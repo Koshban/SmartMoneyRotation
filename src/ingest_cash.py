@@ -1,0 +1,456 @@
+"""
+ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
+
+Auto-selects data source:
+  Period ≤ 5 days   → IBKR TWS  (must be running)
+  Period > 5 days   → yfinance  (bulk backfill)
+
+Override with --source yfinance | ibkr
+
+Usage:
+    python src/ingest_cash.py --market all --period 2y
+    python src/ingest_cash.py --market all --period 3d
+    python src/ingest_cash.py --market us --period 5d --source ibkr
+    python src/ingest_cash.py --full --backfill
+"""
+
+import sys
+import re
+import math
+import logging
+import argparse
+from pathlib import Path
+from datetime import datetime, date, timedelta
+
+# ── Ensure src/ is on the Python path ─────────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pandas as pd
+import yfinance as yf
+
+from common.credentials import IBKR_PORT
+from common.universe import (
+    get_us_only_etfs,
+    get_all_single_names,
+    get_hk_only,
+    get_india_only,
+    is_hk_ticker,
+    is_india_ticker,
+)
+
+try:
+    from common.credentials import IBKR_HOST
+except ImportError:
+    IBKR_HOST = "127.0.0.1"
+
+try:
+    from common.credentials import IBKR_CLIENT_ID_INGEST
+except ImportError:
+    IBKR_CLIENT_ID_INGEST = 10
+
+# ── Paths ──────────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+)
+
+# ── Period → approximate calendar days ─────────────────────────
+PERIOD_DAYS_MAP = {
+    "1d": 1, "2d": 2, "3d": 3, "4d": 4, "5d": 5,
+    "1w": 7, "2w": 14, "1mo": 30, "3mo": 90, "6mo": 180,
+    "1y": 365, "2y": 730, "5y": 1825, "10y": 3650, "max": 9999,
+}
+
+IBKR_THRESHOLD_DAYS = 5
+IBKR_SUPPORTED_MARKETS = {"us", "hk"}
+
+
+# ====================================================================
+#  Symbol lists from universe.py
+# ====================================================================
+
+def get_symbols_for_market(market: str) -> list[str]:
+    """Build symbol list for a market using universe.py helpers."""
+    if market == "us":
+        # US ETFs + US-listed single names (exclude HK and India tickers)
+        etfs = get_us_only_etfs()
+        singles = [
+            s for s in get_all_single_names()
+            if not is_hk_ticker(s) and not is_india_ticker(s)
+        ]
+        combined = list(dict.fromkeys(etfs + singles))  # dedup, preserve order
+        return combined
+
+    elif market == "hk":
+        return get_hk_only()
+
+    elif market == "india":
+        return get_india_only()
+
+    else:
+        logger.warning(f"Unknown market: {market}")
+        return []
+
+
+# ====================================================================
+#  Helpers
+# ====================================================================
+
+def period_to_days(period: str) -> int:
+    """Convert a period string like '2y', '5d', '3mo' to approx calendar days."""
+    period = period.lower().strip()
+    if period in PERIOD_DAYS_MAP:
+        return PERIOD_DAYS_MAP[period]
+
+    m = re.match(r"^(\d+)\s*(d|w|mo|m|y)$", period)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == "d":
+            return n
+        if unit == "w":
+            return n * 7
+        if unit in ("mo", "m"):
+            return n * 30
+        if unit == "y":
+            return n * 365
+
+    logger.warning(f"Cannot parse period '{period}', defaulting to 9999 days (yfinance)")
+    return 9999
+
+
+def period_to_ibkr_duration(period: str) -> str:
+    """Convert period string to IBKR durationStr format like '5 D'."""
+    days = period_to_days(period)
+    if days <= 7:
+        return f"{days} D"
+    elif days <= 60:
+        weeks = max(1, days // 7)
+        return f"{weeks} W"
+    elif days <= 365:
+        months = max(1, days // 30)
+        return f"{months} M"
+    else:
+        years = max(1, days // 365)
+        return f"{years} Y"
+
+
+def choose_source(period: str, market: str, force_source: str = None) -> str:
+    """
+    Decide whether to use 'yfinance' or 'ibkr'.
+      1. If force_source is set, use that.
+      2. If period ≤ 5 days AND market is IBKR-supported → ibkr
+      3. Otherwise → yfinance
+    """
+    if force_source:
+        return force_source
+
+    days = period_to_days(period)
+    if days <= IBKR_THRESHOLD_DAYS and market in IBKR_SUPPORTED_MARKETS:
+        return "ibkr"
+
+    return "yfinance"
+
+
+# ====================================================================
+#  IBKR contract helpers
+# ====================================================================
+
+def clean_hk_symbol(symbol: str) -> str:
+    """'0005.HK' → '5', '0700.HK' → '700'"""
+    sym = symbol.replace(".HK", "").lstrip("0")
+    return sym if sym else "0"
+
+
+def make_ibkr_contract(symbol: str, market: str):
+    """Build an ib_insync Stock contract from a yfinance-style symbol."""
+    from ib_insync import Stock
+
+    if market == "hk":
+        ibkr_sym = clean_hk_symbol(symbol)
+        return Stock(ibkr_sym, "SEHK", "HKD")
+    elif market == "india":
+        ibkr_sym = symbol.replace(".NS", "").replace(".BO", "")
+        return Stock(ibkr_sym, "NSE", "INR")
+    else:
+        ibkr_sym = symbol.split(".")[0]
+        return Stock(ibkr_sym, "SMART", "USD")
+
+
+# ====================================================================
+#  yfinance fetch
+# ====================================================================
+
+def fetch_yfinance(symbols: list[str], period: str) -> pd.DataFrame:
+    """Bulk download OHLCV via yfinance."""
+    logger.info(f"[yfinance] Downloading {len(symbols)} symbols, period={period}")
+
+    if not symbols:
+        return pd.DataFrame()
+
+    df = yf.download(
+        tickers=symbols,
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        threads=True,
+    )
+
+    if df.empty:
+        logger.warning("[yfinance] Empty result")
+        return pd.DataFrame()
+
+    # ── Reshape multi-ticker result ────────────────────────────
+    records = []
+
+    if len(symbols) == 1:
+        sym = symbols[0]
+        tmp = df.copy()
+        tmp = tmp.reset_index()
+        tmp["symbol"] = sym
+        records.append(tmp)
+    else:
+        for sym in symbols:
+            try:
+                tmp = df[sym].copy()
+                tmp = tmp.dropna(how="all")
+                if tmp.empty:
+                    continue
+                tmp = tmp.reset_index()
+                tmp["symbol"] = sym
+                records.append(tmp)
+            except KeyError:
+                logger.warning(f"[yfinance] No data for {sym}")
+                continue
+
+    if not records:
+        return pd.DataFrame()
+
+    result = pd.concat(records, ignore_index=True)
+
+    # Standardise date column name
+    col_map = {}
+    for c in result.columns:
+        if c.lower() == "date":
+            col_map[c] = "Date"
+    result.rename(columns=col_map, inplace=True)
+
+    logger.info(f"[yfinance] Got {len(result):,} rows for {result['symbol'].nunique()} symbols")
+    return result
+
+
+# ====================================================================
+#  IBKR fetch
+# ====================================================================
+
+def fetch_ibkr(symbols: list[str], period: str, market: str) -> pd.DataFrame:
+    """Fetch historical daily bars from IBKR TWS."""
+    try:
+        from ib_insync import IB, util
+    except ImportError:
+        logger.error("ib_insync not installed. Run: pip install ib_insync")
+        return pd.DataFrame()
+
+    duration = period_to_ibkr_duration(period)
+    logger.info(
+        f"[IBKR] Fetching {len(symbols)} symbols, "
+        f"duration={duration}, market={market}"
+    )
+
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID_INGEST)
+        ib.reqMarketDataType(1)
+        logger.info(f"[IBKR] Connected to TWS at {IBKR_HOST}:{IBKR_PORT}")
+    except Exception as e:
+        logger.error(f"[IBKR] Cannot connect to TWS: {e}")
+        logger.warning("[IBKR] Falling back to yfinance")
+        return fetch_yfinance(symbols, period)
+
+    all_records = []
+
+    try:
+        for idx, sym in enumerate(symbols, 1):
+            logger.info(f"[IBKR] [{idx}/{len(symbols)}] {sym}")
+
+            contract = make_ibkr_contract(sym, market)
+            qualified = ib.qualifyContracts(contract)
+
+            if not qualified:
+                logger.warning(f"[IBKR]   Could not qualify {sym}, skipping")
+                continue
+
+            contract = qualified[0]
+
+            try:
+                bars = ib.reqHistoricalData(
+                    contract,
+                    endDateTime="",
+                    durationStr=duration,
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                )
+            except Exception as e:
+                logger.warning(f"[IBKR]   Error fetching {sym}: {e}")
+                continue
+
+            if not bars:
+                logger.warning(f"[IBKR]   No bars for {sym}")
+                continue
+
+            df = util.df(bars)
+            df["symbol"] = sym
+
+            df.rename(columns={
+                "date":     "Date",
+                "open":     "Open",
+                "high":     "High",
+                "low":      "Low",
+                "close":    "Close",
+                "volume":   "Volume",
+                "average":  "VWAP",
+                "barCount": "Trades",
+            }, inplace=True)
+
+            df["Adj Close"] = df["Close"]
+
+            all_records.append(df)
+            logger.info(f"[IBKR]   {sym}: {len(df)} bars")
+
+            # Pacing: IBKR allows ~60 hist data requests per 10 min
+            ib.sleep(0.5)
+
+    finally:
+        ib.disconnect()
+        logger.info("[IBKR] Disconnected")
+
+    if not all_records:
+        return pd.DataFrame()
+
+    result = pd.concat(all_records, ignore_index=True)
+    logger.info(f"[IBKR] Got {len(result):,} rows for {result['symbol'].nunique()} symbols")
+    return result
+
+
+# ====================================================================
+#  Orchestration
+# ====================================================================
+
+def fetch_full_universe(markets: list[str], period: str, force_source: str = None):
+    """
+    Download OHLCV for all symbols across requested markets.
+    Auto-selects yfinance vs IBKR based on period length.
+    """
+    all_dfs = []
+
+    for market in markets:
+        symbols = get_symbols_for_market(market)
+        if not symbols:
+            logger.warning(f"No symbols for market: {market}")
+            continue
+
+        source = choose_source(period, market, force_source)
+        logger.info(
+            f"Market: {market.upper()} | "
+            f"{len(symbols)} symbols | "
+            f"period: {period} | "
+            f"source: {source}"
+        )
+
+        if source == "ibkr":
+            df = fetch_ibkr(symbols, period, market)
+        else:
+            df = fetch_yfinance(symbols, period)
+
+        if df is not None and not df.empty:
+            all_dfs.append(df)
+
+    if not all_dfs:
+        logger.warning("No data collected")
+        return
+
+    result = pd.concat(all_dfs, ignore_index=True)
+
+    # ── Save to parquet ────────────────────────────────────────
+    DATA_DIR.mkdir(exist_ok=True)
+    out_path = DATA_DIR / "universe_ohlcv.parquet"
+    result.to_parquet(out_path, index=False)
+    size_mb = out_path.stat().st_size / (1024 * 1024)
+    logger.info(f"Saved → {out_path}  ({size_mb:.1f} MB, {len(result):,} rows)")
+
+
+# ====================================================================
+#  CLI
+# ====================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Ingest OHLCV data (yfinance + IBKR)")
+    parser.add_argument(
+        "--market",
+        choices=["us", "hk", "india", "all"],
+        default="all",
+        help="Which market(s) to download (default: all)",
+    )
+    parser.add_argument(
+        "--period",
+        default="2y",
+        help="Period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max (default: 2y)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["yfinance", "ibkr"],
+        default=None,
+        help="Force data source (default: auto based on period)",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Alias for --market all",
+    )
+    parser.add_argument(
+        "--backfill", action="store_true",
+        help="Alias for --period max",
+    )
+    args = parser.parse_args()
+
+    if args.full:
+        args.market = "all"
+    if args.backfill:
+        args.period = "max"
+
+    if args.market == "all":
+        markets = ["us", "hk", "india"]
+    else:
+        markets = [args.market]
+
+    # Show auto-selection logic
+    days = period_to_days(args.period)
+    logger.info(
+        f"Period={args.period} ({days} days) → "
+        f"auto threshold: ≤{IBKR_THRESHOLD_DAYS}d uses IBKR"
+        + (f" [OVERRIDDEN → {args.source}]" if args.source else "")
+    )
+
+    # Show symbol counts
+    for mkt in markets:
+        syms = get_symbols_for_market(mkt)
+        src = choose_source(args.period, mkt, args.source)
+        logger.info(f"  {mkt.upper():6s}: {len(syms):>4d} symbols → {src}")
+
+    fetch_full_universe(
+        markets=markets,
+        period=args.period,
+        force_source=args.source,
+    )
+
+    logger.info("Done")
+
+
+if __name__ == "__main__":
+    main()

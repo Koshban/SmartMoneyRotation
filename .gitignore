@@ -1,0 +1,7 @@
+# .gitignore
+common/credentials.py
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+data/*/*/*.csv
