@@ -23,8 +23,6 @@ from __future__ import annotations
 import warnings
 import numpy as np
 import pandas as pd
-import yfinance as yf
-
 from common.config import (
     BENCHMARK_TICKER,
     SECTOR_ETFS,
@@ -101,6 +99,8 @@ def fetch_sector_data(
     benchmark_df : pd.DataFrame
         OHLCV for the benchmark (SPY by default).
     """
+    import yfinance as yf
+
     sector_data: dict[str, pd.DataFrame] = {}
     for name, etf in SECTOR_ETFS.items():
         raw = yf.download(etf, period=period, progress=False)
@@ -339,6 +339,8 @@ def lookup_sector(ticker: str) -> str | None:
 
     Results are cached in memory for the session.
     """
+    import yfinance as yf
+
     ticker = ticker.upper()
 
     if ticker in _sector_cache:

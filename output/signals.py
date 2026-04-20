@@ -145,8 +145,8 @@ class SignalConfig:
     """
 
     # ── Rank thresholds (hysteresis band) ─────────────────
-    entry_rank_max: int = 5
-    exit_rank_max:  int = 8
+    entry_rank_max: int = 8          # was 5 — enter if ranked in top 8
+    exit_rank_max:  int = 20         # was 8 — only exit if falls below 20
 
     # ── Score thresholds ──────────────────────────────────
     #    exit_score_min always applies as an OR exit trigger.
@@ -160,7 +160,7 @@ class SignalConfig:
     breadth_bearish_action: str = "reduce"    # "reduce" or "exit_all"
 
     # ── Position limits ───────────────────────────────────
-    max_positions: int = 5
+    max_positions: int = 8
 
     # ── Signal strength weights ───────────────────────────
     w_score:     float = 0.30

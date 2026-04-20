@@ -4,11 +4,29 @@ common/config.py
 Central configuration for the smart-money rotation system.
 All tunable parameters live here.  Every downstream module imports
 from this file — nothing is hard-coded elsewhere.
+
+Markets supported
+─────────────────
+  US  — Rotation engine + bottom-up scoring (dual-list with convergence)
+  HK  — Bottom-up scoring only (vs local benchmark 2800.HK)
+  IN  — Bottom-up scoring only (vs local benchmark NIFTYBEES.NS)
 """
 
 from pathlib import Path
 from common.credentials import PG_CONFIG, IBKR_PORT
 from common.universe import ETF_UNIVERSE
+
+# ── Safe imports for non-US universes (defined in universe.py) ──
+try:
+    from common.universe import HK_UNIVERSE
+except ImportError:
+    HK_UNIVERSE = []
+
+try:
+    from common.universe import INDIA_UNIVERSE
+except ImportError:
+    INDIA_UNIVERSE = []
+
 
 # ═══════════════════════════════════════════════════════════════
 # 0.  DEFAULT PIPELINE UNIVERSE
@@ -24,7 +42,7 @@ UNIVERSE = list(ETF_UNIVERSE)
 # 1.  PROJECT PATHS
 # ═══════════════════════════════════════════════════════════════
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SRC_DIR      = PROJECT_ROOT / "src" 
+SRC_DIR      = PROJECT_ROOT / "src"
 DATA_DIR     = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STAGING_FILE = DATA_DIR / "staging.json"
@@ -250,11 +268,11 @@ OUTPUT = {
 # ═══════════════════════════════════════════════════════════════
 SCORING_WEIGHTS = {
     # Pillar weights (must sum to 1.0 when all five are active)
-    "pillar_rotation":       0.30,    # was 0.35
-    "pillar_momentum":       0.25,    # was 0.25
-    "pillar_volatility":     0.15,    # was 0.20
-    "pillar_microstructure": 0.20,    # was 0.20
-    "pillar_breadth":        0.10,    # NEW
+    "pillar_rotation":       0.30,
+    "pillar_momentum":       0.25,
+    "pillar_volatility":     0.15,
+    "pillar_microstructure": 0.20,
+    "pillar_breadth":        0.10,
 
     # Pillar 1 — Rotation sub-weights
     "rs_zscore_w":           0.35,
@@ -405,45 +423,46 @@ TICKER_SECTOR_MAP = {
 # ═══════════════════════════════════════════════════════════════
 # 18. SIGNAL PARAMETERS  (used by strategy/signals.py)
 # ═══════════════════════════════════════════════════════════════
+
 SIGNAL_PARAMS = {
     # ── Entry thresholds ─────────────────────────────────────
-    "entry_score_min":        0.60,
+    "entry_score_min":        0.55,
     "entry_percentile_min":   0.70,
     "entry_momentum_confirm": True,
 
     # ── Exit thresholds ──────────────────────────────────────
-    "exit_score_below":       0.45,
-    "exit_percentile_below":  0.30,
-    "exit_score_max":         0.40,     # used by signals.py cooldown
+    "exit_score_below":       0.35,
+    "exit_percentile_below":  0.25,
+    "exit_score_max":         0.35,
 
-    # ── RS regime gate (used by strategy/signals.py) ─────────
+    # ── RS regime gate ───────────────────────────────────────
     "allowed_rs_regimes":     ["leading", "improving"],
     "allowed_sector_regimes": ["leading", "improving", "neutral"],
 
-    # ── Legacy regime keys (retained for compatibility) ──────
+    # ── Legacy regime keys ───────────────────────────────────
     "stock_regime_allowed":   ["leading", "improving"],
     "sector_regime_blocked":  ["lagging"],
 
     # ── Momentum persistence ─────────────────────────────────
-    "confirmation_streak":    3,
+    "confirmation_streak":    2,
     "entry_confirm_days":     2,
-    "exit_confirm_days":      1,
+    "exit_confirm_days":      2,
 
     # ── Anti-churn cooldown ──────────────────────────────────
-    "cooldown_days":          5,
+    "cooldown_days":          15,
 
     # ── Position sizing ──────────────────────────────────────
-    "max_position_pct":       0.08,
-    "min_position_pct":       0.02,
-    "base_position_pct":      0.05,
+    "max_position_pct":       0.15,
+    "min_position_pct":       0.03,
+    "base_position_pct":      0.08,
     "score_scale_factor":     1.5,
     "vol_penalty_threshold":  0.80,
     "vol_penalty_factor":     0.60,
 
     # ── Concentration limits ─────────────────────────────────
-    "max_sector_exposure":    0.30,
-    "max_positions":          15,
-    "min_positions":          5,
+    "max_sector_exposure":    0.35,
+    "max_positions":          10,
+    "min_positions":          3,
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -451,14 +470,14 @@ SIGNAL_PARAMS = {
 # ═══════════════════════════════════════════════════════════════
 PORTFOLIO_PARAMS = {
     "total_capital":         100_000,
-    "max_positions":         15,
-    "min_positions":          5,
-    "max_sector_pct":        0.30,
-    "max_single_pct":        0.08,
-    "min_single_pct":        0.02,
-    "target_invested_pct":   0.95,
-    "rebalance_threshold":   0.015,
-    "incumbent_bonus":       0.02,
+    "max_positions":         10,
+    "min_positions":          3,
+    "max_sector_pct":        0.35,
+    "max_single_pct":        0.15,
+    "min_single_pct":        0.03,
+    "target_invested_pct":   0.90,
+    "rebalance_threshold":   0.05,
+    "incumbent_bonus":       0.05,
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -466,7 +485,7 @@ PORTFOLIO_PARAMS = {
 # ═══════════════════════════════════════════════════════════════
 BREADTH_PARAMS = {
     # Advance/Decline
-    "min_stocks":           10,       # minimum universe size to compute
+    "min_stocks":           10,
 
     # McClellan
     "mcclellan_fast":       19,
@@ -505,3 +524,432 @@ BREADTH_PORTFOLIO = {
 # 22. STOP-LOSS
 # ═══════════════════════════════════════════════════════════════
 ATR_STOP_MULTIPLIER = 2.0    # stop-loss at 2× ATR below entry
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                                                               ║
+# ║         M U L T I - M A R K E T   C O N F I G U R A T I O N  ║
+# ║                                                               ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+# ═══════════════════════════════════════════════════════════════
+# 23. MULTI-MARKET CORE SETTINGS
+# ═══════════════════════════════════════════════════════════════
+# Which markets to run.  The orchestrator iterates this list.
+# Remove a market here to skip it entirely.
+ACTIVE_MARKETS = ["US", "HK", "IN"]
+
+# Per-market benchmark for relative-strength calculation.
+# Each ticker must be fetchable via the data layer (IBKR / yfinance).
+MARKET_BENCHMARKS = {
+    "US": "SPY",
+    "HK": "2800.HK",       # Tracker Fund — tracks Hang Seng Index
+    "IN": "NIFTYBEES.NS",  # Nippon India Nifty BeES — tracks Nifty 50
+}
+
+# Per-market IBKR contract hints (used by data fetcher).
+# These override FETCH_PARAMS when fetching for a specific market.
+MARKET_FETCH_OVERRIDES = {
+    "US": {},                                             # use defaults
+    "HK": {"exchange": "SEHK",  "currency": "HKD"},
+    "IN": {"exchange": "NSE",   "currency": "INR"},
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 24. HK MARKET CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+
+HK_BENCHMARK = "2800.HK"
+
+# ── Informal sector groupings (informational — NOT used for rotation) ──
+# Verify tickers below match your common/universe.py → HK_UNIVERSE.
+# Unmapped tickers default to "Other" in output reports.
+HK_TICKER_GROUP_MAP = {
+    # ── China Tech ─────────────────────────────────────────
+    "0700.HK": "Tech",       # Tencent
+    "9988.HK": "Tech",       # Alibaba
+    "3690.HK": "Tech",       # Meituan
+    "9618.HK": "Tech",       # JD.com
+    "9888.HK": "Tech",       # Baidu
+    "1810.HK": "Tech",       # Xiaomi
+    "9999.HK": "Tech",       # NetEase
+    "9626.HK": "Tech",       # Bilibili
+    "1024.HK": "Tech",       # Kuaishou
+    "0992.HK": "Tech",       # Lenovo
+
+    # ── Financials / Insurance ─────────────────────────────
+    "1299.HK": "Financials",  # AIA Group
+    "0005.HK": "Financials",  # HSBC Holdings
+    "0388.HK": "Financials",  # HK Exchanges & Clearing
+    "2318.HK": "Financials",  # Ping An Insurance
+    "0939.HK": "Financials",  # China Construction Bank
+    "1398.HK": "Financials",  # ICBC
+    "3988.HK": "Financials",  # Bank of China
+
+    # ── Property / REITs ───────────────────────────────────
+    "0001.HK": "Property",    # CK Hutchison
+    "1113.HK": "Property",    # CK Asset Holdings
+    "0016.HK": "Property",    # Sun Hung Kai Properties
+    "0823.HK": "Property",    # Link REIT
+    "1109.HK": "Property",    # China Resources Land
+
+    # ── Energy / Utilities ─────────────────────────────────
+    "0883.HK": "Energy",      # CNOOC
+    "0857.HK": "Energy",      # PetroChina
+    "0002.HK": "Energy",      # CLP Holdings
+    "0003.HK": "Energy",      # HK & China Gas
+
+    # ── Auto / EV ──────────────────────────────────────────
+    "1211.HK": "Auto",        # BYD Company
+    "2015.HK": "Auto",        # Li Auto
+    "9868.HK": "Auto",        # XPeng
+    "0175.HK": "Auto",        # Geely Automobile
+    "9866.HK": "Auto",        # NIO Inc
+    
+
+    # ── Consumer / Telecom ─────────────────────────────────
+    "0941.HK": "Telecom",     # China Mobile
+    "0762.HK": "Telecom",     # China Unicom
+    "9633.HK": "Consumer",    # Nongfu Spring
+    "2020.HK": "Consumer",    # Anta Sports
+    "9961.HK": "Consumer",    # Trip.com
+
+    # ── Healthcare / Biotech ───────────────────────────────
+    "1177.HK": "Healthcare",  # Sino Biopharmaceutical
+    "2269.HK": "Healthcare",  # WuXi Biologics
+    "3692.HK": "Healthcare",  # Hansoh Pharmaceutical
+}
+
+# ── HK scoring weights ──
+# Inherits US defaults, then overrides.
+# No breadth data; redistribute its weight to momentum & microstructure.
+HK_SCORING_WEIGHTS = {
+    **SCORING_WEIGHTS,
+
+    # Adjusted pillar allocation (sums to 1.0)
+    "pillar_rotation":       0.25,   # RS vs 2800.HK — still valuable
+    "pillar_momentum":       0.30,   # ↑ from 0.25
+    "pillar_volatility":     0.15,   # unchanged
+    "pillar_microstructure": 0.30,   # ↑ from 0.20 — volume signals matter in HK
+    "pillar_breadth":        0.00,   # no breadth for HK
+}
+
+# ── HK scoring params ──
+# Inherits US defaults; zeroes out sector adjustment (no sector rotation).
+HK_SCORING_PARAMS = {
+    **SCORING_PARAMS,
+
+    "sector_adj_leading":    0.0,
+    "sector_adj_improving":  0.0,
+    "sector_adj_weakening":  0.0,
+    "sector_adj_lagging":    0.0,
+}
+
+# ── HK signal params ──
+# More permissive regime gates (no sector rotation to gate on).
+# Fewer positions (typically smaller HK universe).
+HK_SIGNAL_PARAMS = {
+    **SIGNAL_PARAMS,
+
+    # Regime gates — stock RS gate kept, sector gate disabled
+    "allowed_rs_regimes":     ["leading", "improving", "neutral"],
+    "allowed_sector_regimes": ["leading", "improving", "neutral",
+                               "weakening", "lagging"],
+    "stock_regime_allowed":   ["leading", "improving", "neutral"],
+    "sector_regime_blocked":  [],
+
+    # Tighter portfolio for smaller universe
+    "max_positions":          8,
+    "min_positions":          2,
+    "max_sector_exposure":    0.40,   # HK is sector-concentrated
+    "max_position_pct":       0.20,   # allow larger single bets
+    "base_position_pct":      0.10,
+}
+
+# ── HK portfolio params ──
+HK_PORTFOLIO_PARAMS = {
+    **PORTFOLIO_PARAMS,
+
+    "max_positions":         8,
+    "min_positions":         2,
+    "max_sector_pct":        0.40,
+    "max_single_pct":        0.20,
+    "min_single_pct":        0.04,
+    "target_invested_pct":   0.85,
+    "rebalance_threshold":   0.06,
+}
+
+# ── HK relative-strength params ──
+HK_RS_PARAMS = {
+    **RS_PARAMS,
+    "primary_benchmark":    "2800.HK",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 25. INDIA MARKET CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+
+IN_BENCHMARK = "NIFTYBEES.NS"
+
+# ── Informal sector groupings (informational — NOT used for rotation) ──
+# Verify tickers below match your common/universe.py → INDIA_UNIVERSE.
+INDIA_TICKER_GROUP_MAP = {
+    # ── IT Services ────────────────────────────────────────
+    "TCS.NS":        "IT",          # Tata Consultancy Services
+    "INFY.NS":       "IT",          # Infosys
+    "WIPRO.NS":      "IT",          # Wipro
+    "HCLTECH.NS":    "IT",          # HCL Technologies
+    "TECHM.NS":      "IT",          # Tech Mahindra
+    "LTIM.NS":       "IT",          # LTIMindtree
+
+    # ── Financials ─────────────────────────────────────────
+    "HDFCBANK.NS":   "Financials",  # HDFC Bank
+    "ICICIBANK.NS":  "Financials",  # ICICI Bank
+    "SBIN.NS":       "Financials",  # State Bank of India
+    "KOTAKBANK.NS":  "Financials",  # Kotak Mahindra Bank
+    "AXISBANK.NS":   "Financials",  # Axis Bank
+    "BAJFINANCE.NS": "Financials",  # Bajaj Finance
+    "BAJFINSV.NS":   "Financials",  # Bajaj Finserv
+    "INDUSINDBK.NS": "Financials",  # IndusInd Bank
+
+    # ── Energy / Conglomerate ──────────────────────────────
+    "RELIANCE.NS":   "Energy",      # Reliance Industries
+    "ONGC.NS":       "Energy",      # Oil & Natural Gas Corp
+    "NTPC.NS":       "Energy",      # NTPC Ltd
+    "POWERGRID.NS":  "Energy",      # Power Grid Corp
+    "ADANIGREEN.NS": "Energy",      # Adani Green Energy
+    "COALINDIA.NS":  "Energy",      # Coal India
+
+    # ── Consumer ───────────────────────────────────────────
+    "HINDUNILVR.NS": "Consumer",    # Hindustan Unilever
+    "ITC.NS":        "Consumer",    # ITC Ltd
+    "ASIANPAINT.NS": "Consumer",    # Asian Paints
+    "TITAN.NS":      "Consumer",    # Titan Company
+    "NESTLEIND.NS":  "Consumer",    # Nestle India
+    "BRITANNIA.NS":  "Consumer",    # Britannia Industries
+    "MARUTI.NS":     "Consumer",    # Maruti Suzuki
+
+    # ── Industrials ────────────────────────────────────────
+    "LT.NS":         "Industrials", # Larsen & Toubro
+    "ADANIENT.NS":   "Industrials", # Adani Enterprises
+    "ADANIPORTS.NS": "Industrials", # Adani Ports
+    "ULTRACEMCO.NS": "Industrials", # UltraTech Cement
+    "GRASIM.NS":     "Industrials", # Grasim Industries
+    "TATASTEEL.NS":  "Industrials", # Tata Steel
+    "JSWSTEEL.NS":   "Industrials", # JSW Steel
+    "HINDALCO.NS":   "Industrials", # Hindalco
+
+    # ── Pharma / Healthcare ────────────────────────────────
+    "SUNPHARMA.NS":  "Pharma",     # Sun Pharmaceutical
+    "DRREDDY.NS":    "Pharma",     # Dr. Reddy's Laboratories
+    "CIPLA.NS":      "Pharma",     # Cipla
+    "APOLLOHOSP.NS": "Pharma",     # Apollo Hospitals
+    "DIVISLAB.NS":   "Pharma",     # Divi's Laboratories
+
+    # ── Telecom ────────────────────────────────────────────
+    "BHARTIARTL.NS": "Telecom",    # Bharti Airtel
+
+    # ── Auto ───────────────────────────────────────────────
+    "TATAMOTORS.NS": "Auto",       # Tata Motors
+    "M&M.NS":        "Auto",       # Mahindra & Mahindra
+    "EICHERMOT.NS":  "Auto",       # Eicher Motors
+    "BAJAJ-AUTO.NS": "Auto",       # Bajaj Auto
+    "HEROMOTOCO.NS": "Auto",       # Hero MotoCorp
+}
+
+# ── India scoring weights ──
+# Same logic as HK: no breadth, redistribute to momentum & microstructure.
+IN_SCORING_WEIGHTS = {
+    **SCORING_WEIGHTS,
+
+    "pillar_rotation":       0.25,
+    "pillar_momentum":       0.30,
+    "pillar_volatility":     0.15,
+    "pillar_microstructure": 0.30,
+    "pillar_breadth":        0.00,
+}
+
+# ── India scoring params ──
+IN_SCORING_PARAMS = {
+    **SCORING_PARAMS,
+
+    "sector_adj_leading":    0.0,
+    "sector_adj_improving":  0.0,
+    "sector_adj_weakening":  0.0,
+    "sector_adj_lagging":    0.0,
+}
+
+# ── India signal params ──
+IN_SIGNAL_PARAMS = {
+    **SIGNAL_PARAMS,
+
+    "allowed_rs_regimes":     ["leading", "improving", "neutral"],
+    "allowed_sector_regimes": ["leading", "improving", "neutral",
+                               "weakening", "lagging"],
+    "stock_regime_allowed":   ["leading", "improving", "neutral"],
+    "sector_regime_blocked":  [],
+
+    "max_positions":          8,
+    "min_positions":          2,
+    "max_sector_exposure":    0.40,
+    "max_position_pct":       0.20,
+    "base_position_pct":      0.10,
+}
+
+# ── India portfolio params ──
+IN_PORTFOLIO_PARAMS = {
+    **PORTFOLIO_PARAMS,
+
+    "max_positions":         8,
+    "min_positions":         2,
+    "max_sector_pct":        0.40,
+    "max_single_pct":        0.20,
+    "min_single_pct":        0.04,
+    "target_invested_pct":   0.85,
+    "rebalance_threshold":   0.06,
+}
+
+# ── India relative-strength params ──
+IN_RS_PARAMS = {
+    **RS_PARAMS,
+    "primary_benchmark":    "NIFTYBEES.NS",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 26. US CONVERGENCE  (dual-list merge settings)
+# ═══════════════════════════════════════════════════════════════
+# When both the rotation engine and the scoring engine produce
+# signals for US, this section controls how they are merged.
+
+US_CONVERGENCE = {
+    # ── Label taxonomy ───────────────────────────────────────
+    # Applied per ticker based on which lists it appears on.
+    "labels": {
+        "strong_buy":     "BUY on BOTH rotation + scoring",
+        "buy_rotation":   "BUY on rotation only",
+        "buy_scoring":    "BUY on scoring only",
+        "conflict":       "BUY on one, SELL on the other — review",
+        "strong_sell":    "SELL on BOTH rotation + scoring",
+        "sell_rotation":  "SELL on rotation only",
+        "sell_scoring":   "SELL on scoring only",
+        "neutral":        "No signal from either engine",
+    },
+
+    # ── Conviction weighting ─────────────────────────────────
+    # When building the final ranked list, how much does
+    # convergence matter vs raw score?
+    "convergence_boost":     0.10,    # added to score if both agree BUY
+    "conflict_penalty":     -0.05,    # subtracted if engines disagree
+
+    # ── Override rules ───────────────────────────────────────
+    # If True, a strong_sell overrides any individual BUY —
+    # i.e. if rotation says SELL and scoring says BUY, final = HOLD.
+    "strong_sell_overrides": True,
+    "strong_buy_overrides":  True,
+
+    # ── Output control ───────────────────────────────────────
+    "show_individual_lists": True,    # include per-engine lists in report
+    "show_merged_list":      True,    # include convergence-merged list
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 27. MASTER MARKET CONFIG
+# ═══════════════════════════════════════════════════════════════
+# Single entry point for all per-market settings.
+# Downstream code: `cfg = MARKET_CONFIG["HK"]` then access any key.
+#
+# Fields:
+#   universe          – list of tickers to score
+#   benchmark         – ticker for RS denominator
+#   engines           – which engines to run ("rotation", "scoring")
+#   scoring_weights   – pillar weights dict
+#   scoring_params    – scoring params dict
+#   signal_params     – signal thresholds dict
+#   portfolio_params  – portfolio construction dict
+#   rs_params         – relative-strength params dict
+#   sector_rs_enabled – whether to run sector rotation engine
+#   sector_etfs       – sector ETF map  (US only)
+#   ticker_sector_map – ticker→sector   (US only)
+#   ticker_group_map  – ticker→group    (HK/IN — informational)
+#   convergence       – dual-list merge config (US only)
+#   fetch_overrides   – IBKR per-market overrides
+
+MARKET_CONFIG = {
+    "US": {
+        "universe":          UNIVERSE,
+        "benchmark":         "SPY",
+        "engines":           ["rotation", "scoring"],
+        "scoring_weights":   SCORING_WEIGHTS,
+        "scoring_params":    SCORING_PARAMS,
+        "signal_params":     SIGNAL_PARAMS,
+        "portfolio_params":  PORTFOLIO_PARAMS,
+        "rs_params":         RS_PARAMS,
+        "sector_rs_enabled": True,
+        "sector_etfs":       SECTOR_ETFS,
+        "sector_rs_params":  SECTOR_RS_PARAMS,
+        "ticker_sector_map": TICKER_SECTOR_MAP,
+        "ticker_group_map":  TICKER_SECTOR_MAP,   # same as sector for US
+        "convergence":       US_CONVERGENCE,
+        "fetch_overrides":   {},
+    },
+    "HK": {
+        "universe":          list(HK_UNIVERSE),
+        "benchmark":         HK_BENCHMARK,
+        "engines":           ["scoring"],
+        "scoring_weights":   HK_SCORING_WEIGHTS,
+        "scoring_params":    HK_SCORING_PARAMS,
+        "signal_params":     HK_SIGNAL_PARAMS,
+        "portfolio_params":  HK_PORTFOLIO_PARAMS,
+        "rs_params":         HK_RS_PARAMS,
+        "sector_rs_enabled": False,
+        "sector_etfs":       {},
+        "sector_rs_params":  {},
+        "ticker_sector_map": {},
+        "ticker_group_map":  HK_TICKER_GROUP_MAP,
+        "convergence":       None,
+        "fetch_overrides":   {"exchange": "SEHK", "currency": "HKD"},
+    },
+    "IN": {
+        "universe":          list(INDIA_UNIVERSE),
+        "benchmark":         IN_BENCHMARK,
+        "engines":           ["scoring"],
+        "scoring_weights":   IN_SCORING_WEIGHTS,
+        "scoring_params":    IN_SCORING_PARAMS,
+        "signal_params":     IN_SIGNAL_PARAMS,
+        "portfolio_params":  IN_PORTFOLIO_PARAMS,
+        "rs_params":         IN_RS_PARAMS,
+        "sector_rs_enabled": False,
+        "sector_etfs":       {},
+        "sector_rs_params":  {},
+        "ticker_sector_map": {},
+        "ticker_group_map":  INDIA_TICKER_GROUP_MAP,
+        "convergence":       None,
+        "fetch_overrides":   {"exchange": "NSE", "currency": "INR"},
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 28. HELPER — look up group for any ticker across all markets
+# ═══════════════════════════════════════════════════════════════
+
+def get_ticker_group(ticker: str, market: str = None) -> str:
+    """
+    Return the sector/group label for *ticker*.
+
+    If *market* is given, look up that market's group map directly.
+    Otherwise, search all markets in order: US → HK → IN.
+    Returns "Other" if the ticker is not mapped anywhere.
+    """
+    if market and market in MARKET_CONFIG:
+        return MARKET_CONFIG[market]["ticker_group_map"].get(ticker, "Other")
+
+    for mkt in MARKET_CONFIG.values():
+        group = mkt["ticker_group_map"].get(ticker)
+        if group:
+            return group
+    return "Other"

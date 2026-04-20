@@ -25,8 +25,7 @@ a phase-by-phase interactive workflow:
       signal reconciliation.
 
   Phase 4 — Reporting
-      Generate recommendation report, weekly summary, and
-      optional backtest results.
+      Generate recommendation report and optional backtest.
 
 The orchestrator can be run end-to-end via
 ``run_full_pipeline()`` or phase-by-phase for interactive /
@@ -43,20 +42,19 @@ Typical Usage
   orch.compute_universe_context()
   orch.run_tickers()
   orch.cross_sectional_analysis()
-  report = orch.generate_reports()
+  result = orch.generate_reports()
 
 Dependencies
 ────────────
   pipeline/runner.py              — single-ticker pipeline
   compute/breadth.py              — universe breadth
-  compute/sectors.py              — sector RS panel
+  compute/sector_rs.py            — sector RS panel
   output/rankings.py              — cross-sectional rankings
   output/signals.py               — portfolio-level signals
   strategy/portfolio.py           — position sizing & allocation
-  strategy/backtest.py            — historical backtest
+  portfolio/backtest.py           — historical backtest
   reports/recommendations.py      — ticker recommendations
-  reports/weekly_report.py        — weekly summary
-  data/loader.py                  — OHLCV data loading
+  src/db/loader.py                — OHLCV data loading
   common/config.py                — all parameters
 """
 
@@ -66,22 +64,43 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
-
+import numpy as np
 import pandas as pd
-
+# ── Convergence ───────────────────────────────────────────────
+from strategy.convergence import (
+    run_convergence,
+    build_price_matrix,
+    enrich_snapshots,
+    convergence_report,
+    MarketSignalResult,
+)
+from strategy.rotation import (
+    run_rotation,
+    RotationConfig,
+    RotationResult,
+)
+# ── Config ────────────────────────────────────────────────────
 from common.config import (
     BENCHMARK_TICKER,
     PORTFOLIO_PARAMS,
     SECTOR_ETFS,
     TICKER_SECTOR_MAP,
     UNIVERSE,
+    MARKET_CONFIG, 
+    ACTIVE_MARKETS
 )
+
+# ── Compute ───────────────────────────────────────────────────
 from compute.breadth import (
     breadth_to_pillar_scores,
     compute_all_breadth,
 )
 from compute.sector_rs import compute_all_sector_rs
-from data.loader import load_ohlcv
+
+# ── Data loading ──────────────────────────────────────────────
+from src.db.loader import load_ohlcv, load_universe_ohlcv
+
+# ── Pipeline ──────────────────────────────────────────────────
 from pipeline.runner import (
     TickerResult,
     results_errors,
@@ -90,12 +109,20 @@ from pipeline.runner import (
     run_batch,
     run_ticker,
 )
+
+# ── Output ────────────────────────────────────────────────────
 from output.rankings import compute_all_rankings
-from output.signals import reconcile_signals
-from reports.recommendations import build_recommendation_report
-from reports.weekly_report import build_weekly_report
-from strategy.backtest import run_backtest
+from output.signals import compute_all_signals
+
+# ── Strategy ──────────────────────────────────────────────────
 from strategy.portfolio import build_portfolio
+
+# ── Portfolio ─────────────────────────────────────────────────
+from portfolio.backtest import run_backtest, BacktestConfig
+
+# ── Reports ───────────────────────────────────────────────────
+from reports.recommendations import build_report
+
 
 logger = logging.getLogger(__name__)
 
@@ -111,48 +138,6 @@ class PipelineResult:
 
     Every downstream consumer (CLI, web dashboard, notebook,
     report generator) reads from this single object.
-
-    Attributes
-    ----------
-    ticker_results : dict[str, TickerResult]
-        Per-ticker enriched DataFrames and snapshots.
-    scored_universe : dict[str, pd.DataFrame]
-        ``{ticker: enriched_df}`` for successful tickers only.
-        Ready for rankings and portfolio construction.
-    snapshots : list[dict]
-        Latest-row summaries sorted by composite score
-        descending.  Each dict is one ticker's snapshot from
-        ``TickerResult.snapshot``, enriched with allocation
-        fields after portfolio construction.
-    rankings : pd.DataFrame
-        Cross-sectional rankings DataFrame with composite,
-        pillar, and percentile rank columns for every ticker.
-    portfolio : dict
-        Output of ``build_portfolio()`` — allocation table,
-        position sizes, cash reserve, metadata.
-    signals : pd.DataFrame
-        Reconciled portfolio-level signals combining per-ticker
-        quality gates with cross-sectional ranking filters.
-    breadth : pd.DataFrame or None
-        Universe-level breadth indicators.
-    breadth_scores : pd.DataFrame or None
-        Per-ticker breadth pillar scores (columns = tickers).
-    sector_rs : pd.DataFrame or None
-        Sector RS panel (MultiIndex: date × sector).
-    recommendation_report : dict or None
-        Structured recommendation report for display.
-    weekly_report : dict or None
-        Structured weekly summary report.
-    backtest : dict or None
-        Backtest results if requested.
-    errors : list[str]
-        Error messages from failed tickers.
-    timings : dict[str, float]
-        Wall-clock seconds for each phase.
-    run_date : pd.Timestamp
-        Date of this pipeline run.
-    as_of : pd.Timestamp or None
-        Cut-off date if backtesting; None for live.
     """
 
     ticker_results: dict[str, TickerResult] = field(default_factory=dict)
@@ -165,10 +150,15 @@ class PipelineResult:
     breadth: Optional[pd.DataFrame] = None
     breadth_scores: Optional[pd.DataFrame] = None
     sector_rs: Optional[pd.DataFrame] = None
+    bench_df: Optional[pd.DataFrame] = None       # ← NEW
+
+    # ── NEW: convergence + rotation ───────────────────────────
+    rotation_result: Optional[Any] = None            # RotationResult
+    convergence: Optional[Any] = None                # MarketSignalResult
+    market: str = "US"
 
     recommendation_report: Optional[dict] = None
-    weekly_report: Optional[dict] = None
-    backtest: Optional[dict] = None
+    backtest: Any = None                          # BacktestResult or None
 
     errors: list[str] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
@@ -177,25 +167,20 @@ class PipelineResult:
 
     @property
     def n_tickers(self) -> int:
-        """Number of successfully scored tickers."""
         return len(self.scored_universe)
 
     @property
     def n_errors(self) -> int:
-        """Number of tickers that failed."""
         return len(self.errors)
 
     @property
     def total_time(self) -> float:
-        """Total wall-clock time in seconds."""
         return sum(self.timings.values())
 
     def top_n(self, n: int = 10) -> list[dict]:
-        """Return top-N snapshots by composite score."""
         return self.snapshots[:n]
 
     def summary(self) -> str:
-        """One-line summary string for logging / display."""
         top = self.snapshots[0]["ticker"] if self.snapshots else "N/A"
         return (
             f"CASH Pipeline — {self.run_date.strftime('%Y-%m-%d')} — "
@@ -207,104 +192,79 @@ class PipelineResult:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ORCHESTRATOR CLASS  (phase-by-phase control)
+#  ORCHESTRATOR CLASS
 # ═══════════════════════════════════════════════════════════════
 
 class Orchestrator:
     """
     Stateful pipeline coordinator.
 
-    Use this when you want fine-grained control over each
-    phase (e.g. in a notebook, or when injecting custom data).
-    For one-shot usage, prefer ``run_full_pipeline()``.
-
-    The orchestrator accumulates state across phases and
-    produces a ``PipelineResult`` at the end.
-
-    Example
-    -------
-    ::
-
-        orch = Orchestrator(capital=100_000)
-        orch.load_data()
-        orch.compute_universe_context()
-        orch.run_tickers()
-        orch.cross_sectional_analysis()
-        result = orch.generate_reports()
-
-    Each phase can be re-run independently (e.g. to test
-    different portfolio parameters without re-computing
-    indicators).
+    Use for fine-grained phase-by-phase control (notebooks,
+    debugging).  For one-shot usage, prefer ``run_full_pipeline()``.
     """
 
-    def __init__(
-        self,
-        *,
-        universe: list[str] | None = None,
-        benchmark: str | None = None,
-        capital: float | None = None,
-        as_of: pd.Timestamp | None = None,
-        enable_breadth: bool = True,
-        enable_sectors: bool = True,
-        enable_signals: bool = True,
-        enable_backtest: bool = False,
-        backtest_start: pd.Timestamp | None = None,
-    ):
-        """
-        Parameters
-        ----------
-        universe : list[str], optional
-            Ticker symbols.  Defaults to ``UNIVERSE`` from config.
-        benchmark : str, optional
-            Benchmark ticker.  Defaults to ``BENCHMARK_TICKER``.
-        capital : float, optional
-            Portfolio capital for position sizing.  Defaults to
-            ``PORTFOLIO_PARAMS["total_capital"]``.
-        as_of : pd.Timestamp, optional
-            Cut-off date for point-in-time analysis.  None means
-            use all available data (live mode).
-        enable_breadth : bool
-            Compute universe breadth (Pillar 5, Gate 3).
-        enable_sectors : bool
-            Compute sector RS and merge tailwind adjustments.
-        enable_signals : bool
-            Run per-ticker and portfolio-level signal generation.
-        enable_backtest : bool
-            Run historical backtest after portfolio construction.
-        backtest_start : pd.Timestamp, optional
-            Start date for backtest.  Defaults to 1 year before
-            the earliest data date.
-        """
-        # ── Configuration ─────────────────────────────────────
-        self.tickers: list[str] = universe or list(UNIVERSE)
-        self.benchmark: str = benchmark or BENCHMARK_TICKER
-        self.capital: float = capital or PORTFOLIO_PARAMS["total_capital"]
-        self.as_of: pd.Timestamp | None = as_of
+    class Orchestrator:
+        def __init__(
+            self,
+            *,
+            market: str = "US",                       # ← NEW
+            universe: list[str] | None = None,
+            benchmark: str | None = None,
+            capital: float | None = None,
+            as_of: pd.Timestamp | None = None,
+            enable_breadth: bool = True,
+            enable_sectors: bool = True,
+            enable_signals: bool = True,
+            enable_backtest: bool = False,
+        ):
+            # ── Market-aware defaults ─────────────────────────────
+            self.market: str = market                  # ← NEW
+            mcfg = MARKET_CONFIG.get(market, {})
 
-        self.enable_breadth: bool = enable_breadth
-        self.enable_sectors: bool = enable_sectors
-        self.enable_signals: bool = enable_signals
-        self.enable_backtest: bool = enable_backtest
-        self.backtest_start: pd.Timestamp | None = backtest_start
+            self.tickers: list[str] = universe or list(
+                mcfg.get("universe", UNIVERSE)
+            )
+            self.benchmark: str = benchmark or mcfg.get(
+                "benchmark", BENCHMARK_TICKER
+            )
+            self.capital: float = capital or PORTFOLIO_PARAMS["total_capital"]
+            self.as_of: pd.Timestamp | None = as_of
 
-        # ── Mutable state (populated phase by phase) ──────────
-        self._ohlcv: dict[str, pd.DataFrame] = {}
-        self._bench_df: pd.DataFrame = pd.DataFrame()
-        self._breadth: pd.DataFrame | None = None
-        self._breadth_scores: pd.DataFrame | None = None
-        self._sector_rs: pd.DataFrame | None = None
-        self._ticker_results: dict[str, TickerResult] = {}
-        self._scored_universe: dict[str, pd.DataFrame] = {}
-        self._snapshots: list[dict] = []
-        self._rankings: pd.DataFrame = pd.DataFrame()
-        self._portfolio: dict = {}
-        self._signals: pd.DataFrame = pd.DataFrame()
-        self._recommendation_report: dict | None = None
-        self._weekly_report: dict | None = None
-        self._backtest: dict | None = None
+            # Respect market config for feature flags
+            self.enable_breadth: bool = (
+                enable_breadth
+                and mcfg.get("scoring_weights", {}).get(
+                    "pillar_breadth", 0.10
+                ) > 0
+            )
+            self.enable_sectors: bool = (
+                enable_sectors
+                and mcfg.get("sector_rs_enabled", True)
+            )
+            self.enable_signals: bool = enable_signals
+            self.enable_backtest: bool = enable_backtest
 
-        self._timings: dict[str, float] = {}
-        self._phases_completed: list[str] = []
+            # ── Mutable state (populated phase by phase) ──────────
+            self._ohlcv: dict[str, pd.DataFrame] = {}
+            self._bench_df: pd.DataFrame = pd.DataFrame()
+            self._breadth: pd.DataFrame | None = None
+            self._breadth_scores: pd.DataFrame | None = None
+            self._sector_rs: pd.DataFrame | None = None
+            self._ticker_results: dict[str, TickerResult] = {}
+            self._scored_universe: dict[str, pd.DataFrame] = {}
+            self._snapshots: list[dict] = []
+            self._rankings: pd.DataFrame = pd.DataFrame()
+            self._portfolio: dict = {}
+            self._signals: pd.DataFrame = pd.DataFrame()
+            self._recommendation_report: dict | None = None
+            self._backtest: Any = None
+
+            # ── NEW: rotation + convergence state ─────────────────
+            self._rotation_result: Any = None           # RotationResult
+            self._convergence_result: Any = None        # MarketSignalResult
+
+            self._timings: dict[str, float] = {}
+            self._phases_completed: list[str] = []
 
     # ───────────────────────────────────────────────────────
     #  Phase 0 — Data Loading
@@ -322,14 +282,8 @@ class Orchestrator:
         ----------
         preloaded : dict, optional
             ``{ticker: OHLCV DataFrame}`` to skip data loading.
-            Useful when data is already in memory (tests,
-            notebooks, backtester warm-start).
         bench_df : pd.DataFrame, optional
-            Pre-loaded benchmark OHLCV.  If None and not in
-            ``preloaded``, loaded via ``load_ohlcv()``.
-
-        After this call, ``self._ohlcv`` and ``self._bench_df``
-        are populated.
+            Pre-loaded benchmark OHLCV.
         """
         t0 = time.perf_counter()
 
@@ -340,10 +294,8 @@ class Orchestrator:
                 f"ticker DataFrames"
             )
         else:
-            # All tickers + benchmark in one call if the loader
-            # supports batch, otherwise iterate.
             all_symbols = list(set(self.tickers + [self.benchmark]))
-            self._ohlcv = _load_universe(all_symbols)
+            self._ohlcv = load_universe_ohlcv(all_symbols)
             logger.info(
                 f"Phase 0: Loaded {len(self._ohlcv)} tickers "
                 f"from data source"
@@ -381,40 +333,44 @@ class Orchestrator:
         """
         Compute universe-level breadth and sector RS.
 
-        These are contextual inputs to the per-ticker pipeline:
-        breadth feeds Pillar 5 (scoring) and Gate 3 (signals),
-        sector RS feeds sector tailwind adjustments (scoring)
-        and Gate 2 (signals).
-
-        Both are optional — if disabled or if computation fails,
-        the per-ticker pipeline degrades gracefully.
+        Breadth feeds Pillar 5 (scoring) and Gate 3 (signals).
+        Sector RS feeds sector tailwind adjustments and Gate 2.
+        Both are optional — the per-ticker pipeline degrades
+        gracefully without them.
         """
         self._require_phase("load_data")
         t0 = time.perf_counter()
 
         # ── Breadth ───────────────────────────────────────────
         #
-        # Universe breadth measures the internal health of the
-        # market: advance/decline ratios, % above moving
-        # averages, new highs vs lows, McClellan oscillator.
+        # compute_all_breadth() expects {ticker: OHLCV DataFrame}
+        # with at least 'close' and optionally 'volume' columns.
+        # It internally aligns them into a panel.
         #
-        # From this we derive:
-        #   _breadth       — DataFrame with daily breadth cols
-        #   _breadth_scores — per-ticker daily scores (0–100)
-        #                     for Pillar 5 of composite scoring
+        # breadth_to_pillar_scores() takes the breadth DataFrame
+        # plus a list of symbols and broadcasts the breadth score
+        # to every ticker (same market-level score per day).
         #
         if self.enable_breadth:
             try:
-                close_panel = _extract_close_panel(self._ohlcv)
-                self._breadth = compute_all_breadth(close_panel)
-                self._breadth_scores = breadth_to_pillar_scores(
-                    self._breadth
-                )
-                logger.info(
-                    f"Phase 1: Breadth computed — "
-                    f"{len(self._breadth)} bars, "
-                    f"regime={self._breadth['breadth_regime'].iloc[-1]}"
-                )
+                self._breadth = compute_all_breadth(self._ohlcv)
+
+                if not self._breadth.empty:
+                    symbols = list(self._ohlcv.keys())
+                    self._breadth_scores = breadth_to_pillar_scores(
+                        self._breadth, symbols
+                    )
+                    logger.info(
+                        f"Phase 1: Breadth computed — "
+                        f"{len(self._breadth)} bars, "
+                        f"regime="
+                        f"{self._breadth['breadth_regime'].iloc[-1]}"
+                    )
+                else:
+                    logger.warning(
+                        "Phase 1: Breadth returned empty — "
+                        "universe may be too small"
+                    )
             except Exception as e:
                 logger.warning(
                     f"Phase 1: Breadth computation failed — {e}.  "
@@ -427,14 +383,10 @@ class Orchestrator:
 
         # ── Sector RS ─────────────────────────────────────────
         #
-        # Sector RS measures the relative strength of each
-        # sector ETF vs the benchmark.  Produces a MultiIndex
-        # (date × sector) panel with rs_zscore, rs_regime,
-        # rs_rank, rs_pctrank.
-        #
-        # The per-ticker pipeline uses this to add sector
-        # tailwind/headwind adjustments to the composite score
-        # and to gate entries in weak sectors.
+        # compute_all_sector_rs() expects:
+        #   sector_data: {sector_name: OHLCV DataFrame}
+        #   benchmark_df: OHLCV DataFrame
+        # Returns MultiIndex (date, sector) panel.
         #
         if self.enable_sectors:
             try:
@@ -476,8 +428,7 @@ class Orchestrator:
 
         Calls ``runner.run_batch()`` which chains:
           indicators → RS → scoring → sector → signals
-        for each ticker.  Results are stored in
-        ``self._ticker_results``.
+        for each ticker.
         """
         self._require_phase("load_data")
         t0 = time.perf_counter()
@@ -493,7 +444,6 @@ class Orchestrator:
             benchmark_ticker=self.benchmark,
         )
 
-        # Extract convenience views
         self._scored_universe = results_to_scored_universe(
             self._ticker_results
         )
@@ -510,6 +460,119 @@ class Orchestrator:
             f"{n_err} errors, {elapsed:.1f}s"
         )
 
+
+    # ───────────────────────────────────────────────────────
+    #  Phase 2.5 — Rotation Engine  (US only)
+    # ───────────────────────────────────────────────────────
+
+    def run_rotation_engine(
+        self,
+        current_holdings: list[str] | None = None,
+        config: RotationConfig | None = None,
+    ) -> None:
+        """
+        Run the top-down sector rotation engine.
+
+        Only meaningful for US — skipped silently for HK/IN.
+        Requires Phase 2 (run_tickers) to have completed so
+        that OHLCV data is available.
+        """
+        self._require_phase("run_tickers")
+
+        mcfg = MARKET_CONFIG.get(self.market, {})
+        engines = mcfg.get("engines", ["scoring"])
+
+        if "rotation" not in engines:
+            logger.info(
+                f"Phase 2.5: Rotation not configured for "
+                f"{self.market} — skipping"
+            )
+            return
+
+        t0 = time.perf_counter()
+
+        # Build wide price matrix from loaded OHLCV
+        prices = build_price_matrix(self._ohlcv)
+
+        if prices.empty or self.benchmark not in prices.columns:
+            logger.warning(
+                "Phase 2.5: Cannot build price matrix for "
+                "rotation — skipping"
+            )
+            return
+
+        try:
+            r_cfg = config or RotationConfig(
+                benchmark=self.benchmark,
+            )
+            self._rotation_result = run_rotation(
+                prices=prices,
+                current_holdings=current_holdings or [],
+                config=r_cfg,
+            )
+
+            rr = self._rotation_result
+            logger.info(
+                f"Phase 2.5: Rotation complete — "
+                f"{len(rr.buys)} BUY, "
+                f"{len(rr.sells)} SELL, "
+                f"{len(rr.reduces)} REDUCE, "
+                f"{len(rr.holds)} HOLD  |  "
+                f"leading={rr.leading_sectors}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Phase 2.5: Rotation failed — {e}.  "
+                f"Proceeding with scoring only."
+            )
+            self._rotation_result = None
+
+        elapsed = time.perf_counter() - t0
+        self._timings["rotation"] = elapsed
+        self._phases_completed.append("rotation")
+    
+
+    # ───────────────────────────────────────────────────────
+    #  Phase 2.75 — Convergence Merge
+    # ───────────────────────────────────────────────────────
+
+    def apply_convergence(self) -> None:
+        """
+        Merge scoring + rotation signals via the convergence layer.
+
+        For US:  dual-list merge (scoring + rotation)
+        For HK/IN: scoring passthrough
+
+        Updates ``self._snapshots`` with convergence labels and
+        adjusted scores so downstream phases (rankings, portfolio,
+        reports) benefit from the convergence intelligence.
+        """
+        self._require_phase("run_tickers")
+        t0 = time.perf_counter()
+
+        self._convergence_result = run_convergence(
+            market=self.market,
+            scoring_snapshots=self._snapshots,
+            rotation_result=self._rotation_result,
+        )
+
+        # Enrich snapshots in-place with convergence data
+        enrich_snapshots(self._snapshots, self._convergence_result)
+
+        n_strong = len(self._convergence_result.strong_buys)
+        n_conflict = len(self._convergence_result.conflicts)
+        logger.info(
+            f"Phase 2.75: Convergence applied — "
+            f"{self._convergence_result.n_tickers} tickers, "
+            f"{n_strong} STRONG_BUY, "
+            f"{n_conflict} CONFLICT"
+        )
+
+        elapsed = time.perf_counter() - t0
+        self._timings["convergence"] = elapsed
+        self._phases_completed.append("convergence")
+
+
     # ───────────────────────────────────────────────────────
     #  Phase 3 — Cross-Sectional Analysis
     # ───────────────────────────────────────────────────────
@@ -517,32 +580,13 @@ class Orchestrator:
     def cross_sectional_analysis(self) -> None:
         """
         Rank the scored universe, build the portfolio, and
-        reconcile signals.
-
-        This phase operates across all tickers simultaneously
-        (cross-sectional), unlike Phase 2 which is per-ticker.
+        generate portfolio-level signals.
 
         Sub-phases
         ──────────
-        3a. Rankings
-            Rank every ticker by composite score, pillar
-            scores, and RS metrics.  Produces a DataFrame with
-            rank and percentile-rank columns.
-
-        3b. Portfolio Construction
-            Select top-N tickers, size positions using ATR-
-            based risk parity, enforce concentration limits,
-            and compute dollar allocations.
-
-        3c. Signal Reconciliation
-            Combine per-ticker quality gates (from Phase 2)
-            with cross-sectional ranking filters to produce
-            final BUY / HOLD / SELL signals for each ticker
-            in the portfolio.
-
-        After this phase, ``self._snapshots`` are enriched
-        with allocation fields (shares, dollar_alloc,
-        weight_pct, category, bucket).
+        3a. Rankings — cross-sectional rank per date
+        3b. Portfolio — position selection + weight allocation
+        3c. Signals — BUY/HOLD/SELL with hysteresis
         """
         self._require_phase("run_tickers")
         t0 = time.perf_counter()
@@ -557,17 +601,18 @@ class Orchestrator:
 
         # ── 3a. Rankings ──────────────────────────────────────
         #
-        # Cross-sectional percentile ranks for composite and
-        # each pillar score.  Rankings are date-aligned — each
-        # row is one ticker's latest values with rank columns.
+        # compute_all_rankings() takes {ticker: scored_df} and
+        # returns MultiIndex (date, ticker) panel with rank,
+        # pct_rank, pillar_agreement, rank_change columns.
         #
         try:
             self._rankings = compute_all_rankings(
                 self._scored_universe
             )
+            n_rows = len(self._rankings)
             logger.info(
-                f"Phase 3a: Rankings computed for "
-                f"{len(self._rankings)} tickers"
+                f"Phase 3a: Rankings computed — "
+                f"{n_rows} rows"
             )
         except Exception as e:
             logger.warning(f"Phase 3a: Rankings failed — {e}")
@@ -575,68 +620,75 @@ class Orchestrator:
 
         # ── 3b. Portfolio Construction ────────────────────────
         #
-        # Select top-ranked tickers, allocate capital using
-        # ATR-based risk parity with concentration limits.
-        #
-        # The portfolio dict contains:
-        #   allocations   — list of {ticker, shares, dollar_alloc,
-        #                   weight_pct, stop_price, risk_per_share}
-        #   cash_reserve  — unallocated capital
-        #   metadata      — total_capital, n_positions, etc.
+        # build_portfolio() takes {ticker: scored_df} and
+        # internally does snapshot extraction, candidate
+        # filtering, ranking, selection, and weight
+        # normalization.  Returns a dict with target_weights,
+        # holdings DataFrame, sector_exposure, metadata, etc.
         #
         try:
             self._portfolio = build_portfolio(
-                snapshots=self._snapshots,
-                rankings=self._rankings,
-                capital=self.capital,
+                universe=self._scored_universe,
                 breadth=self._breadth,
             )
+
+            n_pos = self._portfolio.get(
+                "metadata", {}
+            ).get("num_holdings", 0)
             logger.info(
                 f"Phase 3b: Portfolio built — "
-                f"{self._portfolio.get('metadata', {}).get('n_positions', 0)} "
-                f"positions"
+                f"{n_pos} positions"
             )
 
-            # Enrich snapshots with allocation fields
+            # Enrich orchestrator snapshots with allocation info
             _enrich_snapshots_with_allocations(
-                self._snapshots, self._portfolio
+                self._snapshots,
+                self._portfolio,
+                self.capital,
             )
         except Exception as e:
-            logger.warning(f"Phase 3b: Portfolio build failed — {e}")
+            logger.warning(
+                f"Phase 3b: Portfolio build failed — {e}"
+            )
             self._portfolio = {}
 
-        # ── 3c. Signal Reconciliation ─────────────────────────
+        # ── 3c. Portfolio-Level Signal Generation ─────────────
         #
-        # Combine per-ticker gates with portfolio-level logic:
-        #   - Only top-ranked tickers get BUY signals
-        #   - Tickers dropping out of top-N get SELL
-        #   - Cooldown enforcement across the portfolio
-        #   - Position-size adjustments for breadth regime
+        # compute_all_signals() takes the ranked panel from 3a
+        # and applies cross-sectional rank filters with
+        # hysteresis, position limits, and a breadth circuit
+        # breaker to produce BUY/HOLD/SELL/NEUTRAL signals.
         #
-        if self.enable_signals:
+        if self.enable_signals and not self._rankings.empty:
             try:
-                self._signals = reconcile_signals(
-                    snapshots=self._snapshots,
-                    rankings=self._rankings,
-                    portfolio=self._portfolio,
+                self._signals = compute_all_signals(
+                    ranked=self._rankings,
                     breadth=self._breadth,
                 )
                 logger.info(
-                    f"Phase 3c: Signals reconciled — "
-                    f"{len(self._signals)} tickers"
+                    f"Phase 3c: Signals generated — "
+                    f"{len(self._signals)} rows"
                 )
 
-                # Update snapshot signals from reconciled output
+                # Update snapshots with reconciled signals
                 _enrich_snapshots_with_signals(
                     self._snapshots, self._signals
                 )
             except Exception as e:
                 logger.warning(
-                    f"Phase 3c: Signal reconciliation failed — {e}"
+                    f"Phase 3c: Signal generation failed — {e}"
                 )
                 self._signals = pd.DataFrame()
         else:
-            logger.info("Phase 3c: Signals disabled — skipping")
+            if not self.enable_signals:
+                logger.info(
+                    "Phase 3c: Signals disabled — skipping"
+                )
+            else:
+                logger.warning(
+                    "Phase 3c: No rankings — cannot generate "
+                    "signals"
+                )
 
         elapsed = time.perf_counter() - t0
         self._timings["cross_sectional"] = elapsed
@@ -651,76 +703,68 @@ class Orchestrator:
         """
         Generate reports and assemble the final PipelineResult.
 
-        This is the terminal phase.  It produces structured
-        report dicts (recommendation + weekly) and optionally
-        runs a historical backtest.
-
         Returns
         -------
         PipelineResult
-            Complete pipeline output.  All downstream consumers
-            (CLI, dashboard, export) read from this object.
         """
         self._require_phase("run_tickers")
         t0 = time.perf_counter()
 
         # ── Recommendation Report ─────────────────────────────
         #
-        # Structured output for the top-N recommended tickers
-        # with scores, indicators, risk levels, and rationale.
+        # build_report() expects a specific dict format with
+        # keys: summary, regime, risk_flags, portfolio_actions,
+        # ranked_buys, sells, holds, bucket_weights.
+        #
+        # _build_report_input() bridges from the orchestrator's
+        # internal state to that format.
         #
         try:
-            self._recommendation_report = build_recommendation_report(
-                snapshots=self._snapshots,
-                rankings=self._rankings,
-                portfolio=self._portfolio,
-                breadth=self._breadth,
+            report_input = self._build_report_input()
+            self._recommendation_report = build_report(
+                report_input
             )
             logger.info("Phase 4: Recommendation report built")
         except Exception as e:
             logger.warning(
                 f"Phase 4: Recommendation report failed — {e}"
             )
-
-        # ── Weekly Report ─────────────────────────────────────
-        #
-        # High-level summary: market regime, sector rotation,
-        # breadth health, portfolio changes, risk metrics.
-        #
-        try:
-            self._weekly_report = build_weekly_report(
-                snapshots=self._snapshots,
-                rankings=self._rankings,
-                portfolio=self._portfolio,
-                breadth=self._breadth,
-                sector_rs=self._sector_rs,
-            )
-            logger.info("Phase 4: Weekly report built")
-        except Exception as e:
-            logger.warning(
-                f"Phase 4: Weekly report failed — {e}"
-            )
+            self._recommendation_report = None
 
         # ── Backtest (optional) ───────────────────────────────
         #
-        # Historical simulation using the same scoring and
-        # signal logic.  Walks forward day-by-day, re-ranking
-        # and re-allocating at each rebalance date.
+        # run_backtest() takes the signals DataFrame from
+        # Phase 3c (MultiIndex: date × ticker with signal,
+        # signal_strength, close columns).
         #
         if self.enable_backtest:
-            try:
-                self._backtest = run_backtest(
-                    scored_universe=self._scored_universe,
-                    bench_df=self._bench_df,
-                    capital=self.capital,
-                    start=self.backtest_start,
+            if not self._signals.empty:
+                try:
+                    bt_config = BacktestConfig(
+                        initial_capital=self.capital,
+                    )
+                    self._backtest = run_backtest(
+                        signals_df=self._signals,
+                        config=bt_config,
+                    )
+                    metrics = (
+                        self._backtest.metrics
+                        if self._backtest else {}
+                    )
+                    logger.info(
+                        f"Phase 4: Backtest complete — "
+                        f"CAGR="
+                        f"{metrics.get('cagr', 0):.1%}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Phase 4: Backtest failed — {e}"
+                    )
+            else:
+                logger.warning(
+                    "Phase 4: Cannot run backtest — "
+                    "no signals generated"
                 )
-                logger.info(
-                    f"Phase 4: Backtest complete — "
-                    f"CAGR={self._backtest.get('cagr', 0):.1%}"
-                )
-            except Exception as e:
-                logger.warning(f"Phase 4: Backtest failed — {e}")
 
         elapsed = time.perf_counter() - t0
         self._timings["reports"] = elapsed
@@ -739,8 +783,11 @@ class Orchestrator:
             breadth=self._breadth,
             breadth_scores=self._breadth_scores,
             sector_rs=self._sector_rs,
+            bench_df=self._bench_df,
+            rotation_result=self._rotation_result,       # ← NEW
+            convergence=self._convergence_result,        # ← NEW
+            market=self.market,                          # ← NEW
             recommendation_report=self._recommendation_report,
-            weekly_report=self._weekly_report,
             backtest=self._backtest,
             errors=errors,
             timings=self._timings,
@@ -759,18 +806,19 @@ class Orchestrator:
         self,
         preloaded: dict[str, pd.DataFrame] | None = None,
         bench_df: pd.DataFrame | None = None,
+        current_holdings: list[str] | None = None,
     ) -> PipelineResult:
-        """
-        Execute all phases in sequence and return the result.
-
-        Equivalent to calling ``load_data()``,
-        ``compute_universe_context()``, ``run_tickers()``,
-        ``cross_sectional_analysis()``, and
-        ``generate_reports()`` in order.
-        """
+        """Execute all phases in sequence."""
         self.load_data(preloaded=preloaded, bench_df=bench_df)
         self.compute_universe_context()
         self.run_tickers()
+
+        # ── NEW: rotation + convergence ───────────────────
+        self.run_rotation_engine(
+            current_holdings=current_holdings,
+        )
+        self.apply_convergence()
+
         self.cross_sectional_analysis()
         return self.generate_reports()
 
@@ -784,27 +832,25 @@ class Orchestrator:
     ) -> PipelineResult:
         """
         Re-run Phase 3 + 4 without re-computing indicators.
-
-        Useful for testing different capital amounts or
-        portfolio parameters without the cost of Phase 1–2.
         """
         self._require_phase("run_tickers")
 
         if capital is not None:
             self.capital = capital
 
-        # Reset downstream state
-        self._snapshots = results_to_snapshots(self._ticker_results)
+        self._snapshots = results_to_snapshots(
+            self._ticker_results
+        )
         self._rankings = pd.DataFrame()
         self._portfolio = {}
         self._signals = pd.DataFrame()
         self._recommendation_report = None
-        self._weekly_report = None
 
-        # Remove downstream phases from completed list
         self._phases_completed = [
             p for p in self._phases_completed
-            if p in ("load_data", "universe_context", "run_tickers")
+            if p in (
+                "load_data", "universe_context", "run_tickers"
+            )
         ]
 
         self.cross_sectional_analysis()
@@ -816,13 +862,7 @@ class Orchestrator:
 
     def rerun_ticker(self, ticker: str) -> TickerResult:
         """
-        Re-run the pipeline for a single ticker using the
-        current universe context (breadth, sector RS).
-
-        Useful for debugging or refreshing a single ticker
-        without re-running the full batch.
-
-        The result is also updated in ``self._ticker_results``.
+        Re-run the pipeline for a single ticker.
         """
         self._require_phase("load_data")
 
@@ -857,11 +897,168 @@ class Orchestrator:
         return result
 
     # ───────────────────────────────────────────────────────
+    #  Report Input Bridge
+    # ───────────────────────────────────────────────────────
+
+    def _build_report_input(self) -> dict:
+        """
+        Construct the dict format that
+        ``reports.recommendations.build_report()`` expects.
+
+        Bridges from the orchestrator's internal state
+        (PipelineResult-style) to the legacy dict format with
+        keys: summary, regime, risk_flags, portfolio_actions,
+        ranked_buys, sells, holds, bucket_weights.
+
+        The snapshot dicts produced by ``runner._build_snapshot``
+        already contain the nested structure (sub_scores,
+        indicators, rs) that ``build_report`` reads, so this
+        is primarily a partitioning + metadata assembly step.
+        """
+        # ── Regime detection ──────────────────────────────
+        regime_label, regime_desc = _detect_regime(
+            self._bench_df, self._breadth
+        )
+
+        spy_close = 0.0
+        spy_sma200 = None
+        if not self._bench_df.empty:
+            spy_close = float(
+                self._bench_df["close"].iloc[-1]
+            )
+            if len(self._bench_df) >= 200:
+                sma = self._bench_df["close"].rolling(200).mean()
+                spy_sma200 = float(sma.iloc[-1])
+
+        breadth_label = "unknown"
+        if (
+            self._breadth is not None
+            and not self._breadth.empty
+            and "breadth_regime" in self._breadth.columns
+        ):
+            breadth_label = str(
+                self._breadth["breadth_regime"].iloc[-1]
+            )
+
+        # ── Split snapshots by signal ─────────────────────
+        buys = [
+            s for s in self._snapshots
+            if s.get("signal") == "BUY"
+        ]
+        sells = [
+            s for s in self._snapshots
+            if s.get("signal") == "SELL"
+        ]
+        holds = [
+            s for s in self._snapshots
+            if s.get("signal") not in ("BUY", "SELL")
+        ]
+
+        # Ensure allocation fields default to 0 (not None)
+        for s in buys + sells + holds:
+            s.setdefault("shares", 0)
+            s.setdefault("dollar_alloc", 0)
+            s.setdefault("weight_pct", 0)
+            s.setdefault("stop_price", None)
+            s.setdefault("risk_per_share", None)
+            s.setdefault("themes", [])
+            s.setdefault("category", "")
+            s.setdefault("bucket", "")
+            if s["shares"] is None:
+                s["shares"] = 0
+            if s["dollar_alloc"] is None:
+                s["dollar_alloc"] = 0
+            if s["weight_pct"] is None:
+                s["weight_pct"] = 0
+
+        # ── Summary values ────────────────────────────────
+        total_buy = sum(
+            s.get("dollar_alloc", 0) or 0 for s in buys
+        )
+        cash_rem = self.capital - total_buy
+        cash_pct = (
+            (cash_rem / self.capital * 100)
+            if self.capital > 0 else 100
+        )
+
+        date = (
+            self._snapshots[0]["date"]
+            if self._snapshots
+            else pd.Timestamp.now()
+        )
+
+        # ── Risk flags ────────────────────────────────────
+        risk_flags: list[str] = []
+        if breadth_label == "weak":
+            risk_flags.append(
+                "BREADTH_WEAK: Market breadth is weak — "
+                "reduced exposure recommended"
+            )
+        if regime_label in ("bear_mild", "bear_severe"):
+            risk_flags.append(
+                f"REGIME: {regime_label} — defensive "
+                f"positioning recommended"
+            )
+        if regime_label == "bear_severe":
+            risk_flags.append(
+                "CIRCUIT_BREAKER: Severe bear — "
+                "consider halting new buys"
+            )
+
+        # ── Bucket weights from sector exposure ───────────
+        bucket_weights: dict[str, float] = {}
+        if self._portfolio:
+            se = self._portfolio.get("sector_exposure", {})
+            meta = self._portfolio.get("metadata", {})
+            for sector, weight in se.items():
+                bucket_weights[sector] = weight
+            bucket_weights["cash"] = meta.get("cash_pct", 0.05)
+        else:
+            bucket_weights = {
+                "core_equity": 0.70,
+                "thematic": 0.20,
+                "cash": 0.10,
+            }
+
+        return {
+            "summary": {
+                "date":             date,
+                "portfolio_value":  self.capital,
+                "regime":           regime_label,
+                "regime_desc":      regime_desc,
+                "spy_close":        spy_close,
+                "bucket_breakdown": {},
+                "cash_pct":         cash_pct,
+                "tickers_analysed": len(self._snapshots),
+                "buy_count":        len(buys),
+                "sell_count":       len(sells),
+                "hold_count":       len(holds),
+                "error_count":      len(
+                    results_errors(self._ticker_results)
+                ),
+                "total_buy_dollar": total_buy,
+                "cash_remaining":   cash_rem,
+            },
+            "regime": {
+                "label":       regime_label,
+                "description": regime_desc,
+                "spy_close":   spy_close,
+                "spy_sma200":  spy_sma200,
+                "breadth":     breadth_label,
+            },
+            "risk_flags":        risk_flags,
+            "portfolio_actions": [],
+            "ranked_buys":       buys,
+            "sells":             sells,
+            "holds":             holds,
+            "bucket_weights":    bucket_weights,
+        }
+
+    # ───────────────────────────────────────────────────────
     #  Internal Helpers
     # ───────────────────────────────────────────────────────
 
     def _require_phase(self, phase: str) -> None:
-        """Raise if a prerequisite phase has not been completed."""
         if phase not in self._phases_completed:
             raise RuntimeError(
                 f"Phase '{phase}' has not been run yet.  "
@@ -875,56 +1072,28 @@ class Orchestrator:
 
 def run_full_pipeline(
     *,
+    market: str = "US",                                # ← NEW
     universe: list[str] | None = None,
     benchmark: str | None = None,
     capital: float | None = None,
     as_of: pd.Timestamp | None = None,
     preloaded: dict[str, pd.DataFrame] | None = None,
     bench_df: pd.DataFrame | None = None,
+    current_holdings: list[str] | None = None,         # ← NEW
     enable_breadth: bool = True,
     enable_sectors: bool = True,
     enable_signals: bool = True,
     enable_backtest: bool = False,
-    backtest_start: pd.Timestamp | None = None,
 ) -> PipelineResult:
     """
-    Run the full CASH pipeline end-to-end.
+    Run the full CASH pipeline end-to-end for one market.
 
     This is the main entry point for CLI usage and scheduled
-    jobs.  For interactive control, use the ``Orchestrator``
-    class directly.
-
-    Parameters
-    ----------
-    universe : list[str], optional
-        Ticker symbols.  Defaults to ``UNIVERSE`` from config.
-    benchmark : str, optional
-        Benchmark ticker.  Defaults to ``BENCHMARK_TICKER``.
-    capital : float, optional
-        Portfolio capital.  Defaults to config value.
-    as_of : pd.Timestamp, optional
-        Point-in-time cut-off for backtesting.
-    preloaded : dict, optional
-        ``{ticker: OHLCV DataFrame}`` to skip data loading.
-    bench_df : pd.DataFrame, optional
-        Pre-loaded benchmark OHLCV.
-    enable_breadth : bool
-        Compute universe breadth.  Default True.
-    enable_sectors : bool
-        Compute sector RS.  Default True.
-    enable_signals : bool
-        Generate signals.  Default True.
-    enable_backtest : bool
-        Run historical backtest.  Default False.
-    backtest_start : pd.Timestamp, optional
-        Backtest start date.
-
-    Returns
-    -------
-    PipelineResult
-        Complete pipeline output.
+    jobs.  For multi-market, use ``run_multi_market_pipeline()``.
+    For interactive control, use ``Orchestrator`` directly.
     """
     orch = Orchestrator(
+        market=market,                                 # ← NEW
         universe=universe,
         benchmark=benchmark,
         capital=capital,
@@ -933,149 +1102,280 @@ def run_full_pipeline(
         enable_sectors=enable_sectors,
         enable_signals=enable_signals,
         enable_backtest=enable_backtest,
-        backtest_start=backtest_start,
     )
 
-    return orch.run_all(preloaded=preloaded, bench_df=bench_df)
+    return orch.run_all(
+        preloaded=preloaded,
+        bench_df=bench_df,
+        current_holdings=current_holdings,             # ← NEW
+    )
 
+
+# ═══════════════════════════════════════════════════════════════
+#  MULTI-MARKET PIPELINE
+# ═══════════════════════════════════════════════════════════════
+
+def run_multi_market_pipeline(
+    *,
+    active_markets: list[str] | None = None,
+    capital: float | None = None,
+    as_of: pd.Timestamp | None = None,
+    preloaded: dict[str, dict[str, pd.DataFrame]] | None = None,
+    current_holdings: dict[str, list[str]] | None = None,
+    enable_backtest: bool = False,
+) -> dict[str, PipelineResult]:
+    """
+    Run the full CASH pipeline for every active market.
+
+    Creates a separate Orchestrator per market, each with the
+    correct benchmark, universe, and feature flags.
+
+    Parameters
+    ----------
+    active_markets : list[str], optional
+        Markets to run.  Defaults to ``ACTIVE_MARKETS`` from config
+        (typically ``["US", "HK", "IN"]``).
+    capital : float, optional
+        Portfolio value per market.
+    as_of : pd.Timestamp, optional
+        Cut-off date for backtesting.
+    preloaded : dict, optional
+        ``{market: {ticker: OHLCV DataFrame}}``.  If provided,
+        skips data loading for that market.
+    current_holdings : dict, optional
+        ``{market: [ticker, ...]}``.  Holdings are passed to
+        the rotation engine (US) for sell evaluation.
+    enable_backtest : bool
+        Run historical backtest for each market.
+
+    Returns
+    -------
+    dict[str, PipelineResult]
+        ``{market_code: PipelineResult}`` for each market that
+        ran successfully.
+
+    Example
+    -------
+    ::
+
+        results = run_multi_market_pipeline()
+        us = results["US"]
+        hk = results["HK"]
+
+        # US has convergence data
+        for s in us.convergence.strong_buys:
+            print(f"{s.ticker}: STRONG BUY, adj={s.adjusted_score:.3f}")
+
+        # HK has scoring-only signals
+        for s in hk.convergence.buys:
+            print(f"{s.ticker}: BUY, score={s.composite_score:.3f}")
+    """
+    markets = active_markets or ACTIVE_MARKETS
+    results: dict[str, PipelineResult] = {}
+
+    for market in markets:
+        mcfg = MARKET_CONFIG.get(market)
+        if mcfg is None:
+            logger.warning(
+                f"Market '{market}' not in MARKET_CONFIG — skipping"
+            )
+            continue
+
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"  MARKET: {market}")
+        logger.info(f"  Benchmark: {mcfg['benchmark']}")
+        logger.info(f"  Universe: {len(mcfg['universe'])} tickers")
+        logger.info(f"  Engines: {mcfg['engines']}")
+        logger.info(f"{'=' * 60}")
+
+        # Pre-loaded data for this market
+        pre = (
+            preloaded.get(market) if preloaded else None
+        )
+        holdings = (
+            current_holdings.get(market, [])
+            if current_holdings else None
+        )
+
+        try:
+            orch = Orchestrator(
+                market=market,
+                capital=capital,
+                as_of=as_of,
+                enable_backtest=enable_backtest,
+            )
+
+            result = orch.run_all(
+                preloaded=pre,
+                current_holdings=holdings,
+            )
+            results[market] = result
+
+            logger.info(
+                f"[{market}] Pipeline complete: "
+                f"{result.n_tickers} tickers, "
+                f"{result.n_errors} errors, "
+                f"{result.total_time:.1f}s"
+            )
+
+            # Log convergence summary
+            if result.convergence:
+                logger.info(
+                    f"[{market}] {result.convergence.summary()}"
+                )
+
+        except Exception as e:
+            logger.error(
+                f"[{market}] Pipeline failed: {e}",
+                exc_info=True,
+            )
+
+    logger.info(f"\nMulti-market complete: {list(results.keys())}")
+    return results
 
 # ═══════════════════════════════════════════════════════════════
 #  PRIVATE HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-def _load_universe(symbols: list[str]) -> dict[str, pd.DataFrame]:
+def _detect_regime(
+    bench_df: pd.DataFrame,
+    breadth: pd.DataFrame | None,
+) -> tuple[str, str]:
     """
-    Load OHLCV for every symbol via ``data.loader.load_ohlcv``.
+    Simple market regime detection from benchmark price action
+    and breadth state.
 
-    Skips symbols that fail to load and logs warnings.
-    Returns ``{ticker: DataFrame}`` for successfully loaded
-    symbols.
+    Returns (label, description) where label is one of:
+    bull_confirmed, bull_cautious, bear_mild, bear_severe.
     """
-    loaded: dict[str, pd.DataFrame] = {}
+    if bench_df is None or bench_df.empty:
+        return "bull_cautious", "Insufficient data for regime"
 
-    for sym in symbols:
-        try:
-            df = load_ohlcv(sym)
-            if df is not None and not df.empty:
-                loaded[sym] = df
-            else:
-                logger.warning(f"No data returned for {sym}")
-        except Exception as e:
-            logger.warning(f"Failed to load {sym}: {e}")
+    close = float(bench_df["close"].iloc[-1])
 
-    return loaded
+    # Check SPY vs 200-day SMA
+    above_sma200 = True
+    if len(bench_df) >= 200:
+        sma200 = float(
+            bench_df["close"].rolling(200).mean().iloc[-1]
+        )
+        above_sma200 = close > sma200
 
+    # Check breadth regime
+    b_regime = "unknown"
+    if (
+        breadth is not None
+        and not breadth.empty
+        and "breadth_regime" in breadth.columns
+    ):
+        b_regime = str(breadth["breadth_regime"].iloc[-1])
 
-def _extract_close_panel(
-    ohlcv: dict[str, pd.DataFrame],
-) -> pd.DataFrame:
-    """
-    Build a ``close`` price panel (columns = tickers) from
-    the universe OHLCV dict.
-
-    Used as input to ``compute_all_breadth()``.  Aligns all
-    tickers on a common DatetimeIndex using forward-fill
-    (max 5 days) to handle missing trading days.
-    """
-    close_dict = {}
-    for ticker, df in ohlcv.items():
-        if "close" in df.columns and not df.empty:
-            close_dict[ticker] = df["close"]
-
-    panel = pd.DataFrame(close_dict)
-    panel.sort_index(inplace=True)
-    panel.ffill(limit=5, inplace=True)
-    return panel
+    if above_sma200 and b_regime == "strong":
+        return (
+            "bull_confirmed",
+            "SPY above 200d SMA, breadth strong",
+        )
+    elif above_sma200:
+        return (
+            "bull_cautious",
+            f"SPY above 200d SMA, breadth {b_regime}",
+        )
+    elif b_regime == "weak":
+        return (
+            "bear_severe",
+            "SPY below 200d SMA, breadth weak",
+        )
+    else:
+        return (
+            "bear_mild",
+            f"SPY below 200d SMA, breadth {b_regime}",
+        )
 
 
 def _extract_sector_ohlcv(
     ohlcv: dict[str, pd.DataFrame],
 ) -> dict[str, pd.DataFrame]:
     """
-    Extract OHLCV for sector ETFs that are present in the
-    loaded universe.
+    Extract OHLCV for sector ETFs present in the loaded data.
 
-    Returns ``{sector_name: OHLCV DataFrame}`` for each sector
-    whose ETF ticker exists in the data.
-
-    The ``SECTOR_ETFS`` config maps sector names to ETF tickers
-    (e.g. ``{"Technology": "XLK", ...}``).
+    Returns ``{sector_name: OHLCV DataFrame}`` for sectors
+    whose ETF ticker exists in ``ohlcv``.
     """
     sector_data: dict[str, pd.DataFrame] = {}
-
     for sector_name, etf_ticker in SECTOR_ETFS.items():
         if etf_ticker in ohlcv:
             sector_data[sector_name] = ohlcv[etf_ticker]
-
     return sector_data
 
 
 def _enrich_snapshots_with_allocations(
     snapshots: list[dict],
     portfolio: dict,
+    capital: float,
 ) -> None:
     """
     Merge portfolio allocation fields into ticker snapshots.
 
-    Modifies snapshots in-place, adding: shares, dollar_alloc,
-    weight_pct, category, bucket.
+    ``build_portfolio()`` returns ``target_weights`` as
+    ``{ticker: weight_fraction}``.  This function converts
+    those weights to dollar allocations and share counts,
+    then writes them into the snapshot dicts in-place.
 
-    Tickers not in the portfolio get zero allocations and
-    category ``"not_selected"``.
+    Tickers not in the portfolio get zero allocations.
     """
-    allocations = portfolio.get("allocations", [])
-
-    # Build lookup by ticker
-    alloc_map: dict[str, dict] = {}
-    for alloc in allocations:
-        t = alloc.get("ticker")
-        if t:
-            alloc_map[t] = alloc
+    target_weights = portfolio.get("target_weights", {})
 
     for snap in snapshots:
         ticker = snap["ticker"]
-        alloc = alloc_map.get(ticker)
+        weight = target_weights.get(ticker, 0.0)
 
-        if alloc:
-            snap["shares"] = alloc.get("shares", 0)
-            snap["dollar_alloc"] = alloc.get("dollar_alloc", 0)
-            snap["weight_pct"] = alloc.get("weight_pct", 0)
-            snap["category"] = alloc.get("category", "selected")
-            snap["bucket"] = alloc.get("bucket")
+        if weight > 0:
+            dollar_alloc = weight * capital
+            close = snap.get("close", 0) or 0
+            shares = int(dollar_alloc / close) if close > 0 else 0
+
+            snap["weight_pct"] = round(weight * 100, 2)
+            snap["dollar_alloc"] = round(dollar_alloc, 2)
+            snap["shares"] = shares
+            snap["category"] = "selected"
         else:
+            snap["weight_pct"] = 0.0
+            snap["dollar_alloc"] = 0.0
             snap["shares"] = 0
-            snap["dollar_alloc"] = 0
-            snap["weight_pct"] = 0
             snap["category"] = "not_selected"
-            snap["bucket"] = None
 
 
 def _enrich_snapshots_with_signals(
     snapshots: list[dict],
-    signals: pd.DataFrame,
+    signals_df: pd.DataFrame,
 ) -> None:
     """
-    Update snapshot ``signal`` field from reconciled portfolio
-    signals.
+    Update snapshot ``signal`` field from the portfolio-level
+    signals DataFrame.
 
-    The reconciled signal overrides the per-ticker signal
-    because it incorporates cross-sectional ranking and
-    portfolio-level constraints (max positions, cooldowns,
-    breadth gating).
-
-    Modifies snapshots in-place.
+    ``compute_all_signals()`` returns a MultiIndex (date, ticker)
+    panel.  We extract the latest date's signals and overwrite
+    the per-ticker signal (from ``strategy/signals.py``) with
+    the portfolio-level signal (which incorporates rank
+    hysteresis, position limits, and breadth gating).
     """
-    if signals.empty:
+    if signals_df.empty or "signal" not in signals_df.columns:
         return
 
-    # Build lookup: ticker → reconciled signal
-    if "ticker" in signals.columns and "signal" in signals.columns:
-        sig_map = dict(
-            zip(signals["ticker"], signals["signal"])
-        )
-    elif signals.index.name == "ticker" and "signal" in signals.columns:
-        sig_map = signals["signal"].to_dict()
-    else:
+    dates = (
+        signals_df.index.get_level_values("date")
+        .unique()
+        .sort_values()
+    )
+    if len(dates) == 0:
+        return
+
+    latest_date = dates[-1]
+
+    try:
+        latest = signals_df.xs(latest_date, level="date")
+        sig_map = latest["signal"].to_dict()
+    except (KeyError, TypeError):
         return
 
     for snap in snapshots:

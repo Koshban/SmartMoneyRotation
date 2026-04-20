@@ -3,18 +3,25 @@ common/universe.py
 -----------
 Full investable universe for Smart Money Rotation.
 
-Two tiers:
-  1. ETF Universe   — used by the core rotation engine (scoring, signals, orders)
-  2. Single Names   — organized by theme, for future stock-picking layer
+Three tiers:
+  1.  ETF Universe     — used by the core US rotation engine (scoring, signals, orders)
+  1b. HK Universe      — scored by the bottom-up engine vs 2800.HK benchmark
+  1c. India Universe   — scored by the bottom-up engine vs NIFTYBEES.NS benchmark
+  2.  Single Names     — organized by theme, for future stock-picking layer
 
 Both tiers get ingested into daily_prices so we always have data ready.
 
-Hong Kong tickers use "XXXX.HK" format.
-ingest.py must parse the ".HK" suffix → exchange SEHK, currency HKD for IBKR.
+Ticker conventions:
+  Hong Kong  — "XXXX.HK"   (exchange SEHK, currency HKD)
+  India NSE  — "SYMBOL.NS"  (exchange NSE,  currency INR)
+  India BSE  — "SYMBOL.BO"  (exchange BSE,  currency INR)
+  US         — plain symbol  (exchange SMART, currency USD)
+
+ingest.py must parse suffixes to set the correct IBKR contract params.
 """
 
 # ═════════════════════════════════════════════════════════════════
-#  TIER 1 :  ETF UNIVERSE  (core rotation engine)
+#  TIER 1 :  ETF UNIVERSE  (core US rotation engine)
 # ═════════════════════════════════════════════════════════════════
 
 # ── Broad Market ───────────────────────────────────────────────
@@ -125,6 +132,163 @@ ETF_UNIVERSE = (
 
 
 # ═════════════════════════════════════════════════════════════════
+#  TIER 1b :  HK SCORING UNIVERSE
+# ═════════════════════════════════════════════════════════════════
+# Scored by the bottom-up engine against 2800.HK benchmark.
+# No rotation engine, no sector RS — pure individual scoring.
+# Roughly tracks the Hang Seng Composite + select H-shares.
+#
+# config.py imports HK_UNIVERSE for MARKET_CONFIG["HK"]["universe"].
+
+HK_SINGLE_NAMES = [
+    # ── China Tech ─────────────────────────────────────────
+    "0700.HK",   # Tencent
+    "9988.HK",   # Alibaba
+    "3690.HK",   # Meituan
+    "9618.HK",   # JD.com
+    "9888.HK",   # Baidu
+    "1810.HK",   # Xiaomi
+    "9999.HK",   # NetEase
+    "9626.HK",   # Bilibili
+    "1024.HK",   # Kuaishou
+    "0992.HK",   # Lenovo
+
+    # ── Financials / Insurance ─────────────────────────────
+    "1299.HK",   # AIA Group
+    "0005.HK",   # HSBC Holdings
+    "0388.HK",   # HK Exchanges & Clearing
+    "2318.HK",   # Ping An Insurance
+    "0939.HK",   # China Construction Bank
+    "1398.HK",   # ICBC
+    "3988.HK",   # Bank of China
+
+    # ── Property / REITs ───────────────────────────────────
+    "0001.HK",   # CK Hutchison
+    "1113.HK",   # CK Asset Holdings
+    "0016.HK",   # Sun Hung Kai Properties
+    "0823.HK",   # Link REIT
+    "1109.HK",   # China Resources Land
+
+    # ── Energy / Utilities ─────────────────────────────────
+    "0883.HK",   # CNOOC
+    "0857.HK",   # PetroChina
+    "0002.HK",   # CLP Holdings
+    "0003.HK",   # HK & China Gas
+
+    # ── Auto / EV ──────────────────────────────────────────
+    "1211.HK",   # BYD Company
+    "2015.HK",   # Li Auto
+    "9868.HK",   # XPeng
+    "0175.HK",   # Geely Automobile
+
+    # ── Consumer ───────────────────────────────────────────
+    "9633.HK",   # Nongfu Spring
+    "2020.HK",   # Anta Sports
+
+    # ── Telecom ────────────────────────────────────────────
+    "0941.HK",   # China Mobile
+    "0762.HK",   # China Unicom
+
+    # ── Healthcare / Biotech ───────────────────────────────
+    "1177.HK",   # Sino Biopharmaceutical
+    "2269.HK",   # WuXi Biologics
+    "3692.HK",   # Hansoh Pharmaceutical
+
+    # ── Additional (from hk_china single-names theme) ──────
+    "9866.HK",   # NIO Inc
+    "9961.HK",   # Trip.com
+]
+
+# Combined: ETFs + single names (deduplicated, sorted)
+HK_UNIVERSE = sorted(set(HK_ETFS + HK_SINGLE_NAMES))
+
+
+# ═════════════════════════════════════════════════════════════════
+#  TIER 1c :  INDIA SCORING UNIVERSE
+# ═════════════════════════════════════════════════════════════════
+# Scored by the bottom-up engine against NIFTYBEES.NS benchmark.
+# Roughly tracks the Nifty 50 — large-cap, liquid names where
+# momentum / volume indicators behave predictably.
+#
+# The smaller-cap India picks in Tier 2 SINGLE_NAMES["india"]
+# stay in the stock-picking layer and are NOT scored here.
+#
+# config.py imports INDIA_UNIVERSE for MARKET_CONFIG["IN"]["universe"].
+
+INDIA_LARGE_CAPS = [
+    # ── IT Services ────────────────────────────────────────
+    "TCS.NS",         # Tata Consultancy Services
+    "INFY.NS",        # Infosys
+    "WIPRO.NS",       # Wipro
+    "HCLTECH.NS",     # HCL Technologies
+    "TECHM.NS",       # Tech Mahindra
+    "LTIM.NS",        # LTIMindtree
+
+    # ── Financials ─────────────────────────────────────────
+    "HDFCBANK.NS",    # HDFC Bank
+    "ICICIBANK.NS",   # ICICI Bank
+    "SBIN.NS",        # State Bank of India
+    "KOTAKBANK.NS",   # Kotak Mahindra Bank
+    "AXISBANK.NS",    # Axis Bank
+    "BAJFINANCE.NS",  # Bajaj Finance
+    "BAJFINSV.NS",    # Bajaj Finserv
+    "INDUSINDBK.NS",  # IndusInd Bank
+
+    # ── Energy / Conglomerate ──────────────────────────────
+    "RELIANCE.NS",    # Reliance Industries
+    "ONGC.NS",        # Oil & Natural Gas Corp
+    "NTPC.NS",        # NTPC Ltd
+    "POWERGRID.NS",   # Power Grid Corp
+    "ADANIGREEN.NS",  # Adani Green Energy
+    "COALINDIA.NS",   # Coal India
+
+    # ── Consumer ───────────────────────────────────────────
+    "HINDUNILVR.NS",  # Hindustan Unilever
+    "ITC.NS",         # ITC Ltd
+    "ASIANPAINT.NS",  # Asian Paints
+    "TITAN.NS",       # Titan Company
+    "NESTLEIND.NS",   # Nestle India
+    "BRITANNIA.NS",   # Britannia Industries
+    "MARUTI.NS",      # Maruti Suzuki
+
+    # ── Industrials ────────────────────────────────────────
+    "LT.NS",          # Larsen & Toubro
+    "ADANIENT.NS",    # Adani Enterprises
+    "ADANIPORTS.NS",  # Adani Ports
+    "ULTRACEMCO.NS",  # UltraTech Cement
+    "GRASIM.NS",      # Grasim Industries
+    "TATASTEEL.NS",   # Tata Steel
+    "JSWSTEEL.NS",    # JSW Steel
+    "HINDALCO.NS",    # Hindalco
+
+    # ── Pharma / Healthcare ────────────────────────────────
+    "SUNPHARMA.NS",   # Sun Pharmaceutical
+    "DRREDDY.NS",     # Dr. Reddy's Laboratories
+    "CIPLA.NS",       # Cipla
+    "APOLLOHOSP.NS",  # Apollo Hospitals
+    "DIVISLAB.NS",    # Divi's Laboratories
+
+    # ── Telecom ────────────────────────────────────────────
+    "BHARTIARTL.NS",  # Bharti Airtel
+
+    # ── Auto ───────────────────────────────────────────────
+    "TATAMOTORS.NS",  # Tata Motors
+    "M&M.NS",         # Mahindra & Mahindra
+    "EICHERMOT.NS",   # Eicher Motors
+    "BAJAJ-AUTO.NS",  # Bajaj Auto
+    "HEROMOTOCO.NS",  # Hero MotoCorp
+]
+
+# Benchmark ETF is included so data is always fetched alongside the universe
+INDIA_BENCHMARKS = [
+    "NIFTYBEES.NS",   # Nippon India Nifty BeES — tracks Nifty 50
+]
+
+# Combined (deduplicated, sorted)
+INDIA_UNIVERSE = sorted(set(INDIA_LARGE_CAPS + INDIA_BENCHMARKS))
+
+
+# ═════════════════════════════════════════════════════════════════
 #  TIER 2 :  SINGLE NAMES  (future stock-picking layer)
 # ═════════════════════════════════════════════════════════════════
 
@@ -216,8 +380,6 @@ SINGLE_NAMES = {
         ],
     },
 
-    
-
     "momentum": {
         "name": "High Momentum Names",
         "etf_proxy": "MTUM",
@@ -287,7 +449,7 @@ SINGLE_NAMES = {
     "india": {
         "name": "India",
         "etf_proxy": "INDA",
-        "tickers": [            
+        "tickers": [
             "AMBER.NS",
             "ARE&M.NS",
             "AXISBANK.NS",
@@ -359,11 +521,11 @@ def is_hk_ticker(symbol: str) -> bool:
     return symbol.upper().endswith(".HK")
 
 
-# Replace the existing parse_hk_symbol with:
 def parse_hk_symbol(symbol: str) -> tuple[str, str]:
     """Parse HK ticker: '2800.HK' → ('2800', 'SEHK')."""
     code = symbol.replace(".HK", "")
     return code, "SEHK"
+
 
 # ── India Ticker Utilities ─────────────────────────────────────
 def is_india_ticker(symbol: str) -> bool:
@@ -385,6 +547,19 @@ def parse_india_symbol(symbol: str) -> tuple[str, str]:
     raise ValueError(f"Not an India ticker: {symbol}")
 
 
+# ── Market Detection ──────────────────────────────────────────
+def detect_market(symbol: str) -> str:
+    """
+    Return market code for a ticker: 'US', 'HK', or 'IN'.
+    Used by the orchestrator to route tickers to the right engine.
+    """
+    if is_hk_ticker(symbol):
+        return "HK"
+    if is_india_ticker(symbol):
+        return "IN"
+    return "US"
+
+
 # ── ETF Category Lookup ───────────────────────────────────────
 CATEGORY_MAP: dict[str, str] = {}
 for _sym in BROAD_MARKET:
@@ -401,6 +576,13 @@ for _sym in FIXED_INCOME:
     CATEGORY_MAP[_sym] = "Fixed Income"
 for _sym in COMMODITIES:
     CATEGORY_MAP[_sym] = "Commodities"
+# ── Tier 1b / 1c categories ───────────────────────────────────
+for _sym in HK_SINGLE_NAMES:
+    CATEGORY_MAP.setdefault(_sym, "HK Single Name")
+for _sym in INDIA_LARGE_CAPS:
+    CATEGORY_MAP.setdefault(_sym, "India Large Cap")
+for _sym in INDIA_BENCHMARKS:
+    CATEGORY_MAP.setdefault(_sym, "India Benchmark")
 
 
 def get_all_single_names() -> list[str]:
@@ -430,30 +612,48 @@ def get_us_only_etfs() -> list[str]:
 
 
 def get_hk_only() -> list[str]:
-    """Return all HK-listed tickers (ETFs + single names)."""
-    hk = [s for s in ETF_UNIVERSE if is_hk_ticker(s)]
+    """Return all HK-listed tickers (Tier 1b universe + any in Tier 2 themes)."""
+    hk: set[str] = set(HK_UNIVERSE)
     for theme in SINGLE_NAMES.values():
-        hk.extend(s for s in theme["tickers"] if is_hk_ticker(s))
-    return sorted(set(hk))
+        hk.update(s for s in theme["tickers"] if is_hk_ticker(s))
+    return sorted(hk)
 
 
 def get_india_only() -> list[str]:
-    """Return all India-listed tickers (.NS / .BO) from single names."""
-    india = []
+    """Return all India-listed tickers (Tier 1c universe + any in Tier 2 themes)."""
+    india: set[str] = set(INDIA_UNIVERSE)
     for theme in SINGLE_NAMES.values():
-        india.extend(s for s in theme["tickers"] if is_india_ticker(s))
-    return sorted(set(india))
+        india.update(s for s in theme["tickers"] if is_india_ticker(s))
+    return sorted(india)
 
 
 def get_full_universe() -> list[str]:
     """
-    Everything — ETFs + single names + theme proxies.
+    Everything — ETFs + HK universe + India universe + single names + theme proxies.
     Used by ingest.py for full backfill.
     """
     all_syms: set[str] = set(ETF_UNIVERSE)
+    all_syms.update(HK_UNIVERSE)
+    all_syms.update(INDIA_UNIVERSE)
     all_syms.update(get_all_single_names())
     all_syms.update(get_theme_etf_proxies())
     return sorted(all_syms)
+
+
+def get_universe_for_market(market: str) -> list[str]:
+    """
+    Return the scoring universe for a specific market.
+    This is what MARKET_CONFIG[market]["universe"] resolves to.
+    Convenience function for modules that don't import config.py.
+    """
+    if market == "US":
+        return list(ETF_UNIVERSE)
+    elif market == "HK":
+        return list(HK_UNIVERSE)
+    elif market == "IN":
+        return list(INDIA_UNIVERSE)
+    else:
+        raise ValueError(f"Unknown market: {market!r}  (expected 'US', 'HK', or 'IN')")
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -461,7 +661,7 @@ def get_full_universe() -> list[str]:
 # ═════════════════════════════════════════════════════════════════
 
 def print_universe():
-    """Pretty-print both tiers for verification."""
+    """Pretty-print all tiers for verification."""
 
     # ── Tier 1: ETFs ───────────────────────────────────────────
     print(f"\n{'='*65}")
@@ -479,6 +679,21 @@ def print_universe():
     for name, syms in etf_groups:
         print(f"  {name:16s} ({len(syms):2d}): {', '.join(syms)}")
 
+    # ── Tier 1b: HK Universe ──────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  TIER 1b : HK SCORING UNIVERSE  ({len(HK_UNIVERSE)} symbols)")
+    print(f"{'='*65}")
+    print(f"  ETFs         ({len(HK_ETFS):2d}): {', '.join(HK_ETFS)}")
+    print(f"  Single Names ({len(HK_SINGLE_NAMES):2d}): {', '.join(HK_SINGLE_NAMES[:10])}...")
+    print(f"  Benchmark       : 2800.HK (Tracker Fund)")
+
+    # ── Tier 1c: India Universe ────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  TIER 1c : INDIA SCORING UNIVERSE  ({len(INDIA_UNIVERSE)} symbols)")
+    print(f"{'='*65}")
+    print(f"  Large Caps   ({len(INDIA_LARGE_CAPS):2d}): {', '.join(INDIA_LARGE_CAPS[:8])}...")
+    print(f"  Benchmark       : NIFTYBEES.NS (Nifty BeES)")
+
     # ── Tier 2: Single Names ───────────────────────────────────
     singles = get_all_single_names()
     print(f"\n{'='*65}")
@@ -488,19 +703,21 @@ def print_universe():
     for key, theme in SINGLE_NAMES.items():
         print(f"  {theme['name']:30s} ({len(theme['tickers']):2d})"
               f"  proxy: {theme['etf_proxy']:5s}"
-              f"  | {', '.join(theme['tickers'])}")
+              f"  | {', '.join(theme['tickers'][:8])}"
+              f"{'...' if len(theme['tickers']) > 8 else ''}")
 
-    # ── HK Tickers ─────────────────────────────────────────────
+    # ── HK Tickers (all sources) ──────────────────────────────
     hk_all = get_hk_only()
     print(f"\n{'='*65}")
-    print(f"  HK-LISTED TICKERS  ({len(hk_all)} symbols — need SEHK/HKD)")
+    print(f"  ALL HK TICKERS  ({len(hk_all)} symbols — need SEHK/HKD)")
     print(f"{'='*65}")
-    print(f"  {', '.join(hk_all)}")
+    for i in range(0, len(hk_all), 8):
+        print(f"  {', '.join(hk_all[i:i+8])}")
 
-    # ── India Tickers ──────────────────────────────────────────
+    # ── India Tickers (all sources) ───────────────────────────
     india_all = get_india_only()
     print(f"\n{'='*65}")
-    print(f"  INDIA-LISTED TICKERS  ({len(india_all)} symbols — need NSE/BSE)")
+    print(f"  ALL INDIA TICKERS  ({len(india_all)} symbols — need NSE/BSE)")
     print(f"{'='*65}")
     for i in range(0, len(india_all), 6):
         print(f"  {', '.join(india_all[i:i+6])}")
@@ -511,8 +728,10 @@ def print_universe():
     print(f"\n{'='*65}")
     print(f"  FULL UNIVERSE    : {len(full)} unique symbols")
     print(f"  US ETFs only     : {len(us_etfs)} symbols")
-    print(f"  HK tickers       : {len(hk_all)} symbols")
-    print(f"  India tickers    : {len(india_all)} symbols")
+    print(f"  HK universe      : {len(HK_UNIVERSE)} symbols (scoring)")
+    print(f"  HK all sources   : {len(hk_all)} symbols (incl. themes)")
+    print(f"  India universe   : {len(INDIA_UNIVERSE)} symbols (scoring)")
+    print(f"  India all sources: {len(india_all)} symbols (incl. themes)")
     print(f"{'='*65}\n")
 
 

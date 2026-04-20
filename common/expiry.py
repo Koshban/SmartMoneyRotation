@@ -1,4 +1,6 @@
-"""Monthly option expiry date utilities."""
+"""
+common/expiry.py
+Monthly option expiry date utilities."""
 
 from datetime import date, timedelta
 from typing import List, Tuple

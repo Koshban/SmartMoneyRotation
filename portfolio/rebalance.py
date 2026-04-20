@@ -37,10 +37,11 @@ class RebalanceConfig:
 
     # Drift threshold: rebalance when any position drifts
     # more than this from its target weight
-    drift_threshold: float = 0.05
+    # Rebalance only when drift exceeds 15% (was 5%)
+    drift_threshold: float = 0.15
 
     # Minimum trade as fraction of portfolio value
-    min_trade_pct: float = 0.01
+    min_trade_pct: float = 0.03
 
     # Transaction costs
     commission_pct: float = 0.001    # 10 bps

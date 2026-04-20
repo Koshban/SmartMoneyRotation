@@ -281,7 +281,7 @@ def _load_from_db(ticker: str) -> pd.DataFrame:
             SELECT date as date, open, high, low, close, volume
             FROM {table}
             WHERE symbol = %s
-            ORDER BY trade_date ASC
+            ORDER BY date ASC
         """
         df = pd.read_sql(query, conn, params=(ticker,))
         conn.close()
@@ -362,13 +362,16 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     # ── Lowercase column names ────────────────────────────────
     df.columns = [str(c).lower().strip() for c in df.columns]
 
-    # ── Common renames ────────────────────────────────────────
-    renames = {
-        "adj close": "adj_close",
-        "adj_close": "adj_close",
+    # ── Rename known variants to canonical names ──────────────
+    # Applied once — downstream code only references canonical names.
+    _COLUMN_RENAMES = {
+        "adj close":  "adj_close",
         "trade_date": "date",
     }
-    df.rename(columns=renames, inplace=True)
+    df.rename(
+        columns={k: v for k, v in _COLUMN_RENAMES.items() if k in df.columns},
+        inplace=True,
+    )
 
     # ── Set date index ────────────────────────────────────────
     if "date" in df.columns:
@@ -383,21 +386,23 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
 
     df.index.name = "date"
 
-    # ── Drop non-OHLCV columns (ticker, symbol, etc.) ────────
-    for col in ["ticker", "symbol", "adj_close", "currency",
-                "bar_count", "average", "vwap", "num_trades",
-                "exchange", "created_at", "updated_at", "id"]:
-        if col in df.columns:
-            df.drop(columns=col, inplace=True, errors="ignore")
+    # ── Drop non-OHLCV columns ────────────────────────────────
+    # After renaming, only canonical names exist.  We keep
+    # exactly _REQUIRED_COLS and discard everything else.
+    # This is safer than maintaining an ever-growing deny-list:
+    # new metadata columns from DB or yfinance are automatically
+    # excluded without needing code changes.
+    keep = [c for c in df.columns if c in _REQUIRED_COLS]
+    missing = [c for c in _REQUIRED_COLS if c not in df.columns]
 
-    # ── Validate required columns ─────────────────────────────
-    for col in _REQUIRED_COLS:
-        if col not in df.columns:
-            logger.debug(
-                f"Missing column '{col}' after normalisation. "
-                f"Available: {list(df.columns)}"
-            )
-            return pd.DataFrame()
+    if missing:
+        logger.debug(
+            f"Missing required columns after normalisation: {missing}. "
+            f"Available: {list(df.columns)}"
+        )
+        return pd.DataFrame()
+
+    df = df[keep]
 
     # ── Clean ─────────────────────────────────────────────────
     df = df.sort_index()
@@ -425,10 +430,10 @@ def _find_symbol_col(df: pd.DataFrame) -> str | None:
                       "SYMBOL", "TICKER"]:
         if candidate in df.columns:
             return candidate
-    # Check if it's in the index
     if df.index.name in ("symbol", "ticker"):
+        name = df.index.name
         df.reset_index(inplace=True)
-        return df.index.name
+        return name
     return None
 
 
