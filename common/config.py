@@ -1,24 +1,35 @@
 """
-config.py
----------
+common/config.py
+----------------
 Central configuration for the smart-money rotation system.
 All tunable parameters live here.  Every downstream module imports
 from this file — nothing is hard-coded elsewhere.
-
-To backtest alternative settings, duplicate this file as
-config_v2.py and point your runner at it, or simply edit in place.
 """
 
 from pathlib import Path
 from common.credentials import PG_CONFIG, IBKR_PORT
+from common.universe import ETF_UNIVERSE
+
+# ═══════════════════════════════════════════════════════════════
+# 0.  DEFAULT PIPELINE UNIVERSE
+# ═══════════════════════════════════════════════════════════════
+# The orchestrator imports this as the default ticker list.
+# Override at runtime via Orchestrator(universe=[...]).
+# ETF_UNIVERSE is the core rotation engine's scoreable set.
+# Single names and India/.HK tickers are additive — pass them
+# explicitly when data sources are configured for those markets.
+UNIVERSE = list(ETF_UNIVERSE)
 
 # ═══════════════════════════════════════════════════════════════
 # 1.  PROJECT PATHS
 # ═══════════════════════════════════════════════════════════════
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SRC_DIR      = PROJECT_ROOT / "src" 
 DATA_DIR     = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STAGING_FILE = DATA_DIR / "staging.json"
+LOGS_DIR = PROJECT_ROOT / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════
 # 2.  DATABASE
@@ -54,6 +65,7 @@ FETCH_PARAMS = {
 # 5.  BENCHMARKS
 # ═══════════════════════════════════════════════════════════════
 BENCHMARKS = ["SPY", "QQQ", "IWM"]
+BENCHMARK_TICKER = "SPY"
 
 # ═══════════════════════════════════════════════════════════════
 # 6.  INDICATOR PARAMETERS
@@ -71,8 +83,16 @@ INDICATOR_PARAMS = {
 
     # ── Moving averages ────────────────────────────────────
     "ema_period":           30,
+    "ema_short":            9,
+    "ema_mid":              21,
     "sma_short":            30,
     "sma_long":             50,
+    "sma_50":               50,
+    "sma_200":              200,
+
+    # ── Bollinger Bands ────────────────────────────────────
+    "bb_period":            20,
+    "bb_std":               2.0,
 
     # ── Volatility ─────────────────────────────────────────
     "atr_period":           14,
@@ -82,7 +102,36 @@ INDICATOR_PARAMS = {
     "obv":                  True,
     "ad_line":              True,
     "volume_avg_window":    20,
+    "vol_sma_period":       20,
     "amihud_window":        20,
+    "amihud_period":        20,
+
+    # ── Stochastic ─────────────────────────────────────────
+    "stoch_k":              14,
+    "stoch_d":              3,
+    "stoch_smooth":         3,
+
+    # ── Rate of Change ─────────────────────────────────────
+    "roc_period":           12,
+
+    # ── Keltner Channel ────────────────────────────────────
+    "kc_period":            20,
+    "kc_atr_mult":          1.5,
+
+    # ── VWAP lookback ──────────────────────────────────────
+    "vwap_period":          20,
+
+    # ── OBV smoothing ──────────────────────────────────────
+    "obv_sma":              20,
+
+    # ── MFI ────────────────────────────────────────────────
+    "mfi_period":           14,
+
+    # ── CCI ────────────────────────────────────────────────
+    "cci_period":           20,
+
+    # ── Donchian Channel ───────────────────────────────────
+    "dc_period":            20,
 
     # ── Breadth ────────────────────────────────────────────
     "breadth_ma_windows":   [20, 50],
@@ -92,24 +141,34 @@ INDICATOR_PARAMS = {
 
     # ── Correlation ────────────────────────────────────────
     "correlation_window":   60,
-    
-    # ── NEW: relative strength params ───────────────────────
-    "rs_ema_span":                10,   # smoothing on RS ratio
-    "rs_sma_span":                50,   # trend baseline for RS ratio
-    "rs_slope_window":            20,   # rolling regression window
-    "rs_zscore_window":           60,   # lookback for z-score normalization
-    "rs_momentum_short":          10,   # short slope for acceleration
-    "rs_momentum_long":           30,   # long slope for acceleration
-    "rs_vol_confirm_threshold":  1.3,   # relative volume threshold
+
+    # ── Relative strength params ───────────────────────────
+    "rs_ema_span":                10,
+    "rs_sma_span":                50,
+    "rs_slope_window":            20,
+    "rs_zscore_window":           60,
+    "rs_momentum_short":          10,
+    "rs_momentum_long":           30,
+    "rs_vol_confirm_threshold":  1.3,
 }
 
 # ═══════════════════════════════════════════════════════════════
 # 7.  RELATIVE STRENGTH PARAMETERS
 # ═══════════════════════════════════════════════════════════════
 RS_PARAMS = {
+    # Legacy keys (retained for compatibility)
     "lookback_windows":     [10, 20],
-    "slope_window":         10,
     "primary_benchmark":    "SPY",
+
+    # Keys used by compute/relative_strength.py
+    "lookback":            63,
+    "slope_window":        21,
+    "zscore_window":       63,
+    "ma_short":            10,
+    "ma_long":             40,
+    "strong_z":            1.0,
+    "weak_z":             -1.0,
+    "improving_slope":     0.0,
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -122,20 +181,8 @@ OPTIONS_PARAMS = {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# 9.  SCORING — SIX PILLARS
+# 9.  SCORING — SIX PILLARS (original architecture)
 # ═══════════════════════════════════════════════════════════════
-#
-#   Pillar                      Weight   What it measures
-#   ─────────────────────────   ──────   ────────────────────────
-#   relative_strength           0.25     Cross-sectional rotation
-#   trend_momentum              0.25     Absolute trend strength
-#   volume_accumulation         0.20     Flow confirmation
-#   breadth                     0.15     Participation within theme
-#   options_volatility          0.10     Forward-looking positioning
-#   liquidity_penalty           0.05     Quality gate (negative mod)
-#
-#   Weights MUST sum to 1.0.
-
 PILLAR_WEIGHTS = {
     "relative_strength":    0.25,
     "trend_momentum":       0.25,
@@ -145,9 +192,6 @@ PILLAR_WEIGHTS = {
     "liquidity_penalty":    0.05,
 }
 
-# ── Per-pillar metric weights (equal-weight by default) ────────
-# Set to None for equal-weight.  Override with a dict of
-# {metric_name: weight} to fine-tune within a pillar.
 PILLAR_METRIC_WEIGHTS = {
     "relative_strength":    None,
     "trend_momentum":       None,
@@ -160,34 +204,16 @@ PILLAR_METRIC_WEIGHTS = {
 # ═══════════════════════════════════════════════════════════════
 # 10. NORMALIZATION
 # ═══════════════════════════════════════════════════════════════
-#
-#   method:
-#     "zscore"     → winsorized z-score (default)
-#     "percentile" → rank-based, output 0–1
-#
-#   zscore_cap: winsorize at ± this value (ignored for percentile)
-
 NORMALIZATION = {
     "default_method":  "zscore",
     "zscore_cap":      3.0,
 }
 
-# Per-pillar override.  Any pillar not listed uses default_method.
-PILLAR_NORM_OVERRIDE = {
-    # "options_volatility": "percentile",
-}
+PILLAR_NORM_OVERRIDE = {}
 
 # ═══════════════════════════════════════════════════════════════
 # 11. THEME SCORING MODE  (HYBRID)
 # ═══════════════════════════════════════════════════════════════
-#
-#   "etf"    → compute on the theme ETF only
-#   "basket" → compute on every name, then aggregate
-#
-#   Hybrid default:
-#     - ETF for trend/momentum, relative strength
-#     - Basket for breadth, volume/accumulation, options
-
 THEME_SCORING_SOURCE = {
     "relative_strength":    "etf",
     "trend_momentum":       "etf",
@@ -219,15 +245,16 @@ OUTPUT = {
     "save_to_postgres":     True,
 }
 
-# ── SCORING WEIGHTS ─────────────────────────────────────────
-# Pillar weights must sum to 1.0
-# Sub-component weights within each pillar must sum to 1.0
+# ═══════════════════════════════════════════════════════════════
+# 14. SCORING WEIGHTS  (used by compute/scoring.py)
+# ═══════════════════════════════════════════════════════════════
 SCORING_WEIGHTS = {
-    # Pillar weights
-    "pillar_rotation":       0.35,
-    "pillar_momentum":       0.25,
-    "pillar_volatility":     0.20,
-    "pillar_microstructure": 0.20,
+    # Pillar weights (must sum to 1.0 when all five are active)
+    "pillar_rotation":       0.30,    # was 0.35
+    "pillar_momentum":       0.25,    # was 0.25
+    "pillar_volatility":     0.15,    # was 0.20
+    "pillar_microstructure": 0.20,    # was 0.20
+    "pillar_breadth":        0.10,    # NEW
 
     # Pillar 1 — Rotation sub-weights
     "rs_zscore_w":           0.35,
@@ -251,16 +278,31 @@ SCORING_WEIGHTS = {
     "rel_volume_w":          0.35,
 }
 
-# ── SCORING PARAMS ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 15. SCORING PARAMS  (used by compute/scoring.py)
+# ═══════════════════════════════════════════════════════════════
 SCORING_PARAMS = {
-    "rank_window":          60,    # rolling percentile-rank lookback
-    "micro_slope_window":   10,    # slope lookback for OBV / A-D line
-    "rs_momentum_scale":   500,    # multiplier before sigmoid (values ~±0.003)
+    "rank_window":          60,
+    "micro_slope_window":   10,
+    "rs_momentum_scale":   500,
+
+    # Also used by the 4-pillar scoring variant
+    "w_momentum":     0.30,
+    "w_trend":        0.30,
+    "w_volume":       0.20,
+    "w_volatility":   0.20,
+    "zscore_cap":     3.0,
+
+    # Sector adjustment
+    "sector_adj_leading":    0.04,
+    "sector_adj_improving":  0.02,
+    "sector_adj_weakening": -0.02,
+    "sector_adj_lagging":   -0.04,
 }
 
-# ── SECTOR CONFIGURATION ────────────────────────────────────
-BENCHMARK_TICKER = "SPY"
-
+# ═══════════════════════════════════════════════════════════════
+# 16. SECTOR CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
 SECTOR_ETFS = {
     "Technology":       "XLK",
     "Healthcare":       "XLV",
@@ -275,51 +317,191 @@ SECTOR_ETFS = {
     "Communication":    "XLC",
 }
 
+# Alias used by compute/sector_rs.py
+SECTOR_ETF_MAP = SECTOR_ETFS
+
 SECTOR_RS_PARAMS = {
-    "rs_lookback":      63,     # ~3 months
-    "slope_window":     20,     # regression slope window
-    "zscore_window":    63,     # z-score normalization lookback
-    "momentum_window":  10,     # acceleration of RS slope
-    "rank_smoothing":   5,      # smooth cross-sectional pct-ranks
+    # Legacy keys
+    "rs_lookback":      63,
+    "momentum_window":  10,
+    "rank_smoothing":   5,
+
+    # Keys used by compute/sector_rs.py
+    "lookback":            63,
+    "slope_window":        21,
+    "zscore_window":       63,
+    "ma_short":            10,
+    "ma_long":             40,
+    "strong_z":            0.75,
+    "weak_z":             -0.75,
+    "improving_slope":     0.0,
+    "top_n_sectors":       4,
+    "tailwind_regimes":    ["leading", "improving"],
+    "headwind_regimes":    ["lagging"],
 }
 
-# How much sector context adjusts the stock composite score
 SECTOR_SCORE_ADJUSTMENT = {
     "enabled":      True,
-    "max_boost":    0.10,       # best sector adds +0.10 to composite
-    "max_penalty": -0.10,       # worst sector subtracts 0.10
+    "max_boost":    0.10,
+    "max_penalty": -0.10,
 }
 
-# ── STRATEGY / SIGNAL PARAMETERS ────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 17. TICKER → SECTOR MAPPING
+# ═══════════════════════════════════════════════════════════════
+TICKER_SECTOR_MAP = {
+    # Technology
+    "AAPL": "Technology", "MSFT": "Technology", "NVDA": "Technology",
+    "GOOGL": "Technology", "META": "Technology", "AMZN": "Technology",
+    "AVGO": "Technology", "CRM": "Technology", "ADBE": "Technology",
+    "AMD": "Technology", "INTC": "Technology", "ORCL": "Technology",
+    "CSCO": "Technology", "QCOM": "Technology", "TXN": "Technology",
+    "NOW": "Technology", "AMAT": "Technology", "MU": "Technology",
+
+    # Financials
+    "JPM": "Financials", "GS": "Financials", "BAC": "Financials",
+    "MS": "Financials", "WFC": "Financials", "C": "Financials",
+    "BLK": "Financials", "SCHW": "Financials", "AXP": "Financials",
+
+    # Energy
+    "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
+    "SLB": "Energy", "EOG": "Energy", "MPC": "Energy",
+
+    # Healthcare
+    "JNJ": "Healthcare", "UNH": "Healthcare", "PFE": "Healthcare",
+    "LLY": "Healthcare", "ABBV": "Healthcare", "MRK": "Healthcare",
+    "TMO": "Healthcare", "ABT": "Healthcare", "BMY": "Healthcare",
+
+    # Consumer Staples
+    "PG": "Consumer Staples", "KO": "Consumer Staples",
+    "PEP": "Consumer Staples", "WMT": "Consumer Staples",
+    "COST": "Consumer Staples", "CL": "Consumer Staples",
+
+    # Consumer Disc
+    "HD": "Consumer Disc", "NKE": "Consumer Disc",
+    "MCD": "Consumer Disc", "SBUX": "Consumer Disc",
+    "TGT": "Consumer Disc", "LOW": "Consumer Disc",
+
+    # Industrials
+    "LIN": "Industrials", "CAT": "Industrials",
+    "HON": "Industrials", "UPS": "Industrials",
+    "RTX": "Industrials", "DE": "Industrials",
+    "GE": "Industrials", "BA": "Industrials",
+
+    # Materials
+    "APD": "Materials", "ECL": "Materials",
+    "NEM": "Materials", "FCX": "Materials",
+
+    # Utilities
+    "NEE": "Utilities", "DUK": "Utilities",
+    "SO": "Utilities", "D": "Utilities",
+
+    # Communication
+    "DIS": "Communication", "NFLX": "Communication",
+    "T": "Communication", "VZ": "Communication",
+    "TMUS": "Communication",
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 18. SIGNAL PARAMETERS  (used by strategy/signals.py)
+# ═══════════════════════════════════════════════════════════════
 SIGNAL_PARAMS = {
     # ── Entry thresholds ─────────────────────────────────────
-    "entry_score_min":        0.60,   # adjusted score must exceed
-    "entry_percentile_min":   0.70,   # score_percentile must exceed
-    "entry_momentum_confirm": True,   # require momentum pillar > 0.55
+    "entry_score_min":        0.60,
+    "entry_percentile_min":   0.70,
+    "entry_momentum_confirm": True,
 
     # ── Exit thresholds ──────────────────────────────────────
-    "exit_score_below":       0.45,   # exit if adjusted drops below
-    "exit_percentile_below":  0.30,   # exit if percentile drops below
+    "exit_score_below":       0.45,
+    "exit_percentile_below":  0.30,
+    "exit_score_max":         0.40,     # used by signals.py cooldown
 
-    # ── Regime filters ───────────────────────────────────────
+    # ── RS regime gate (used by strategy/signals.py) ─────────
+    "allowed_rs_regimes":     ["leading", "improving"],
+    "allowed_sector_regimes": ["leading", "improving", "neutral"],
+
+    # ── Legacy regime keys (retained for compatibility) ──────
     "stock_regime_allowed":   ["leading", "improving"],
     "sector_regime_blocked":  ["lagging"],
 
+    # ── Momentum persistence ─────────────────────────────────
+    "confirmation_streak":    3,
+    "entry_confirm_days":     2,
+    "exit_confirm_days":      1,
+
+    # ── Anti-churn cooldown ──────────────────────────────────
+    "cooldown_days":          5,
+
     # ── Position sizing ──────────────────────────────────────
-    "max_position_pct":       0.08,   # 8% max single position
-    "min_position_pct":       0.02,   # 2% min (below this → skip)
-    "base_position_pct":      0.05,   # 5% starting point
-    "score_scale_factor":     1.5,    # how much score adjusts size
-    "vol_penalty_threshold":  0.80,   # score_volatility below this
-    "vol_penalty_factor":     0.60,   # → reduce size by 40%
+    "max_position_pct":       0.08,
+    "min_position_pct":       0.02,
+    "base_position_pct":      0.05,
+    "score_scale_factor":     1.5,
+    "vol_penalty_threshold":  0.80,
+    "vol_penalty_factor":     0.60,
 
     # ── Concentration limits ─────────────────────────────────
-    "max_sector_exposure":    0.30,   # 30% max per sector
-    "max_positions":          15,     # hard cap on open positions
-    "min_positions":          5,      # diversification floor
-
-    # ── Signal smoothing ─────────────────────────────────────
-    "entry_confirm_days":     2,      # must hold above entry for N days
-    "exit_confirm_days":      1,      # exit triggers after N days below
-    "cooldown_days":          5,      # wait N days after exit before re-entry
+    "max_sector_exposure":    0.30,
+    "max_positions":          15,
+    "min_positions":          5,
 }
+
+# ═══════════════════════════════════════════════════════════════
+# 19. PORTFOLIO CONSTRUCTION
+# ═══════════════════════════════════════════════════════════════
+PORTFOLIO_PARAMS = {
+    "total_capital":         100_000,
+    "max_positions":         15,
+    "min_positions":          5,
+    "max_sector_pct":        0.30,
+    "max_single_pct":        0.08,
+    "min_single_pct":        0.02,
+    "target_invested_pct":   0.95,
+    "rebalance_threshold":   0.015,
+    "incumbent_bonus":       0.02,
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 20. MARKET BREADTH
+# ═══════════════════════════════════════════════════════════════
+BREADTH_PARAMS = {
+    # Advance/Decline
+    "min_stocks":           10,       # minimum universe size to compute
+
+    # McClellan
+    "mcclellan_fast":       19,
+    "mcclellan_slow":       39,
+
+    # Percent above MA
+    "ma_short":             50,
+    "ma_long":              200,
+
+    # New highs / lows
+    "high_low_window":      252,
+
+    # Breadth thrust
+    "thrust_window":        10,
+    "thrust_up_threshold":  0.615,
+    "thrust_dn_threshold":  0.25,
+
+    # Regime classification
+    "regime_strong_pct":    0.65,
+    "regime_weak_pct":      0.35,
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 21. BREADTH → PORTFOLIO INTEGRATION
+# ═══════════════════════════════════════════════════════════════
+BREADTH_PORTFOLIO = {
+    "strong_exposure":     1.00,
+    "neutral_exposure":    0.80,
+    "weak_exposure":       0.50,
+    "weak_block_new":      True,
+    "weak_raise_entry":    0.05,
+    "neutral_raise_entry": 0.02,
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 22. STOP-LOSS
+# ═══════════════════════════════════════════════════════════════
+ATR_STOP_MULTIPLIER = 2.0    # stop-loss at 2× ATR below entry

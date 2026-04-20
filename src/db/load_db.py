@@ -1,331 +1,358 @@
 """
-load_db.py – Read parquet files and upsert into PostgreSQL (cash + options).
+src/db/load_db.py
+
+Load parquet / CSV files into PostgreSQL tables defined in schema.py.
 
 Usage:
-    python src/db/load_db.py --market all --type cash
-    python src/db/load_db.py --market all --type options
     python src/db/load_db.py --market all --type all
-    python src/db/load_db.py --market india --type cash
-    python src/db/load_db.py --market us --type options --dry-run
+    python src/db/load_db.py --market us  --type cash
+    python src/db/load_db.py --market us  --type options
+    python src/db/load_db.py --market hk  --type options
+    python src/db/load_db.py --status
 """
-
 import sys
-import logging
-import argparse
 from pathlib import Path
 
-# ── Ensure src/ is on the Python path ─────────────────────────
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+_SRC  = Path(__file__).resolve().parent.parent  # .../src
+_ROOT = _SRC.parent                             # .../SmartMoneyRotation
+for _p in (str(_ROOT), str(_SRC)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import argparse
+import logging
 import pandas as pd
-import psycopg2
-from psycopg2.extras import execute_values
+from sqlalchemy import text
 
-from common.credentials import PG_CONFIG
+SRC = Path(__file__).resolve().parent.parent
+ROOT = SRC.parent
+sys.path.insert(0, str(ROOT))
 
-# ── Paths ──────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-CASH_PARQUET = DATA_DIR / "universe_ohlcv.parquet"
+from db.db import get_engine
 
-logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)-20s %(levelname)-10s %(message)s",
 )
+LOG = logging.getLogger(__name__)
 
-BATCH_SIZE = 5000
-
-# ── Region classification ──────────────────────────────────────
-REGION_CONFIG = {
-    "us":     {"cash_table": "us_cash",     "options_table": "us_options",     "currency": "USD"},
-    "hk":     {"cash_table": "hk_cash",     "options_table": "hk_options",     "currency": "HKD"},
-    "india":  {"cash_table": "india_cash",  "options_table": "india_options",  "currency": "INR"},
-    "others": {"cash_table": "others_cash", "options_table": "others_options", "currency": "USD"},
-}
-
-OPTIONS_PARQUETS = {
-    "us": DATA_DIR / "us_options.parquet",
-    "hk": DATA_DIR / "hk_options.parquet",
-}
-
-SUFFIX_TO_REGION = {
-    ".HK": "hk",
-    ".NS": "india",
-    ".BO": "india",
-}
+DATA_DIR = ROOT / "data"
 
 
-def classify_symbol(symbol: str) -> str:
-    """Determine region from ticker suffix."""
-    for suffix, region in SUFFIX_TO_REGION.items():
-        if symbol.upper().endswith(suffix.upper()):
-            return region
-    if "." not in symbol:
-        return "us"
-    return "others"
-
-
-# ====================================================================
-#  SQL
-# ====================================================================
+# ═══════════════════════════════════════════════════════════════
+#  COLUMN MAPS  — parquet/CSV column → DB column
+# ═══════════════════════════════════════════════════════════════
 
 CASH_COLUMNS = [
-    "symbol", "trade_date", "open", "high", "low",
-    "close", "adj_close", "volume", "currency",
+    "date", "symbol", "open", "high", "low", "close", "volume",
 ]
-
-CASH_UPSERT_SQL = """
-INSERT INTO {table} (symbol, trade_date, open, high, low, close, adj_close, volume, currency)
-VALUES %s
-ON CONFLICT (symbol, trade_date) DO UPDATE SET
-    open       = EXCLUDED.open,
-    high       = EXCLUDED.high,
-    low        = EXCLUDED.low,
-    close      = EXCLUDED.close,
-    adj_close  = EXCLUDED.adj_close,
-    volume     = EXCLUDED.volume,
-    currency   = EXCLUDED.currency,
-    updated_at = NOW()
-;
-"""
 
 OPTIONS_COLUMNS = [
-    "symbol", "trade_date", "expiry_date", "strike", "option_type",
-    "last_price", "volume", "open_interest",
-    "implied_volatility", "delta", "gamma", "theta", "vega", "rho",
-    "underlying_price", "bid", "ask", "bid_size", "ask_size",
-    "exchange", "currency",
+    "date", "symbol", "expiry", "strike", "opt_type",
+    "bid", "ask", "last", "volume", "oi",
+    "iv",
+    "delta", "gamma", "theta", "vega", "rho",
+    "underlying_price", "dte",
+    "source",
 ]
 
-OPTIONS_UPSERT_SQL = """
-INSERT INTO {table} (
-    symbol, trade_date, expiry_date, strike, option_type,
-    last_price, volume, open_interest,
-    implied_volatility, delta, gamma, theta, vega, rho,
-    underlying_price, bid, ask, bid_size, ask_size,
-    exchange, currency
-)
-VALUES %s
-ON CONFLICT (symbol, trade_date, expiry_date, strike, option_type) DO UPDATE SET
-    last_price         = EXCLUDED.last_price,
-    volume             = EXCLUDED.volume,
-    open_interest      = EXCLUDED.open_interest,
-    implied_volatility = EXCLUDED.implied_volatility,
-    delta              = EXCLUDED.delta,
-    gamma              = EXCLUDED.gamma,
-    theta              = EXCLUDED.theta,
-    vega               = EXCLUDED.vega,
-    rho                = EXCLUDED.rho,
-    underlying_price   = EXCLUDED.underlying_price,
-    bid                = EXCLUDED.bid,
-    ask                = EXCLUDED.ask,
-    bid_size           = EXCLUDED.bid_size,
-    ask_size           = EXCLUDED.ask_size,
-    exchange           = EXCLUDED.exchange,
-    currency           = EXCLUDED.currency,
-    updated_at         = NOW()
-;
-"""
 
-CASH_COL_MAP = {
-    "Open": "open", "High": "high", "Low": "low",
-    "Close": "close", "Adj Close": "adj_close", "Volume": "volume",
-}
+# ═══════════════════════════════════════════════════════════════
+#  CASH LOADING
+# ═══════════════════════════════════════════════════════════════
 
+def load_cash(market: str) -> int:
+    """
+    Load cash OHLCV data into {market}_cash table.
 
-# ====================================================================
-#  Helpers
-# ====================================================================
+    Reads from: data/{market}_cash.parquet  (or .csv fallback)
+    Upsert:     ON CONFLICT (date, symbol) DO UPDATE
+    """
+    table = f"{market}_cash"
+    df = _read_data_file(market, "cash")
 
-def get_connection():
-    logger.info(f"Connecting to PostgreSQL: {PG_CONFIG['host']}:{PG_CONFIG['port']}/{PG_CONFIG['dbname']}")
-    return psycopg2.connect(**PG_CONFIG)
+    if df is None or df.empty:
+        LOG.warning(f"No data found for {table}")
+        return 0
 
+    # Ensure required columns exist
+    for col in ["date", "symbol", "close"]:
+        if col not in df.columns:
+            LOG.error(f"{table}: missing required column '{col}'")
+            return 0
 
-def df_to_rows(df: pd.DataFrame, columns: list) -> list[tuple]:
-    """Convert DataFrame to list of tuples, replacing NaN with None."""
-    for col in columns:
+    # Keep only known columns, fill missing optional ones with None
+    for col in CASH_COLUMNS:
         if col not in df.columns:
             df[col] = None
-    subset = df[columns].copy()
-    subset = subset.where(subset.notna(), None)
-    return [tuple(row) for row in subset.itertuples(index=False, name=None)]
+    df = df[CASH_COLUMNS].copy()
 
+    # Clean
+    df = df.dropna(subset=["date", "symbol", "close"])
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df = df.drop_duplicates(subset=["date", "symbol"], keep="last")
 
-def upsert_rows(conn, table: str, upsert_sql: str, rows: list[tuple], dry_run: bool = False):
-    total = len(rows)
-    label = " [DRY RUN]" if dry_run else ""
-    logger.info(f"Upserting {total:,} rows into {table}{label}")
-
-    if dry_run:
-        if rows:
-            logger.info(f"  Sample: {rows[0]}")
-        return
-
-    sql = upsert_sql.format(table=table)
-    cur = conn.cursor()
-    inserted = 0
-
-    for i in range(0, total, BATCH_SIZE):
-        batch = rows[i : i + BATCH_SIZE]
-        execute_values(cur, sql, batch, page_size=BATCH_SIZE)
-        inserted += len(batch)
-        logger.info(f"  {inserted:,} / {total:,}")
-
-    conn.commit()
-    cur.close()
-    logger.info(f"✓ {table}: {total:,} rows upserted")
-
-
-# ====================================================================
-#  Cash loading
-# ====================================================================
-
-def read_cash_parquet() -> dict[str, pd.DataFrame]:
-    """Read universe_ohlcv.parquet and split by region."""
-    if not CASH_PARQUET.exists():
-        logger.warning(f"Cash parquet not found: {CASH_PARQUET}")
-        return {}
-
-    logger.info(f"Reading {CASH_PARQUET}")
-    df = pd.read_parquet(CASH_PARQUET)
-
-    # Normalise date
-    if "Date" not in df.columns and df.index.name in ("Date", "date", None):
-        df = df.reset_index()
-    date_col = next((c for c in df.columns if c.lower() == "date"), None)
-    if date_col is None:
-        raise ValueError(f"No Date column. Columns: {list(df.columns)}")
-    df.rename(columns={date_col: "trade_date"}, inplace=True)
-    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-
-    # Normalise symbol
-    sym_col = next((c for c in df.columns if c.lower() in ("symbol", "ticker")), None)
-    if sym_col is None:
-        raise ValueError(f"No symbol column. Columns: {list(df.columns)}")
-    df.rename(columns={sym_col: "symbol"}, inplace=True)
-
-    # Rename OHLCV
-    df.rename(columns=CASH_COL_MAP, inplace=True)
-
-    # Split by region
-    df["region"] = df["symbol"].apply(classify_symbol)
-    region_dfs = {}
-    for region in REGION_CONFIG:
-        rdf = df[df["region"] == region].copy()
-        if not rdf.empty:
-            region_dfs[region] = rdf
-            logger.info(f"  {region}: {len(rdf):,} rows, {rdf['symbol'].nunique()} symbols")
-    return region_dfs
-
-
-def load_cash(region: str, region_dfs: dict, dry_run: bool = False):
-    cfg = REGION_CONFIG[region]
-    df = region_dfs.get(region)
-    if df is None or df.empty:
-        logger.warning(f"No cash data for {region}")
-        return
-
-    df = df.copy()
-    df["currency"] = cfg["currency"]
-    rows = df_to_rows(df, CASH_COLUMNS)
-
-    if not rows:
-        return
-
-    conn = get_connection()
-    try:
-        upsert_rows(conn, cfg["cash_table"], CASH_UPSERT_SQL, rows, dry_run)
-    finally:
-        conn.close()
-
-
-# ====================================================================
-#  Options loading
-# ====================================================================
-
-def read_options_parquet(region: str) -> pd.DataFrame:
-    """Read a region's options parquet."""
-    path = OPTIONS_PARQUETS.get(region)
-    if path is None or not path.exists():
-        logger.warning(f"Options parquet not found for {region}: {path}")
-        return pd.DataFrame()
-
-    logger.info(f"Reading {path}")
-    df = pd.read_parquet(path)
-
-    # Ensure date columns are proper dates
-    for col in ("trade_date", "expiry_date"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col]).dt.date
-
-    return df
-
-
-def load_options(region: str, dry_run: bool = False):
-    cfg = REGION_CONFIG.get(region)
-    if cfg is None:
-        logger.error(f"Unknown region: {region}")
-        return
-
-    df = read_options_parquet(region)
     if df.empty:
-        logger.warning(f"No options data for {region}")
-        return
+        LOG.warning(f"{table}: no valid rows after cleaning")
+        return 0
 
-    df = df.copy()
-    if "currency" not in df.columns:
-        df["currency"] = cfg["currency"]
+    # Upsert
+    engine = get_engine()
+    upsert_sql = f"""
+        INSERT INTO {table} (date, symbol, open, high, low, close, volume)
+        VALUES (:date, :symbol, :open, :high, :low, :close, :volume)
+        ON CONFLICT (date, symbol) DO UPDATE SET
+            open   = EXCLUDED.open,
+            high   = EXCLUDED.high,
+            low    = EXCLUDED.low,
+            close  = EXCLUDED.close,
+            volume = EXCLUDED.volume;
+    """
 
-    rows = df_to_rows(df, OPTIONS_COLUMNS)
-    if not rows:
-        return
-
-    logger.info(f"  {region} options: {len(rows):,} rows, "
-                f"{df['symbol'].nunique()} symbols, "
-                f"{df['expiry_date'].nunique()} expiries")
-
-    conn = get_connection()
-    try:
-        upsert_rows(conn, cfg["options_table"], OPTIONS_UPSERT_SQL, rows, dry_run)
-    finally:
-        conn.close()
+    rows_loaded = _batch_upsert(engine, upsert_sql, df, table)
+    return rows_loaded
 
 
-# ====================================================================
+# ═══════════════════════════════════════════════════════════════
+#  OPTIONS LOADING
+# ═══════════════════════════════════════════════════════════════
+
+def load_options(market: str) -> int:
+    """
+    Load options snapshot data into {market}_options table.
+
+    Reads from: data/{market}_options.parquet  (or .csv fallback)
+    Upsert:     ON CONFLICT (date, symbol, expiry, strike, opt_type) DO UPDATE
+
+    Handles both yfinance data (greeks are NULL) and IBKR data (full greeks).
+    When IBKR data overwrites yfinance data for the same contract, greeks
+    get populated.
+    """
+    table = f"{market}_options"
+    df = _read_data_file(market, "options")
+
+    if df is None or df.empty:
+        LOG.warning(f"No data found for {table}")
+        return 0
+
+    # Ensure required columns exist
+    for col in ["date", "symbol", "expiry", "strike", "opt_type"]:
+        if col not in df.columns:
+            LOG.error(f"{table}: missing required column '{col}'")
+            return 0
+
+    # Add missing optional columns as None
+    for col in OPTIONS_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    # Compute DTE if not present
+    if df["dte"].isna().all():
+        try:
+            df["dte"] = (
+                pd.to_datetime(df["expiry"]) - pd.to_datetime(df["date"])
+            ).dt.days
+        except Exception:
+            pass
+
+    df = df[OPTIONS_COLUMNS].copy()
+
+    # Clean
+    df = df.dropna(subset=["date", "symbol", "expiry", "strike", "opt_type"])
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
+    df["opt_type"] = df["opt_type"].str.upper().str.strip()
+    df = df[df["opt_type"].isin(["C", "P"])]
+    df = df.drop_duplicates(
+        subset=["date", "symbol", "expiry", "strike", "opt_type"],
+        keep="last",
+    )
+
+    if df.empty:
+        LOG.warning(f"{table}: no valid rows after cleaning")
+        return 0
+
+    # Upsert — IBKR data (with greeks) overwrites yfinance data (without)
+    engine = get_engine()
+    upsert_sql = f"""
+        INSERT INTO {table} (
+            date, symbol, expiry, strike, opt_type,
+            bid, ask, last, volume, oi,
+            iv,
+            delta, gamma, theta, vega, rho,
+            underlying_price, dte,
+            source
+        )
+        VALUES (
+            :date, :symbol, :expiry, :strike, :opt_type,
+            :bid, :ask, :last, :volume, :oi,
+            :iv,
+            :delta, :gamma, :theta, :vega, :rho,
+            :underlying_price, :dte,
+            :source
+        )
+        ON CONFLICT (date, symbol, expiry, strike, opt_type) DO UPDATE SET
+            bid              = COALESCE(EXCLUDED.bid,              {table}.bid),
+            ask              = COALESCE(EXCLUDED.ask,              {table}.ask),
+            last             = COALESCE(EXCLUDED.last,             {table}.last),
+            volume           = COALESCE(EXCLUDED.volume,           {table}.volume),
+            oi               = COALESCE(EXCLUDED.oi,               {table}.oi),
+            iv               = COALESCE(EXCLUDED.iv,               {table}.iv),
+            delta            = COALESCE(EXCLUDED.delta,            {table}.delta),
+            gamma            = COALESCE(EXCLUDED.gamma,            {table}.gamma),
+            theta            = COALESCE(EXCLUDED.theta,            {table}.theta),
+            vega             = COALESCE(EXCLUDED.vega,             {table}.vega),
+            rho              = COALESCE(EXCLUDED.rho,              {table}.rho),
+            underlying_price = COALESCE(EXCLUDED.underlying_price, {table}.underlying_price),
+            dte              = COALESCE(EXCLUDED.dte,              {table}.dte),
+            source           = COALESCE(EXCLUDED.source,           {table}.source);
+    """
+
+    rows_loaded = _batch_upsert(engine, upsert_sql, df, table)
+    return rows_loaded
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SHARED HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def _read_data_file(market: str, dtype: str) -> pd.DataFrame | None:
+    """
+    Read data from parquet (preferred) or CSV fallback.
+
+    Looks for:  data/{market}_{dtype}.parquet
+                data/{market}_{dtype}.csv
+    """
+    parquet_path = DATA_DIR / f"{market}_{dtype}.parquet"
+    csv_path = DATA_DIR / f"{market}_{dtype}.csv"
+
+    if parquet_path.exists():
+        LOG.info(f"Reading {parquet_path.name}")
+        return pd.read_parquet(parquet_path)
+    elif csv_path.exists():
+        LOG.info(f"Reading {csv_path.name} (parquet not found)")
+        return pd.read_csv(csv_path)
+    else:
+        LOG.warning(
+            f"No data file found: {parquet_path.name} or {csv_path.name}"
+        )
+        return None
+
+
+def _batch_upsert(
+    engine,
+    sql: str,
+    df: pd.DataFrame,
+    table: str,
+    batch_size: int = 1000,
+) -> int:
+    """
+    Execute upsert in batches for memory efficiency.
+
+    Converts NaN/NaT to None for proper NULL handling in SQL.
+    """
+    # Replace NaN with None (psycopg2 sends NULL)
+    records = df.where(df.notna(), None).to_dict("records")
+
+    total = 0
+    with engine.begin() as conn:
+        for i in range(0, len(records), batch_size):
+            batch = records[i : i + batch_size]
+            conn.execute(text(sql), batch)
+            total += len(batch)
+
+            if total % 5000 == 0 or total == len(records):
+                LOG.info(f"  {table}: {total:,} / {len(records):,} rows")
+
+    LOG.info(f"  {table}: loaded {total:,} rows total")
+    return total
+
+
+def load_status():
+    """Show row counts for all tables."""
+    engine = get_engine()
+    from db.schema import all_table_names
+
+    LOG.info("=" * 50)
+    LOG.info(f"{'Table':<20s} {'Rows':>10s}")
+    LOG.info("-" * 50)
+
+    with engine.connect() as conn:
+        for table in all_table_names():
+            try:
+                result = conn.execute(
+                    text(f"SELECT COUNT(*) FROM {table}")
+                ).scalar()
+                LOG.info(f"{table:<20s} {result:>10,}")
+            except Exception:
+                LOG.info(f"{table:<20s} {'(missing)':>10s}")
+
+    LOG.info("=" * 50)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  CLI
-# ====================================================================
+# ═══════════════════════════════════════════════════════════════
+
+MARKET_CHOICES = ["us", "hk", "india", "others", "all"]
+TYPE_CHOICES = ["cash", "options", "all"]
 
 def main():
-    parser = argparse.ArgumentParser(description="Load parquet data into PostgreSQL")
-    parser.add_argument(
-        "--market", required=True,
-        choices=["us", "hk", "india", "others", "all"],
+    parser = argparse.ArgumentParser(
+        description="Load parquet/CSV data into PostgreSQL",
     )
     parser.add_argument(
-        "--type", required=True,
-        choices=["cash", "options", "all"],
-        help="Which data type to load",
+        "--market",
+        choices=MARKET_CHOICES,
+        default="all",
     )
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--type",
+        choices=TYPE_CHOICES,
+        default="all",
+        dest="dtype",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show table row counts",
+    )
     args = parser.parse_args()
 
-    markets = list(REGION_CONFIG.keys()) if args.market == "all" else [args.market]
-    load_types = ["cash", "options"] if args.type == "all" else [args.type]
+    if args.status:
+        load_status()
+        return
 
-    # ── Cash ───────────────────────────────────────────────────
-    if "cash" in load_types:
-        region_dfs = read_cash_parquet()
-        for mkt in markets:
-            load_cash(mkt, region_dfs, dry_run=args.dry_run)
+    # ── Determine what to load ────────────────────────────────
+    from db.schema import CASH_REGIONS, OPTIONS_REGIONS
 
-    # ── Options ────────────────────────────────────────────────
-    if "options" in load_types:
-        for mkt in markets:
-            load_options(mkt, dry_run=args.dry_run)
+    if args.market == "all":
+        cash_markets = CASH_REGIONS
+        opt_markets = OPTIONS_REGIONS
+    else:
+        cash_markets = [args.market] if args.market in CASH_REGIONS else []
+        opt_markets = [args.market] if args.market in OPTIONS_REGIONS else []
 
-    logger.info("Done")
+    total = 0
+
+    # ── Cash ──────────────────────────────────────────────────
+    if args.dtype in ("cash", "all"):
+        for m in cash_markets:
+            try:
+                n = load_cash(m)
+                total += n
+            except Exception as e:
+                LOG.error(f"Failed loading {m}_cash: {e}")
+
+    # ── Options ───────────────────────────────────────────────
+    if args.dtype in ("options", "all"):
+        for m in opt_markets:
+            try:
+                n = load_options(m)
+                total += n
+            except Exception as e:
+                LOG.error(f"Failed loading {m}_options: {e}")
+
+    LOG.info(f"DONE — {total:,} total rows loaded")
 
 
 if __name__ == "__main__":

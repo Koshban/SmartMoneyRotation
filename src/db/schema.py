@@ -1,248 +1,416 @@
 """
-schema.py – Create PostgreSQL tables for the SmartMoneyRotation project.
+src/db/schema.py
 
-Tables per region (us, hk, india, others):
-  - {region}_cash       OHLCV for equities / ETFs
-  - {region}_options    Options chain snapshots
+Single source of truth for all DB table definitions.
 
-Run:
-    python src/db/schema.py
+Usage:
+    python src/db/schema.py create          # Create all tables
+    python src/db/schema.py drop --yes      # Drop all tables (confirm required)
+    python src/db/schema.py recreate --yes  # Drop + Create
+    python src/db/schema.py status          # Show which tables exist
+    python src/db/schema.py drop-options --yes  # Drop only options tables
 """
 
+import argparse
 import logging
-import psycopg2
-from psycopg2 import sql
 import sys
 from pathlib import Path
-from common.credentials import PG_CONFIG
 
-# Ensure src/ is on the Python path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import psycopg2
 
-logger = logging.getLogger(__name__)
+SRC = Path(__file__).resolve().parent.parent
+ROOT = SRC.parent
+sys.path.insert(0, str(ROOT))
+
+from common.credentials import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)-20s %(levelname)-10s %(message)s",
 )
-DB_CONFIG = PG_CONFIG
-REGIONS = ["us", "hk", "india", "others"]
+LOG = logging.getLogger(__name__)
 
 
-# ====================================================================
-#  SQL Templates
-# ====================================================================
+# ═══════════════════════════════════════════════════════════════
+#  CONNECTION
+# ═══════════════════════════════════════════════════════════════
 
-CASH_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS {table_name} (
-    symbol          VARCHAR(30)     NOT NULL,
-    trade_date      DATE            NOT NULL,
-    open            NUMERIC(18,6),
-    high            NUMERIC(18,6),
-    low             NUMERIC(18,6),
-    close           NUMERIC(18,6),
-    adj_close       NUMERIC(18,6),
-    volume          BIGINT,
-    vwap            NUMERIC(18,6),
-    num_trades      INTEGER,
-    exchange        VARCHAR(10),
-    currency        VARCHAR(5)      NOT NULL,
-    created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-
-    PRIMARY KEY (symbol, trade_date)
-);
-
--- Fast lookups by date range
-CREATE INDEX IF NOT EXISTS idx_{table_name}_date
-    ON {table_name} (trade_date);
-
--- Fast lookups by symbol + date range
-CREATE INDEX IF NOT EXISTS idx_{table_name}_sym_date
-    ON {table_name} (symbol, trade_date DESC);
-
-COMMENT ON TABLE {table_name} IS 'Daily OHLCV cash/equity data – {region} market';
-"""
+def get_conn():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+    )
 
 
-OPTIONS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS {table_name} (
-    symbol              VARCHAR(30)     NOT NULL,
-    trade_date          DATE            NOT NULL,
-    expiry_date         DATE            NOT NULL,
-    strike              NUMERIC(18,6)   NOT NULL,
-    option_type         VARCHAR(4)      NOT NULL,   -- 'CALL' or 'PUT'
-    open                NUMERIC(18,6),
-    high                NUMERIC(18,6),
-    low                 NUMERIC(18,6),
-    close               NUMERIC(18,6),
-    last_price          NUMERIC(18,6),
-    volume              BIGINT,
-    open_interest       BIGINT,
-    implied_volatility  NUMERIC(12,6),
-    delta               NUMERIC(10,6),
-    gamma               NUMERIC(10,6),
-    theta               NUMERIC(10,6),
-    vega                NUMERIC(10,6),
-    rho                 NUMERIC(10,6),
-    underlying_price    NUMERIC(18,6),
-    bid                 NUMERIC(18,6),
-    ask                 NUMERIC(18,6),
-    bid_size            INTEGER,
-    ask_size            INTEGER,
-    exchange            VARCHAR(10),
-    currency            VARCHAR(5)      NOT NULL,
-    created_at          TIMESTAMPTZ     DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ     DEFAULT NOW(),
+# ═══════════════════════════════════════════════════════════════
+#  CASH TABLE DDL  (unchanged from your current schema)
+# ═══════════════════════════════════════════════════════════════
 
-    PRIMARY KEY (symbol, trade_date, expiry_date, strike, option_type)
-);
+CASH_REGIONS = ["us", "hk", "india", "others"]
 
--- Lookup by underlying + date
-CREATE INDEX IF NOT EXISTS idx_{table_name}_sym_date
-    ON {table_name} (symbol, trade_date DESC);
+def _cash_ddl(region: str) -> str:
+    """
+    Cash (equity/ETF) OHLCV table.
 
--- Lookup by expiry
-CREATE INDEX IF NOT EXISTS idx_{table_name}_expiry
-    ON {table_name} (expiry_date, symbol);
+    Columns:  date, symbol, open, high, low, close, volume
+    Unique:   (date, symbol)
+    Index:    symbol, date
+    """
+    table = f"{region}_cash"
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table} (
+        id          SERIAL PRIMARY KEY,
+        date        DATE           NOT NULL,
+        symbol      VARCHAR(20)    NOT NULL,
+        open        NUMERIC(14,4),
+        high        NUMERIC(14,4),
+        low         NUMERIC(14,4),
+        close       NUMERIC(14,4)  NOT NULL,
+        volume      BIGINT,
+        created_at  TIMESTAMP DEFAULT NOW(),
 
--- Options chain slice: symbol + expiry + type
-CREATE INDEX IF NOT EXISTS idx_{table_name}_chain
-    ON {table_name} (symbol, expiry_date, option_type, strike);
+        CONSTRAINT uq_{table}_date_symbol
+            UNIQUE (date, symbol)
+    );
 
-COMMENT ON TABLE {table_name} IS 'Options chain snapshots – {region} market';
-"""
+    CREATE INDEX IF NOT EXISTS ix_{table}_symbol
+        ON {table} (symbol);
+
+    CREATE INDEX IF NOT EXISTS ix_{table}_date
+        ON {table} (date);
+
+    CREATE INDEX IF NOT EXISTS ix_{table}_symbol_date
+        ON {table} (symbol, date DESC);
+    """
 
 
-# ====================================================================
-#  Updated-at trigger (auto-set updated_at on row change)
-# ====================================================================
+# ═══════════════════════════════════════════════════════════════
+#  OPTIONS TABLE DDL  (comprehensive — greeks, bid/ask, source)
+# ═══════════════════════════════════════════════════════════════
 
-TRIGGER_FUNC_SQL = """
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-"""
+OPTIONS_REGIONS = ["us", "hk"]  # Add "india" when ready
 
-TRIGGER_SQL = """
-DROP TRIGGER IF EXISTS trg_updated_at ON {table_name};
-CREATE TRIGGER trg_updated_at
-    BEFORE UPDATE ON {table_name}
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-"""
+def _options_ddl(region: str) -> str:
+    """
+    Options snapshot table — one row per (date, symbol, expiry, strike, opt_type).
+
+    Designed to hold data from both yfinance (no greeks) and IBKR (full greeks).
+    Columns that a source doesn't provide are simply NULL.
+
+    Columns:
+        Identification:  date, symbol, expiry, strike, opt_type
+        Market data:     bid, ask, last, volume, oi
+        Volatility:      iv
+        Greeks:          delta, gamma, theta, vega, rho
+        Context:         underlying_price, dte
+        Metadata:        source, created_at
+
+    Unique:  (date, symbol, expiry, strike, opt_type)
+    """
+    table = f"{region}_options"
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table} (
+        id                SERIAL PRIMARY KEY,
+
+        -- ── Identification ────────────────────────────────────
+        date              DATE           NOT NULL,
+        symbol            VARCHAR(20)    NOT NULL,
+        expiry            DATE           NOT NULL,
+        strike            NUMERIC(14,4)  NOT NULL,
+        opt_type          CHAR(1)        NOT NULL CHECK (opt_type IN ('C', 'P')),
+
+        -- ── Market Data ───────────────────────────────────────
+        bid               NUMERIC(14,4),
+        ask               NUMERIC(14,4),
+        last              NUMERIC(14,4),
+        volume            INTEGER,
+        oi                INTEGER,
+
+        -- ── Implied Volatility ────────────────────────────────
+        iv                NUMERIC(10,6),
+
+        -- ── Greeks (NULL when source is yfinance) ─────────────
+        delta             NUMERIC(10,6),
+        gamma             NUMERIC(10,6),
+        theta             NUMERIC(10,6),
+        vega              NUMERIC(10,6),
+        rho               NUMERIC(10,6),
+
+        -- ── Context ──────────────────────────────────────────
+        underlying_price  NUMERIC(14,4),
+        dte               INTEGER,
+
+        -- ── Metadata ─────────────────────────────────────────
+        source            VARCHAR(20)    DEFAULT 'yfinance',
+        created_at        TIMESTAMP      DEFAULT NOW(),
+
+        -- ── Constraints ──────────────────────────────────────
+        CONSTRAINT uq_{table}_snapshot
+            UNIQUE (date, symbol, expiry, strike, opt_type)
+    );
+
+    -- Fast lookups by symbol
+    CREATE INDEX IF NOT EXISTS ix_{table}_symbol
+        ON {table} (symbol);
+
+    -- Fast lookups by date (for daily snapshots)
+    CREATE INDEX IF NOT EXISTS ix_{table}_date
+        ON {table} (date);
+
+    -- Composite: symbol + date (most common query pattern)
+    CREATE INDEX IF NOT EXISTS ix_{table}_symbol_date
+        ON {table} (symbol, date DESC);
+
+    -- Composite: symbol + expiry (for chain lookups)
+    CREATE INDEX IF NOT EXISTS ix_{table}_symbol_expiry
+        ON {table} (symbol, expiry);
+
+    -- Filtered: high-IV contracts
+    CREATE INDEX IF NOT EXISTS ix_{table}_iv
+        ON {table} (iv DESC)
+        WHERE iv IS NOT NULL;
+
+    -- Filtered: IBKR data with greeks
+    CREATE INDEX IF NOT EXISTS ix_{table}_greeks
+        ON {table} (symbol, expiry, strike)
+        WHERE delta IS NOT NULL;
+    """
 
 
-# ====================================================================
-#  Table creation
-# ====================================================================
+# ═══════════════════════════════════════════════════════════════
+#  AGGREGATE / DERIVED TABLE  (optional — for pipeline output)
+# ═══════════════════════════════════════════════════════════════
 
-def get_connection():
-    """Return a psycopg2 connection using DB_CONFIG."""
-    logger.info(f"Connecting to PostgreSQL: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}")
-    return psycopg2.connect(**DB_CONFIG)
+def _signals_ddl() -> str:
+    """
+    Pipeline output: daily signals / scores per ticker.
+
+    This table is OPTIONAL. The pipeline can write to parquet instead.
+    Kept here so the DB can serve as a single reporting layer.
+    """
+    return """
+    CREATE TABLE IF NOT EXISTS signals (
+        id              SERIAL PRIMARY KEY,
+        date            DATE           NOT NULL,
+        symbol          VARCHAR(20)    NOT NULL,
+        market          VARCHAR(10)    NOT NULL,
+
+        -- ── Cash Metrics ──────────────────────────────────────
+        close           NUMERIC(14,4),
+        rsi_14          NUMERIC(8,4),
+        macd            NUMERIC(14,6),
+        macd_signal     NUMERIC(14,6),
+        bb_pct          NUMERIC(8,4),
+        atr_14          NUMERIC(14,4),
+        adx_14          NUMERIC(8,4),
+        vol_z_20        NUMERIC(8,4),
+
+        -- ── Options Metrics ───────────────────────────────────
+        iv_avg          NUMERIC(10,6),
+        iv_skew         NUMERIC(10,6),
+        put_call_ratio  NUMERIC(8,4),
+        max_oi_strike   NUMERIC(14,4),
+        total_oi        INTEGER,
+        total_volume    INTEGER,
+
+        -- ── Scores ────────────────────────────────────────────
+        cash_score      NUMERIC(8,4),
+        options_score   NUMERIC(8,4),
+        combined_score  NUMERIC(8,4),
+        regime          VARCHAR(20),
+        recommendation  VARCHAR(50),
+
+        -- ── Metadata ─────────────────────────────────────────
+        created_at      TIMESTAMP DEFAULT NOW(),
+
+        CONSTRAINT uq_signals_date_symbol
+            UNIQUE (date, symbol)
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_signals_date
+        ON signals (date DESC);
+
+    CREATE INDEX IF NOT EXISTS ix_signals_symbol
+        ON signals (symbol);
+
+    CREATE INDEX IF NOT EXISTS ix_signals_score
+        ON signals (combined_score DESC)
+        WHERE combined_score IS NOT NULL;
+    """
 
 
-def create_tables():
-    """Create all cash and options tables for every region."""
-    conn = get_connection()
-    conn.autocommit = True
+# ═══════════════════════════════════════════════════════════════
+#  REGISTRY — all tables managed by this schema
+# ═══════════════════════════════════════════════════════════════
+
+def all_table_names() -> list[str]:
+    """Every table this schema manages, in creation order."""
+    tables = [f"{r}_cash" for r in CASH_REGIONS]
+    tables += [f"{r}_options" for r in OPTIONS_REGIONS]
+    tables.append("signals")
+    return tables
+
+
+def all_ddl() -> list[str]:
+    """All DDL statements in creation order."""
+    stmts = [_cash_ddl(r) for r in CASH_REGIONS]
+    stmts += [_options_ddl(r) for r in OPTIONS_REGIONS]
+    stmts.append(_signals_ddl())
+    return stmts
+
+
+def options_table_names() -> list[str]:
+    return [f"{r}_options" for r in OPTIONS_REGIONS]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  OPERATIONS
+# ═══════════════════════════════════════════════════════════════
+
+def create_all():
+    """Create all tables (idempotent — IF NOT EXISTS)."""
+    conn = get_conn()
     cur = conn.cursor()
-
-    # ── Trigger function (shared) ──────────────────────────────
-    logger.info("Creating trigger function: update_updated_at_column()")
-    cur.execute(TRIGGER_FUNC_SQL)
-
-    for region in REGIONS:
-        # ── Cash table ─────────────────────────────────────────
-        cash_table = f"{region}_cash"
-        logger.info(f"Creating table: {cash_table}")
-        cur.execute(CASH_TABLE_SQL.format(table_name=cash_table, region=region.upper()))
-        cur.execute(TRIGGER_SQL.format(table_name=cash_table))
-
-        # ── Options table ──────────────────────────────────────
-        opts_table = f"{region}_options"
-        logger.info(f"Creating table: {opts_table}")
-        cur.execute(OPTIONS_TABLE_SQL.format(table_name=opts_table, region=region.upper()))
-        cur.execute(TRIGGER_SQL.format(table_name=opts_table))
-
-    cur.close()
-    conn.close()
-    logger.info("All tables created successfully")
+    try:
+        for ddl in all_ddl():
+            cur.execute(ddl)
+        conn.commit()
+        LOG.info(f"Created tables: {', '.join(all_table_names())}")
+    except Exception as e:
+        conn.rollback()
+        LOG.error(f"Create failed: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
-def drop_tables(confirm: bool = False):
-    """Drop all cash and options tables. Use with caution."""
-    if not confirm:
-        logger.warning("drop_tables called without confirm=True — skipping")
-        return
-
-    conn = get_connection()
-    conn.autocommit = True
+def drop_all():
+    """Drop ALL managed tables. Destructive!"""
+    conn = get_conn()
     cur = conn.cursor()
-
-    for region in REGIONS:
-        for suffix in ["cash", "options"]:
-            table = f"{region}_{suffix}"
-            logger.warning(f"DROPPING table: {table}")
+    try:
+        for table in reversed(all_table_names()):
             cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE;")
+            LOG.info(f"  Dropped: {table}")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        LOG.error(f"Drop failed: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
-    cur.close()
-    conn.close()
-    logger.info("All tables dropped")
 
-
-def list_tables():
-    """Print all project tables and their row counts."""
-    conn = get_connection()
+def drop_options():
+    """Drop only options tables. Preserves cash data."""
+    conn = get_conn()
     cur = conn.cursor()
+    try:
+        for table in options_table_names():
+            cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE;")
+            LOG.info(f"  Dropped: {table}")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        LOG.error(f"Drop failed: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
-    print(f"\n{'Table':<25} {'Rows':>12} {'Size':>12}")
-    print("─" * 51)
 
-    for region in REGIONS:
-        for suffix in ["cash", "options"]:
-            table = f"{region}_{suffix}"
-            try:
+def table_status() -> dict[str, dict]:
+    """Check which tables exist and their row counts."""
+    conn = get_conn()
+    cur = conn.cursor()
+    status = {}
+    try:
+        for table in all_table_names():
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = %s
+                );
+            """, (table,))
+            exists = cur.fetchone()[0]
+
+            rows = 0
+            if exists:
                 cur.execute(f"SELECT COUNT(*) FROM {table};")
-                count = cur.fetchone()[0]
-                cur.execute(f"SELECT pg_size_pretty(pg_total_relation_size('{table}'));")
-                size = cur.fetchone()[0]
-                print(f"{table:<25} {count:>12,} {size:>12}")
-            except Exception:
-                conn.rollback()
-                print(f"{table:<25} {'— missing —':>12}")
+                rows = cur.fetchone()[0]
 
-    print()
-    cur.close()
-    conn.close()
+            status[table] = {"exists": exists, "rows": rows}
+    finally:
+        cur.close()
+        conn.close()
+
+    return status
 
 
-# ====================================================================
+def print_status():
+    """Pretty-print table status."""
+    status = table_status()
+    LOG.info("=" * 50)
+    LOG.info(f"{'Table':<20s} {'Exists':<10s} {'Rows':>10s}")
+    LOG.info("-" * 50)
+    for table, info in status.items():
+        marker = "✓" if info["exists"] else "✗"
+        rows = f"{info['rows']:,}" if info["exists"] else "—"
+        LOG.info(f"{table:<20s} {marker:<10s} {rows:>10s}")
+    LOG.info("=" * 50)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  CLI
-# ====================================================================
+# ═══════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Manage SmartMoneyRotation DB schema")
-    parser.add_argument(
-        "action",
-        choices=["create", "drop", "status"],
-        help="create = build tables, drop = destroy tables, status = show row counts",
+def main():
+    parser = argparse.ArgumentParser(
+        description="Manage DB schema for options pipeline",
     )
     parser.add_argument(
-        "--yes", action="store_true",
-        help="Required for drop to actually execute",
+        "action",
+        choices=["create", "drop", "recreate", "status", "drop-options"],
+        help="Action to perform",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required for destructive operations (drop, recreate)",
     )
     args = parser.parse_args()
 
     if args.action == "create":
-        create_tables()
+        create_all()
+
     elif args.action == "drop":
-        drop_tables(confirm=args.yes)
+        if not args.yes:
+            LOG.error("Pass --yes to confirm dropping ALL tables")
+            return
+        drop_all()
+
+    elif args.action == "recreate":
+        if not args.yes:
+            LOG.error("Pass --yes to confirm drop + recreate ALL tables")
+            return
+        drop_all()
+        create_all()
+
+    elif args.action == "drop-options":
+        if not args.yes:
+            LOG.error("Pass --yes to confirm dropping options tables")
+            return
+        drop_options()
+        LOG.info("Now run: python src/db/schema.py create")
+
     elif args.action == "status":
-        list_tables()
+        print_status()
+
+
+if __name__ == "__main__":
+    main()

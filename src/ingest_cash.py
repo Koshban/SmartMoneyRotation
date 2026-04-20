@@ -1,11 +1,15 @@
 """
-ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
+src/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
 
 Auto-selects data source:
   Period ≤ 5 days   → IBKR TWS  (must be running)
   Period > 5 days   → yfinance  (bulk backfill)
 
 Override with --source yfinance | ibkr
+
+Outputs:
+  data/{market}_cash.parquet   — per-market files (for load_db.py)
+  data/universe_ohlcv.parquet  — combined file   (for loader.py)
 
 Usage:
     python src/ingest_cash.py --market all --period 2y
@@ -15,11 +19,17 @@ Usage:
 """
 
 import sys
-import re
+from pathlib import Path
+_SRC  = Path(__file__).resolve().parent        # .../src
+_ROOT = _SRC.parent                            # .../SmartMoneyRotation
+for _p in (str(_ROOT), str(_SRC)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+        
 import math
 import logging
 import argparse
-from pathlib import Path
+import re
 from datetime import datetime, date, timedelta
 
 # ── Ensure src/ is on the Python path ─────────────────────────
@@ -156,6 +166,27 @@ def choose_source(period: str, market: str, force_source: str = None) -> str:
     return "yfinance"
 
 
+def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise column names to lowercase for load_db.py compatibility.
+
+    yfinance returns Title Case (Date, Open, High, ...),
+    IBKR fetch already renames to Title Case.
+    load_db.py expects lowercase (date, symbol, open, ...).
+    """
+    df = df.copy()
+    df.columns = [str(c).lower().strip() for c in df.columns]
+
+    # Standardise common variations
+    renames = {
+        "adj close": "adj_close",
+    }
+    df.rename(columns={k: v for k, v in renames.items() if k in df.columns},
+              inplace=True)
+
+    return df
+
+
 # ====================================================================
 #  IBKR contract helpers
 # ====================================================================
@@ -233,7 +264,7 @@ def fetch_yfinance(symbols: list[str], period: str) -> pd.DataFrame:
 
     result = pd.concat(records, ignore_index=True)
 
-    # Standardise date column name
+    # Standardise date column name (yfinance uses "Date" or "date")
     col_map = {}
     for c in result.columns:
         if c.lower() == "date":
@@ -347,7 +378,12 @@ def fetch_full_universe(markets: list[str], period: str, force_source: str = Non
     """
     Download OHLCV for all symbols across requested markets.
     Auto-selects yfinance vs IBKR based on period length.
+
+    Saves:
+      data/{market}_cash.parquet   — per-market (for load_db.py)
+      data/universe_ohlcv.parquet  — combined   (for loader.py)
     """
+    DATA_DIR.mkdir(exist_ok=True)
     all_dfs = []
 
     for market in markets:
@@ -369,21 +405,39 @@ def fetch_full_universe(markets: list[str], period: str, force_source: str = Non
         else:
             df = fetch_yfinance(symbols, period)
 
-        if df is not None and not df.empty:
-            all_dfs.append(df)
+        if df is None or df.empty:
+            logger.warning(f"No data returned for market: {market}")
+            continue
+
+        # ── Normalise columns to lowercase ─────────────────────
+        df = normalise_columns(df)
+
+        # ── Save per-market parquet (what load_db.py expects) ──
+        market_path = DATA_DIR / f"{market}_cash.parquet"
+        df.to_parquet(market_path, index=False)
+        size_mb = market_path.stat().st_size / (1024 * 1024)
+        logger.info(
+            f"Saved → {market_path}  "
+            f"({size_mb:.1f} MB, {len(df):,} rows, "
+            f"{df['symbol'].nunique()} symbols)"
+        )
+
+        all_dfs.append(df)
 
     if not all_dfs:
-        logger.warning("No data collected")
+        logger.warning("No data collected across any market")
         return
 
-    result = pd.concat(all_dfs, ignore_index=True)
-
-    # ── Save to parquet ────────────────────────────────────────
-    DATA_DIR.mkdir(exist_ok=True)
-    out_path = DATA_DIR / "universe_ohlcv.parquet"
-    result.to_parquet(out_path, index=False)
-    size_mb = out_path.stat().st_size / (1024 * 1024)
-    logger.info(f"Saved → {out_path}  ({size_mb:.1f} MB, {len(result):,} rows)")
+    # ── Save combined file (for loader.py parquet reads) ───────
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined_path = DATA_DIR / "universe_ohlcv.parquet"
+    combined.to_parquet(combined_path, index=False)
+    size_mb = combined_path.stat().st_size / (1024 * 1024)
+    logger.info(
+        f"Saved → {combined_path}  "
+        f"({size_mb:.1f} MB, {len(combined):,} rows, "
+        f"{combined['symbol'].nunique()} symbols — combined)"
+    )
 
 
 # ====================================================================

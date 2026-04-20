@@ -1,42 +1,40 @@
 """
 strategy/signals.py
 -------------------
-Converts composite scores into actionable trade signals.
+Entry / exit signal generation.
+
+Takes a scored, RS-enriched DataFrame for a single ticker and
+produces a column set that tells the portfolio builder what to do.
+
+Signals are *gated*: every candidate must pass a checklist of
+conditions before it earns a ``sig_confirmed == 1`` flag.
+
+Gates
+─────
+  1.  score_adjusted  ≥  entry_score_min          (quality bar)
+  2.  rs_regime       ∈  allowed_rs_regimes       (stock trend)
+  3.  sect_rs_regime  ∈  allowed_sector_regimes   (sector tide)
+  4.  momentum_streak ≥  N consecutive days > 0.5 (persistence)
+  5.  NOT in cooldown after recent exit            (anti-churn)
+  6.  breadth_regime  ∈  allowed_breadth_regimes  (market gate)
 
 Pipeline
 ────────
-  scored DataFrame (from compute layer)
-       ↓
-  regime_filter()       — is the stock in an allowed regime?
-  sector_filter()       — is the sector not blocked?
-  momentum_filter()     — is momentum confirming?
-       ↓
-  raw_signal()          — meets entry / exit thresholds?
-       ↓
-  confirmed_signal()    — held for N consecutive days?
-       ↓
-  position_size()       — how much capital to allocate?
-       ↓
-  generate_signals()    — master function, all of the above
+  scored_df  →  _gate_regime()
+             →  _gate_sector()
+             →  _gate_breadth()
+             →  _gate_momentum()
+             →  _gate_cooldown()
+             →  _gate_entry()
+             →  _compute_exits()
+             →  _position_sizing()
+             →  generate_signals()  ← master function
 
-Output columns
-──────────────
-  sig_regime_ok        bool     stock regime filter passes
-  sig_sector_ok        bool     sector regime filter passes
-  sig_momentum_ok      bool     momentum pillar confirms
-  sig_filters_pass     bool     all three filters pass
-  sig_raw              int      raw signal: 1 / 0 / -1
-  sig_entry_streak     int      consecutive days above entry threshold
-  sig_exit_streak      int      consecutive days below exit threshold
-  sig_filter_fail_str  int      consecutive days filters are failing
-  sig_confirmed        int      confirmed signal after streak check
-  sig_entry_trigger    bool     fresh entry (transition 0 → 1)
-  sig_exit_trigger     bool     fresh exit  (transition 1 → 0)
-  sig_in_cooldown      bool     within cooldown window after exit
-  sig_position_pct     float    suggested position size (0.0–max_pct)
-  sig_reason           str      human-readable reason for current signal
-
-All thresholds and sizing rules live in common/config.py → SIGNAL_PARAMS.
+Each gate adds its own boolean column so downstream analytics
+can diagnose *why* a signal was or wasn't generated.
+ is the per-ticker quality filter. It runs on a single ticker's time series and 
+ answers "is this ticker trade-worthy today?" through six gates (regime, sector, breadth, momentum, cooldown, score). 
+ Its output is sig_confirmed, sig_exit, and all the sig_* diagnostic columns.
 """
 
 from __future__ import annotations
@@ -44,497 +42,414 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from common.config import SIGNAL_PARAMS
+from common.config import SIGNAL_PARAMS, BREADTH_PORTFOLIO
 
 
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG ACCESSOR
 # ═══════════════════════════════════════════════════════════════
 
-def _p(key: str):
-    """Fetch parameter from SIGNAL_PARAMS."""
+def _sp(key: str):
     return SIGNAL_PARAMS[key]
 
 
-# ═══════════════════════════════════════════════════════════════
-#  INDIVIDUAL FILTERS
-# ═══════════════════════════════════════════════════════════════
-
-def _regime_filter(df: pd.DataFrame) -> pd.Series:
-    """
-    Stock-level regime filter.
-
-    Returns True when rs_regime is in the allowed list
-    (default: leading, improving).  A stock in a 'lagging'
-    regime should not receive new capital regardless of score.
-    """
-    allowed = _p("stock_regime_allowed")
-    if "rs_regime" in df.columns:
-        return df["rs_regime"].isin(allowed)
-    # If no RS regime computed, pass everything through
-    return pd.Series(True, index=df.index)
-
-
-def _sector_filter(df: pd.DataFrame) -> pd.Series:
-    """
-    Sector-level regime filter.
-
-    Returns True when the sector regime is NOT in the blocked
-    list.  Avoids allocating to stocks in sectors that are
-    actively rotating out, even if the stock itself looks ok.
-    """
-    blocked = _p("sector_regime_blocked")
-    if "sect_rs_regime" in df.columns:
-        return ~df["sect_rs_regime"].isin(blocked)
-    return pd.Series(True, index=df.index)
-
-
-def _momentum_filter(df: pd.DataFrame) -> pd.Series:
-    """
-    Momentum pillar confirmation.
-
-    Requires the momentum sub-score to exceed a minimum.
-    Prevents entries where rotation is detected but price
-    action hasn't confirmed yet (divergence).
-    """
-    if not _p("entry_momentum_confirm"):
-        return pd.Series(True, index=df.index)
-
-    if "score_momentum" in df.columns:
-        return df["score_momentum"] > 0.55
-    return pd.Series(True, index=df.index)
+def _bpp(key: str):
+    return BREADTH_PORTFOLIO[key]
 
 
 # ═══════════════════════════════════════════════════════════════
-#  RAW SIGNAL GENERATION
+#  GATE 1 — STOCK RS REGIME
 # ═══════════════════════════════════════════════════════════════
 
-def _pick_score_column(df: pd.DataFrame) -> str:
-    """Use adjusted score if available, else fall back to composite."""
-    if "score_adjusted" in df.columns:
-        return "score_adjusted"
-    if "score_composite" in df.columns:
-        return "score_composite"
-    raise ValueError(
-        "DataFrame must contain 'score_adjusted' or 'score_composite'."
+def _gate_regime(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    allowed = _sp("allowed_rs_regimes")
+
+    if "rs_regime" in result.columns:
+        result["sig_regime_ok"] = result["rs_regime"].isin(allowed)
+    else:
+        result["sig_regime_ok"] = True
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GATE 2 — SECTOR REGIME
+# ═══════════════════════════════════════════════════════════════
+
+def _gate_sector(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    allowed = _sp("allowed_sector_regimes")
+
+    if "sect_rs_regime" in result.columns:
+        result["sig_sector_ok"] = (
+            result["sect_rs_regime"].isin(allowed)
+        )
+    else:
+        result["sig_sector_ok"] = True
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GATE 3 — BREADTH REGIME
+# ═══════════════════════════════════════════════════════════════
+
+def _gate_breadth(
+    df: pd.DataFrame,
+    breadth: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Market-level breadth gate.
+
+    When breadth data is provided, this gate:
+      - Merges breadth_regime and breadth_score onto the
+        ticker's DataFrame by date.
+      - Sets ``sig_breadth_ok`` = True when breadth_regime
+        is NOT weak (or when ``weak_block_new`` is False).
+      - Adjusts the effective entry threshold upward in
+        neutral / weak regimes.
+
+    Without breadth data the gate passes unconditionally.
+    """
+    result = df.copy()
+
+    if breadth is None or breadth.empty:
+        result["sig_breadth_ok"]       = True
+        result["breadth_regime"]       = "unknown"
+        result["breadth_score"]        = np.nan
+        result["entry_score_adj"]      = 0.0
+        return result
+
+    # ── Merge breadth onto ticker dates ───────────────────────
+    breadth_cols = ["breadth_regime", "breadth_score", "breadth_score_smooth"]
+    available    = [c for c in breadth_cols if c in breadth.columns]
+
+    if not available:
+        result["sig_breadth_ok"]  = True
+        result["breadth_regime"]  = "unknown"
+        result["breadth_score"]   = np.nan
+        result["entry_score_adj"] = 0.0
+        return result
+
+    bdata = breadth[available].copy()
+
+    # Align on date index
+    result = result.join(bdata, how="left")
+
+    # Forward-fill breadth regime for any gaps
+    if "breadth_regime" in result.columns:
+        result["breadth_regime"] = (
+            result["breadth_regime"].ffill().fillna("unknown")
+        )
+    else:
+        result["breadth_regime"] = "unknown"
+
+    if "breadth_score" in result.columns:
+        result["breadth_score"] = result["breadth_score"].ffill()
+
+    # ── Set gate ──────────────────────────────────────────────
+    block_new = _bpp("weak_block_new")
+
+    if block_new:
+        result["sig_breadth_ok"] = (
+            result["breadth_regime"] != "weak"
+        )
+    else:
+        result["sig_breadth_ok"] = True
+
+    # ── Entry threshold adjustment ────────────────────────────
+    weak_raise    = _bpp("weak_raise_entry")
+    neutral_raise = _bpp("neutral_raise_entry")
+
+    conditions = [
+        result["breadth_regime"] == "weak",
+        result["breadth_regime"] == "neutral",
+    ]
+    choices = [weak_raise, neutral_raise]
+
+    result["entry_score_adj"] = np.select(
+        conditions, choices, default=0.0
     )
 
-
-def _raw_signal(df: pd.DataFrame) -> pd.Series:
-    """
-    Generate raw signal from score thresholds.
-
-      +1  score ≥ entry_score_min AND percentile ≥ entry_percentile_min
-      -1  score < exit_score_below OR percentile < exit_percentile_below
-       0  everything else (hold / no action)
-    """
-    score_col = _pick_score_column(df)
-    score = df[score_col].fillna(0)
-
-    pctile = (
-        df["score_percentile"].fillna(0.5)
-        if "score_percentile" in df.columns
-        else pd.Series(0.5, index=df.index)
-    )
-
-    entry_cond = (
-        (score >= _p("entry_score_min"))
-        & (pctile >= _p("entry_percentile_min"))
-    )
-
-    exit_cond = (
-        (score < _p("exit_score_below"))
-        | (pctile < _p("exit_percentile_below"))
-    )
-
-    signal = pd.Series(0, index=df.index, dtype=int)
-    signal[entry_cond] = 1
-    signal[exit_cond] = -1
-
-    return signal
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
-#  STREAK COUNTING + CONFIRMATION
+#  GATE 4 — MOMENTUM PERSISTENCE
 # ═══════════════════════════════════════════════════════════════
 
-def _consecutive_streak(condition: pd.Series) -> pd.Series:
-    """
-    Count consecutive True values ending at each row.
+def _gate_momentum(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    streak = _sp("confirmation_streak")
 
-    [F, T, T, T, F, T]  →  [0, 1, 2, 3, 0, 1]
-
-    Used for entry/exit confirmation — signal must persist
-    for N days before acting.
-    """
-    groups = (~condition).cumsum()
-    return condition.groupby(groups).cumsum().astype(int)
-
-
-def _confirmed_signal(
-    raw: pd.Series,
-    filters_pass: pd.Series,
-) -> pd.Series:
-    """
-    Apply confirmation logic:
-      - Entry: raw == 1 AND filters pass for entry_confirm_days
-      - Exit:  raw == -1 for exit_confirm_days
-               OR filters fail for exit_confirm_days (regime flip)
-      - Neutral: everything else → hold previous confirmed state
-
-    Returns Series of 1 (long) or 0 (flat).
-    """
-    entry_days = _p("entry_confirm_days")
-    exit_days  = _p("exit_confirm_days")
-
-    entry_streak = _consecutive_streak((raw == 1) & filters_pass)
-    exit_streak  = _consecutive_streak(raw == -1)
-    filter_fail_streak = _consecutive_streak(~filters_pass)
-
-    confirmed = pd.Series(0, index=raw.index, dtype=int)
-
-    # Walk forward — hold state, flip on confirmed streaks
-    state = 0
-    values = confirmed.values
-    e_vals = entry_streak.values
-    x_vals = exit_streak.values
-    ff_vals = filter_fail_streak.values
-
-    for i in range(len(values)):
-        if state == 0:
-            # Looking for entry
-            if e_vals[i] >= entry_days:
-                state = 1
-        else:
-            # Currently long — check exit conditions
-            if x_vals[i] >= exit_days:
-                # Score dropped below exit threshold
-                state = 0
-            elif ff_vals[i] >= exit_days:
-                # Filters failed (regime flipped) → force exit
-                state = 0
-            elif e_vals[i] >= entry_days:
-                # Still confirmed long
-                state = 1
-            # else: hold position (state stays 1)
-
-        values[i] = state
-
-    return confirmed
-
-
-# ═══════════════════════════════════════════════════════════════
-#  COOLDOWN
-# ═══════════════════════════════════════════════════════════════
-
-def _apply_cooldown(confirmed: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """
-    After an exit (1 → 0), block re-entry for cooldown_days.
-
-    Uses the *original* confirmed signal to detect exits so that
-    in-place modifications during cooldown don't mask transitions.
-
-    Returns
-    -------
-    adjusted : pd.Series   confirmed signal with cooldown applied
-    in_cooldown : pd.Series  bool, True during cooldown window
-    """
-    cooldown = _p("cooldown_days")
-    if cooldown <= 0:
-        return confirmed.copy(), pd.Series(False, index=confirmed.index)
-
-    original = confirmed.values          # read-only reference
-    adjusted = confirmed.values.copy()   # mutable copy
-    in_cooldown = np.zeros(len(confirmed), dtype=bool)
-
-    cooldown_remaining = 0
-
-    for i in range(1, len(adjusted)):
-        # Detect exit in original signal (1 → 0 transition)
-        if original[i] == 0 and original[i - 1] == 1:
-            cooldown_remaining = cooldown
-
-        if cooldown_remaining > 0:
-            in_cooldown[i] = True
-            adjusted[i] = 0         # suppress any re-entry
-            cooldown_remaining -= 1
-
-    return (
-        pd.Series(adjusted, index=confirmed.index),
-        pd.Series(in_cooldown, index=confirmed.index),
+    score_col = (
+        "score_adjusted" if "score_adjusted" in result.columns
+        else "score_composite"
     )
+
+    if score_col not in result.columns:
+        result["sig_momentum_ok"] = False
+        return result
+
+    above = result[score_col] >= 0.50
+    cumsum = above.cumsum()
+    reset  = cumsum - cumsum.where(~above).ffill().fillna(0)
+
+    result["sig_momentum_streak"] = reset.astype(int)
+    result["sig_momentum_ok"]     = reset >= streak
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GATE 5 — COOLDOWN
+# ═══════════════════════════════════════════════════════════════
+
+def _gate_cooldown(df: pd.DataFrame) -> pd.DataFrame:
+    result   = df.copy()
+    cooldown = _sp("cooldown_days")
+
+    score_col = (
+        "score_adjusted" if "score_adjusted" in result.columns
+        else "score_composite"
+    )
+
+    if score_col not in result.columns:
+        result["sig_in_cooldown"] = False
+        return result
+
+    exit_thresh = _sp("exit_score_max")
+
+    was_above = (result[score_col].shift(1) >= exit_thresh)
+    now_below = (result[score_col] < exit_thresh)
+    exit_event = was_above & now_below
+
+    cooldown_remaining = pd.Series(0, index=result.index, dtype=int)
+    counter = 0
+    for i in range(len(result)):
+        if exit_event.iloc[i]:
+            counter = cooldown
+        elif counter > 0:
+            counter -= 1
+        cooldown_remaining.iloc[i] = counter
+
+    result["sig_in_cooldown"]       = cooldown_remaining > 0
+    result["sig_cooldown_remaining"] = cooldown_remaining
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GATE 6 — ENTRY CONFIRMATION
+# ═══════════════════════════════════════════════════════════════
+
+def _gate_entry(df: pd.DataFrame) -> pd.DataFrame:
+    result    = df.copy()
+    base_min  = _sp("entry_score_min")
+
+    score_col = (
+        "score_adjusted" if "score_adjusted" in result.columns
+        else "score_composite"
+    )
+
+    if score_col not in result.columns:
+        result["sig_confirmed"] = 0
+        result["sig_reason"]    = "no score"
+        return result
+
+    # ── Effective entry threshold (breadth-adjusted) ──────────
+    entry_adj = result.get("entry_score_adj", 0.0)
+    if isinstance(entry_adj, (int, float)):
+        entry_adj = pd.Series(entry_adj, index=result.index)
+    effective_min = base_min + entry_adj.fillna(0.0)
+
+    result["sig_effective_entry_min"] = effective_min
+
+    scores = result[score_col]
+
+    # All gates must pass
+    regime_ok   = result.get("sig_regime_ok", True)
+    sector_ok   = result.get("sig_sector_ok", True)
+    breadth_ok  = result.get("sig_breadth_ok", True)
+    momentum_ok = result.get("sig_momentum_ok", False)
+    cooldown    = result.get("sig_in_cooldown", False)
+
+    confirmed = (
+        (scores >= effective_min)
+        & regime_ok
+        & sector_ok
+        & breadth_ok
+        & momentum_ok
+        & (~cooldown)
+    )
+
+    result["sig_confirmed"] = confirmed.astype(int)
+
+    # ── Reason annotation ─────────────────────────────────────
+    reasons = pd.Series("", index=result.index)
+
+    reasons = reasons.where(
+        confirmed,
+        np.where(
+            ~regime_ok.astype(bool) if not isinstance(
+                regime_ok, bool
+            ) else ~regime_ok,
+            "regime_blocked",
+            np.where(
+                ~sector_ok.astype(bool) if not isinstance(
+                    sector_ok, bool
+                ) else ~sector_ok,
+                "sector_blocked",
+                np.where(
+                    ~breadth_ok.astype(bool) if not isinstance(
+                        breadth_ok, bool
+                    ) else ~breadth_ok,
+                    "breadth_weak",
+                    np.where(
+                        cooldown.astype(bool) if not isinstance(
+                            cooldown, bool
+                        ) else cooldown,
+                        "cooldown",
+                        np.where(
+                            ~momentum_ok.astype(bool) if not isinstance(
+                                momentum_ok, bool
+                            ) else ~momentum_ok,
+                            "momentum_unconfirmed",
+                            np.where(
+                                scores < effective_min,
+                                "score_below_entry",
+                                "no_signal",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    reasons = reasons.where(~confirmed, "LONG")
+    result["sig_reason"] = reasons
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EXIT SIGNALS
+# ═══════════════════════════════════════════════════════════════
+
+def _compute_exits(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    exit_max = _sp("exit_score_max")
+
+    score_col = (
+        "score_adjusted" if "score_adjusted" in result.columns
+        else "score_composite"
+    )
+
+    if score_col not in result.columns:
+        result["sig_exit"] = 0
+        return result
+
+    was_confirmed = result["sig_confirmed"].shift(1).fillna(0) == 1
+    now_weak      = result[score_col] < exit_max
+
+    result["sig_exit"] = (was_confirmed & now_weak).astype(int)
+
+    # Also flag if breadth turned weak on an existing position
+    if "breadth_regime" in result.columns:
+        breadth_was_ok  = result["sig_breadth_ok"].shift(1, fill_value=True)
+        breadth_now_bad = result["breadth_regime"] == "weak"
+        result["sig_exit_breadth"] = (
+            was_confirmed & breadth_now_bad & breadth_was_ok
+        ).astype(int)
+    else:
+        result["sig_exit_breadth"] = 0
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
 #  POSITION SIZING
 # ═══════════════════════════════════════════════════════════════
 
-def _position_size(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
-    """
-    Compute position size as a fraction of portfolio.
+def _position_sizing(df: pd.DataFrame) -> pd.DataFrame:
+    result   = df.copy()
+    base     = _sp("base_position_pct")
+    max_pos  = _sp("max_position_pct")
 
-    Logic
-    ─────
-    1. Start from base_position_pct.
-    2. Scale by (adjusted_score - entry_threshold) × score_scale_factor.
-       Higher conviction → larger position.
-    3. Apply volatility penalty if score_volatility is low.
-    4. Clamp to [min_position_pct, max_position_pct].
-    5. Zero out if signal != 1.
-    """
-    score_col = _pick_score_column(df)
-    score = df[score_col].fillna(0)
+    score_col = (
+        "score_adjusted" if "score_adjusted" in result.columns
+        else "score_composite"
+    )
 
-    base = _p("base_position_pct")
-    scale = _p("score_scale_factor")
-    entry_min = _p("entry_score_min")
-    max_pos = _p("max_position_pct")
-    min_pos = _p("min_position_pct")
+    if score_col not in result.columns:
+        result["sig_position_pct"] = 0.0
+        return result
 
-    # ── Conviction scaling ────────────────────────────────────
-    excess = (score - entry_min).clip(lower=0)
-    size = base + excess * scale
+    scores = result[score_col].fillna(0)
 
-    # ── Volatility penalty ────────────────────────────────────
-    if "score_volatility" in df.columns:
-        vol_thresh = _p("vol_penalty_threshold")
-        vol_factor = _p("vol_penalty_factor")
-        vol_penalty = np.where(
-            df["score_volatility"].fillna(0.5) < vol_thresh,
-            vol_factor,
-            1.0,
-        )
-        size = size * vol_penalty
+    # Scale linearly from base → max as score goes 0.6 → 1.0
+    low, high = 0.60, 1.0
+    frac = ((scores - low) / (high - low)).clip(0, 1)
+    raw  = base + frac * (max_pos - base)
 
-    # ── Sector boost ──────────────────────────────────────────
-    if "sect_rs_pctrank" in df.columns:
-        # Top 3 sectors get a 10-20% size boost
-        sect_boost = np.where(
-            df["sect_rs_pctrank"].fillna(0.5) >= 0.80,
-            1.15,
-            np.where(
-                df["sect_rs_pctrank"].fillna(0.5) <= 0.20,
-                0.85,
-                1.00,
-            ),
-        )
-        size = size * sect_boost
+    # ── Breadth-based scaling ─────────────────────────────────
+    # In neutral/weak breadth, scale down position sizes
+    if "breadth_regime" in result.columns:
+        breadth_scale = result["breadth_regime"].map({
+            "strong":  1.0,
+            "neutral": _bpp("neutral_exposure"),
+            "weak":    _bpp("weak_exposure"),
+        }).fillna(1.0)
+    else:
+        breadth_scale = 1.0
 
-    # ── Clamp and zero out non-entries ────────────────────────
-    size = size.clip(lower=min_pos, upper=max_pos)
-    size = np.where(signal == 1, size, 0.0)
+    raw = raw * breadth_scale
 
-    return pd.Series(size, index=df.index)
+    result["sig_position_pct"] = np.where(
+        result["sig_confirmed"] == 1, raw, 0.0,
+    )
 
-
-# ═══════════════════════════════════════════════════════════════
-#  SIGNAL REASON (human-readable)
-# ═══════════════════════════════════════════════════════════════
-
-def _signal_reason(df: pd.DataFrame) -> pd.Series:
-    """
-    Build a short reason string for the current signal state.
-
-    Examples:
-      "LONG: score 0.72, tech leading, rank 1"
-      "FLAT: score below 0.60 threshold"
-      "BLOCKED: sector lagging"
-      "COOLDOWN: 3 days remaining"
-    """
-    score_col = _pick_score_column(df)
-    reasons = []
-
-    for i in range(len(df)):
-        row = df.iloc[i]
-        sig = row.get("sig_confirmed", 0)
-        score_val = row.get(score_col, 0)
-
-        if row.get("sig_in_cooldown", False):
-            reasons.append("COOLDOWN")
-            continue
-
-        if sig == 1:
-            parts = [f"LONG: score {score_val:.2f}"]
-            regime = row.get("rs_regime", "")
-            if regime:
-                parts.append(regime)
-            sect = row.get("sector_name", "")
-            sect_regime = row.get("sect_rs_regime", "")
-            if sect and sect_regime:
-                parts.append(f"{sect} {sect_regime}")
-            rank = row.get("sect_rs_rank", None)
-            if rank and not pd.isna(rank):
-                parts.append(f"rank {int(rank)}")
-            reasons.append(", ".join(parts))
-        else:
-            # Why flat?
-            if not row.get("sig_regime_ok", True):
-                reasons.append(
-                    f"BLOCKED: stock regime "
-                    f"{row.get('rs_regime', '?')}"
-                )
-            elif not row.get("sig_sector_ok", True):
-                reasons.append(
-                    f"BLOCKED: sector "
-                    f"{row.get('sect_rs_regime', '?')}"
-                )
-            elif not row.get("sig_momentum_ok", True):
-                reasons.append(
-                    f"WAIT: momentum {row.get('score_momentum', 0):.2f}"
-                )
-            elif score_val < _p("entry_score_min"):
-                reasons.append(
-                    f"FLAT: score {score_val:.2f} "
-                    f"< {_p('entry_score_min')}"
-                )
-            else:
-                reasons.append(f"FLAT: score {score_val:.2f}")
-
-    return pd.Series(reasons, index=df.index)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
 #  MASTER FUNCTION
 # ═══════════════════════════════════════════════════════════════
 
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
+def generate_signals(
+    df: pd.DataFrame,
+    breadth: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
-    Full signal generation pipeline.
+    Run the full signal pipeline on a single ticker's scored
+    DataFrame.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Date-indexed stock data with score columns from
-        ``compute_composite_score`` and optionally sector
-        columns from ``merge_sector_context``.
+        Output of the scoring pipeline, with RS and sector RS
+        columns already merged.
+    breadth : pd.DataFrame, optional
+        Output of ``compute_all_breadth()``.  When provided,
+        breadth regime gates and position-size scaling are active.
 
     Returns
     -------
     pd.DataFrame
-        Input DataFrame with signal columns appended:
-
-        ==================== =========================================
-        sig_regime_ok        bool — stock regime filter passes
-        sig_sector_ok        bool — sector regime filter passes
-        sig_momentum_ok      bool — momentum pillar confirms
-        sig_filters_pass     bool — all three filters pass
-        sig_raw              int  — raw signal (+1 / 0 / -1)
-        sig_entry_streak     int  — consecutive entry-condition days
-        sig_exit_streak      int  — consecutive exit-condition days
-        sig_filter_fail_str  int  — consecutive days filters failing
-        sig_confirmed        int  — signal after confirmation + cooldown
-        sig_entry_trigger    bool — fresh entry (0 → 1 transition)
-        sig_exit_trigger     bool — fresh exit  (1 → 0 transition)
-        sig_in_cooldown      bool — within post-exit cooldown
-        sig_position_pct     float — suggested allocation (0–max_pct)
-        sig_reason           str  — human-readable explanation
-        ==================== =========================================
-
-    Raises
-    ------
-    ValueError
-        If no score column found.
+        Original columns plus all ``sig_*`` columns.
     """
-    out = df.copy()
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    # ── Filters ───────────────────────────────────────────────
-    out["sig_regime_ok"]   = _regime_filter(out)
-    out["sig_sector_ok"]   = _sector_filter(out)
-    out["sig_momentum_ok"] = _momentum_filter(out)
-    out["sig_filters_pass"] = (
-        out["sig_regime_ok"]
-        & out["sig_sector_ok"]
-        & out["sig_momentum_ok"]
-    )
+    result = _gate_regime(df)
+    result = _gate_sector(result)
+    result = _gate_breadth(result, breadth)
+    result = _gate_momentum(result)
+    result = _gate_cooldown(result)
+    result = _gate_entry(result)
+    result = _compute_exits(result)
+    result = _position_sizing(result)
 
-    # ── Raw signal ────────────────────────────────────────────
-    out["sig_raw"] = _raw_signal(out)
-
-    # ── Streaks ───────────────────────────────────────────────
-    out["sig_entry_streak"] = _consecutive_streak(
-        (out["sig_raw"] == 1) & out["sig_filters_pass"]
-    )
-    out["sig_exit_streak"] = _consecutive_streak(
-        out["sig_raw"] == -1
-    )
-    out["sig_filter_fail_str"] = _consecutive_streak(
-        ~out["sig_filters_pass"]
-    )
-
-    # ── Confirmed signal ──────────────────────────────────────
-    confirmed = _confirmed_signal(
-        out["sig_raw"], out["sig_filters_pass"]
-    )
-
-    # ── Cooldown ──────────────────────────────────────────────
-    out["sig_confirmed"], out["sig_in_cooldown"] = _apply_cooldown(
-        confirmed
-    )
-
-    # ── Entry / exit triggers (transitions) ───────────────────
-    prev = out["sig_confirmed"].shift(1).fillna(0).astype(int)
-    out["sig_entry_trigger"] = (out["sig_confirmed"] == 1) & (prev == 0)
-    out["sig_exit_trigger"]  = (out["sig_confirmed"] == 0) & (prev == 1)
-
-    # ── Position sizing ───────────────────────────────────────
-    out["sig_position_pct"] = _position_size(out, out["sig_confirmed"])
-
-    # ── Human-readable reason ─────────────────────────────────
-    out["sig_reason"] = _signal_reason(out)
-
-    return out
-
-
-# ═══════════════════════════════════════════════════════════════
-#  SIGNAL SUMMARY — quick stats for a single stock
-# ═══════════════════════════════════════════════════════════════
-
-def signal_summary(df: pd.DataFrame) -> dict:
-    """
-    Quick diagnostic summary of signal history.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Output of :func:`generate_signals`.
-
-    Returns
-    -------
-    dict with keys:
-        total_days, days_long, days_flat, pct_invested,
-        num_entries, num_exits, avg_hold_days,
-        current_signal, current_reason, current_position_pct,
-        current_score, current_regime
-    """
-    if "sig_confirmed" not in df.columns:
-        raise ValueError("Run generate_signals() first.")
-
-    sig = df["sig_confirmed"]
-    score_col = _pick_score_column(df)
-    total = len(sig.dropna())
-    long_days = int((sig == 1).sum())
-    entries = int(df["sig_entry_trigger"].sum())
-    exits = int(df["sig_exit_trigger"].sum())
-
-    # Average holding period
-    if entries > 0:
-        avg_hold = long_days / entries
-    else:
-        avg_hold = 0.0
-
-    last = df.iloc[-1]
-
-    return {
-        "total_days":           total,
-        "days_long":            long_days,
-        "days_flat":            total - long_days,
-        "pct_invested":         round(long_days / max(total, 1), 3),
-        "num_entries":          entries,
-        "num_exits":            exits,
-        "avg_hold_days":        round(avg_hold, 1),
-        "current_signal":       int(last.get("sig_confirmed", 0)),
-        "current_reason":       last.get("sig_reason", ""),
-        "current_position_pct": round(last.get("sig_position_pct", 0), 4),
-        "current_score":        round(last.get(score_col, 0), 4),
-        "current_regime":       last.get("rs_regime", ""),
-    }
+    return result

@@ -1,20 +1,25 @@
 """
 compute/scoring.py
 -------------------
-Four-pillar composite scoring engine.
+Five-pillar composite scoring engine.
 
 Takes a DataFrame that already has indicator columns (from indicators.py)
-and relative-strength columns (from relative_strength.py), and produces
-sub-scores plus a weighted composite score per row (ticker-day).
+and relative-strength columns (from relative_strength.py), plus an
+optional breadth score series (from breadth.py), and produces sub-scores
+plus a weighted composite score per row (ticker-day).
 
 Pillar 1 — Rotation       : Is smart money rotating into this name?
 Pillar 2 — Momentum       : Is price action confirming the rotation?
 Pillar 3 — Volatility     : Is risk / reward favorable for entry?
 Pillar 4 — Microstructure : Is institutional volume backing the move?
+Pillar 5 — Breadth        : Is the broad market confirming the move?
 
 Each pillar returns a Series in [0, 1].
 Weighted average → composite in [0, 1].
 All weights live in common/config.py → SCORING_WEIGHTS.
+
+When breadth data is unavailable the engine falls back to a four-pillar
+mode, renormalising the remaining weights so they still sum to 1.0.
 
 This module does NOT make trade decisions — it ranks.
 The strategy layer downstream decides what score threshold triggers action.
@@ -55,9 +60,9 @@ COL = {
 
     # Pillar 4 — Microstructure
     "obv":              "obv",
-    "obv_slope":        "obv_slope_10d",       # pre-computed
+    "obv_slope":        "obv_slope_10d",
     "ad_line":          "ad_line",
-    "ad_slope":         "ad_line_slope_10d",   # pre-computed
+    "ad_slope":         "ad_line_slope_10d",
     "relative_volume":  "relative_volume",
 }
 
@@ -145,7 +150,6 @@ def _pillar_rotation(df: pd.DataFrame) -> pd.Series:
     regime = df[_col("rs_regime")].map(regime_map).fillna(0.5)
 
     # ── rs_momentum ──────────────────────────────────────────
-    # Raw values ~±0.003, scale to ±1.5 for useful sigmoid range
     mom = pd.Series(
         _sigmoid(
             df[_col("rs_momentum")].fillna(0).values
@@ -184,8 +188,6 @@ def _pillar_momentum(df: pd.DataFrame) -> pd.Series:
           <15 = choppy = low score.
     """
     # ── RSI ──────────────────────────────────────────────────
-    #   RSI    0   25   40   55   70   80   100
-    #   score  .10 .10  .60  1.0  1.0  .50  .10
     rsi_score = pd.Series(
         np.interp(
             df[_col("rsi")].fillna(50).values,
@@ -201,8 +203,6 @@ def _pillar_momentum(df: pd.DataFrame) -> pd.Series:
     ).fillna(0.5)
 
     # ── ADX ──────────────────────────────────────────────────
-    #   ADX    0   10   15   25   40   60
-    #   score  .10 .20  .40  .85  1.0  1.0
     adx_score = pd.Series(
         np.interp(
             df[_col("adx")].fillna(15).values,
@@ -295,8 +295,6 @@ def _pillar_microstructure(df: pd.DataFrame) -> pd.Series:
     ).fillna(0.5)
 
     # ── Relative volume ──────────────────────────────────────
-    #   rvol   0.0  0.5  1.0  1.5  2.5  4.0  8.0
-    #   score  .10  .20  .50  .85  1.0  .80  .50
     rvol_score = pd.Series(
         np.interp(
             df[_col("relative_volume")].fillna(1.0).values,
@@ -314,12 +312,55 @@ def _pillar_microstructure(df: pd.DataFrame) -> pd.Series:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  PILLAR 5 — BREADTH
+#  "Is the broad market confirming the move?"
+# ═══════════════════════════════════════════════════════════════
+
+def _pillar_breadth(
+    df: pd.DataFrame,
+    breadth_scores: pd.Series,
+) -> pd.Series:
+    """
+    Market breadth overlay.
+
+    The breadth pillar is unique: it is a universe-level signal
+    (the same value for every symbol on a given day), not a
+    per-symbol indicator.  It acts as a tide gauge — when broad
+    participation is strong, all boats get a lift; when breadth
+    deteriorates, conviction is dampened across the board.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The per-symbol indicator DataFrame (used only for its index).
+    breadth_scores : pd.Series
+        Daily breadth scores on a 0–100 scale, as produced by
+        ``breadth_to_pillar_scores()`` for this symbol's column.
+
+    Returns
+    -------
+    pd.Series
+        Values in [0, 1] aligned to df's index.
+    """
+    # Align to the symbol's date index, forward-fill gaps
+    # (breadth may have fewer rows if the constituent universe
+    # started trading later than this symbol)
+    aligned = breadth_scores.reindex(df.index).ffill().fillna(50.0)
+
+    # Rescale 0–100 → 0–1
+    return (aligned / 100.0).clip(0, 1)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  MASTER FUNCTION
 # ═══════════════════════════════════════════════════════════════
 
-def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
+def compute_composite_score(
+    df: pd.DataFrame,
+    breadth_scores: pd.Series | None = None,
+) -> pd.DataFrame:
     """
-    Compute all four pillar sub-scores and the weighted composite.
+    Compute all pillar sub-scores and the weighted composite.
 
     Parameters
     ----------
@@ -327,6 +368,11 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
         Date-indexed OHLCV with indicator columns (from
         compute_all_indicators) **and** RS columns (from
         compute_all_rs) already present.
+    breadth_scores : pd.Series or None
+        Daily breadth score for this symbol (0–100 scale),
+        typically one column from the output of
+        ``breadth_to_pillar_scores()``.  If None, the engine
+        falls back to four-pillar mode with renormalised weights.
 
     Returns
     -------
@@ -336,15 +382,17 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
           score_momentum       [0-1]   Pillar 2
           score_volatility     [0-1]   Pillar 3
           score_microstructure [0-1]   Pillar 4
+          score_breadth        [0-1]   Pillar 5 (if breadth provided)
           score_composite      [0-1]   Weighted average
           score_percentile     [0-1]   Time-series pct rank of composite
+          breadth_available    bool    Whether breadth was used
 
     Raises
     ------
     ValueError
-        Missing columns or pillar weights don't sum to ~1.0.
+        Missing columns needed by pillars 1–4.
     """
-    # ── Validate required columns ─────────────────────────────
+    # ── Validate required columns (pillars 1–4) ──────────────
     required = {
         "pillar_rotation":       [
             _col("rs_zscore"), _col("rs_regime"),
@@ -370,17 +418,27 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing columns: {missing}")
 
-    # ── Validate pillar weights ───────────────────────────────
+    # ── Determine mode: 5-pillar or 4-pillar fallback ────────
+    use_breadth = (
+        breadth_scores is not None
+        and not breadth_scores.empty
+        and "pillar_breadth" in SCORING_WEIGHTS
+    )
+
     pillar_keys = [
         "pillar_rotation", "pillar_momentum",
         "pillar_volatility", "pillar_microstructure",
     ]
-    total = sum(_w(k) for k in pillar_keys)
-    if abs(total - 1.0) > 0.01:
-        raise ValueError(
-            f"Pillar weights sum to {total:.4f}, expected ~1.0.  "
-            f"Fix SCORING_WEIGHTS in config.py."
-        )
+    if use_breadth:
+        pillar_keys.append("pillar_breadth")
+
+    raw_weights = {k: _w(k) for k in pillar_keys}
+    total_w = sum(raw_weights.values())
+
+    # Renormalise so active pillars sum to exactly 1.0
+    if total_w <= 0:
+        raise ValueError("Pillar weights sum to zero.")
+    weights = {k: v / total_w for k, v in raw_weights.items()}
 
     # ── Compute pillar scores ─────────────────────────────────
     out = df.copy()
@@ -390,18 +448,28 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
     out["score_volatility"]     = _pillar_volatility(out).clip(0, 1)
     out["score_microstructure"] = _pillar_microstructure(out).clip(0, 1)
 
+    if use_breadth:
+        out["score_breadth"] = _pillar_breadth(out, breadth_scores).clip(0, 1)
+
     # ── Composite ─────────────────────────────────────────────
-    out["score_composite"] = (
-        _w("pillar_rotation")       * out["score_rotation"]
-        + _w("pillar_momentum")     * out["score_momentum"]
-        + _w("pillar_volatility")   * out["score_volatility"]
-        + _w("pillar_microstructure") * out["score_microstructure"]
-    ).clip(0, 1)
+    composite = (
+        weights["pillar_rotation"]       * out["score_rotation"]
+        + weights["pillar_momentum"]     * out["score_momentum"]
+        + weights["pillar_volatility"]   * out["score_volatility"]
+        + weights["pillar_microstructure"] * out["score_microstructure"]
+    )
+
+    if use_breadth:
+        composite += weights["pillar_breadth"] * out["score_breadth"]
+
+    out["score_composite"] = composite.clip(0, 1)
 
     # ── Time-series percentile ────────────────────────────────
-    # "How good is today's score relative to this stock's own history?"
     out["score_percentile"] = _rolling_pctrank(
         out["score_composite"], 252
     )
+
+    # ── Metadata ──────────────────────────────────────────────
+    out["breadth_available"] = use_breadth
 
     return out
