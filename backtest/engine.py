@@ -1,24 +1,17 @@
 """
 backtest/engine.py
 ------------------
-Core backtesting engine.
+Core backtesting engine — ties together data loading, the full
+CASH pipeline (including rotation + convergence), and the
+portfolio simulation.
 
-Ties together data loading, the full CASH pipeline, and the
-portfolio simulation into a single ``run_backtest_period()``
-call.
-
-For strategy comparison, the engine accepts parameter overrides
-via a ``StrategyConfig`` object.  Overrides are applied to the
-global config dicts using a context manager, then restored
-after the run — safe for sequential comparison of many variants.
-
-Key improvements
-----------------
-- Config overrides now wrap both pipeline AND portfolio simulation
-- Minimum holding period prevents excessive churn (default 20 cal-days)
-- Breadth crisis response blocks equity BUYs in weak/critical regimes
-- Cash proxy (SHY) earns returns on idle capital instead of 0 %
-- Robust column detection for any signal DataFrame schema
+Key improvements over the original:
+  - Multi-market support (US, HK, IN) via market-aware StrategyConfig
+  - lookback_days passthrough to Orchestrator for indicator warm-up
+  - Rotation engine and convergence automatically invoked for US
+  - Regime-conditional metrics when breadth data is available
+  - Fixed cash-proxy equity adjustment bug
+  - Cleaner signal column detection
 """
 
 from __future__ import annotations
@@ -40,6 +33,7 @@ from common.config import (
     SCORING_PARAMS,
     SIGNAL_PARAMS,
     BREADTH_PORTFOLIO,
+    MARKET_CONFIG,
 )
 from pipeline.orchestrator import Orchestrator, PipelineResult
 from portfolio.backtest import (
@@ -66,7 +60,6 @@ DEFENSIVE_TICKERS = frozenset({
     "AGG", "SHY", "TLT", "IEF", "GLD", "BIL",
 })
 
-# Column-name candidates (checked in priority order)
 _SIGNAL_COLS = ("signal", "action", "trade_signal")
 _TICKER_COLS = ("ticker", "symbol", "asset")
 _DATE_COLS   = ("date", "trade_date", "timestamp")
@@ -81,7 +74,6 @@ _REGIME_COLS = (
 # ═══════════════════════════════════════════════════════════════
 
 def _is_buy(val) -> bool:
-    """Return True if *val* represents a BUY / entry signal."""
     if isinstance(val, str):
         return val.upper() in ("BUY", "STRONG_BUY", "ENTRY")
     try:
@@ -91,7 +83,6 @@ def _is_buy(val) -> bool:
 
 
 def _is_sell(val) -> bool:
-    """Return True if *val* represents a SELL / exit signal."""
     if isinstance(val, str):
         return val.upper() in ("SELL", "STRONG_SELL", "EXIT")
     try:
@@ -101,12 +92,10 @@ def _is_sell(val) -> bool:
 
 
 def _buy_value(sample) -> Any:
-    """Return the BUY constant matching the dtype of *sample*."""
     return "BUY" if isinstance(sample, str) else 1
 
 
 def _hold_value(sample) -> Any:
-    """Return the HOLD / neutral constant matching *sample*."""
     return "HOLD" if isinstance(sample, str) else 0
 
 
@@ -119,22 +108,17 @@ class StrategyConfig:
     """
     A named set of parameter overrides for backtesting.
 
-    Each dict field is either ``None`` (use global default) or a
-    mapping of key → value that will be merged into the
-    corresponding config dict for the duration of the run.
-
-    Example
-    -------
-    >>> aggressive = StrategyConfig(
-    ...     name="aggressive_momentum",
-    ...     description="Heavy momentum weighting",
-    ...     scoring_weights={"pillar_momentum": 0.40},
-    ...     signal_params={"entry_score_min": 0.50},
-    ...     min_hold_days=30,
-    ... )
+    Enhanced with:
+      - ``market`` — target market (US / HK / IN)
+      - ``enable_rotation`` — whether to run rotation engine
+      - ``enable_convergence`` — whether to merge scoring + rotation
+      - ``lookback_days`` — analysis window for the pipeline
     """
     name: str = "baseline"
     description: str = "Default CASH parameters"
+
+    # ── Market ────────────────────────────────────────────────
+    market: str = "US"
 
     # ── Config-dict overrides (applied to globals) ────────────
     scoring_weights:   dict | None = None
@@ -151,22 +135,19 @@ class StrategyConfig:
     # ── Universe filter ───────────────────────────────────────
     universe_filter: list[str] | None = None
 
+    # ── Pipeline feature flags ────────────────────────────────
+    enable_rotation: bool = True
+    enable_convergence: bool = True
+    lookback_days: int | None = None
+
     # ── Trading rules ─────────────────────────────────────────
     min_hold_days: int = 20
-    """Minimum calendar days between entry and exit.  0 = disabled."""
-
     cash_proxy: str | None = "SHY"
-    """Ticker whose returns are applied to idle cash.  None = disabled."""
 
     # ── Breadth crisis response ───────────────────────────────
     breadth_defensive: bool = True
-    """Block equity BUY signals during weak / critical breadth."""
-
     max_equity_weak: float = 0.40
-    """Maximum equity exposure allowed during *weak* breadth."""
-
     max_equity_critical: float = 0.15
-    """Maximum equity exposure allowed during *critical* breadth."""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -175,12 +156,7 @@ class StrategyConfig:
 
 @dataclass
 class BacktestRun:
-    """
-    Complete output of a single backtest run.
-
-    Wraps the pipeline result, the portfolio simulation result,
-    and comprehensive performance metrics.
-    """
+    """Complete output of a single backtest run."""
     strategy: StrategyConfig
     start_date: pd.Timestamp
     end_date: pd.Timestamp
@@ -241,38 +217,27 @@ def run_backtest_period(
     strategy: StrategyConfig | None = None,
     capital: float = 100_000.0,
     benchmark: str | None = None,
+    current_holdings: list[str] | None = None,
 ) -> BacktestRun:
     """
     Run a complete backtest over a date range.
 
     Steps
     -----
-    1. Slice data to ``[start, end]``
-    2. Apply strategy parameter overrides  (context manager)
-    3. Run the full CASH pipeline  (Orchestrator)
-    4. **Pre-process signals**  (min-hold, breadth override)
-    5. Run the portfolio simulation  (portfolio/backtest.py)
-    6. **Adjust equity for cash-proxy returns**
-    7. Compute performance metrics and benchmarks
-    8. Return everything in a ``BacktestRun``
-
-    Parameters
-    ----------
-    data : dict[str, pd.DataFrame]
-        ``{ticker: OHLCV}`` from ``ensure_history()``.
-    start, end : str / Timestamp / None
-        Period bounds.  *None* → earliest / latest available.
-    strategy : StrategyConfig or None
-        Override set.  *None* → defaults.
-    capital : float
-        Initial portfolio value.
-    benchmark : str or None
-        Benchmark ticker.  Default = SPY.
+    1. Slice data to [start, end]
+    2. Apply strategy parameter overrides
+    3. Run the full CASH pipeline (with rotation + convergence for US)
+    4. Pre-process signals (min-hold, breadth override)
+    5. Run the portfolio simulation
+    6. Adjust equity for cash-proxy returns
+    7. Compute performance metrics (including regime-conditional)
     """
     if strategy is None:
         strategy = StrategyConfig()
 
-    benchmark = benchmark or BENCHMARK_TICKER
+    market = strategy.market
+    mcfg = MARKET_CONFIG.get(market, MARKET_CONFIG["US"])
+    benchmark = benchmark or mcfg.get("benchmark", BENCHMARK_TICKER)
     t0 = time.perf_counter()
 
     # ── 1. Slice data ─────────────────────────────────────────
@@ -287,11 +252,9 @@ def run_backtest_period(
 
     # ── 2. Apply universe filter ──────────────────────────────
     if strategy.universe_filter:
-        # Always keep benchmark + cash proxy in the universe
         must_keep = {benchmark}
         if strategy.cash_proxy and strategy.cash_proxy in data:
             must_keep.add(strategy.cash_proxy)
-
         sliced = {
             k: v for k, v in sliced.items()
             if k in strategy.universe_filter or k in must_keep
@@ -302,9 +265,9 @@ def run_backtest_period(
     actual_end = summary["latest_end"]
 
     logger.info(
-        f"Backtest '{strategy.name}': "
+        f"Backtest '{strategy.name}' [{market}]: "
         f"{summary['n_tickers']} tickers, "
-        f"{actual_start.date()} \u2192 {actual_end.date()}, "
+        f"{actual_start.date()} → {actual_end.date()}, "
         f"${capital:,.0f}"
     )
 
@@ -323,28 +286,61 @@ def run_backtest_period(
         bench_equity.name = "benchmark"
 
     # ══════════════════════════════════════════════════════════
-    #  Everything inside _config_overrides so that scoring
-    #  weights, signal params, portfolio params, breadth
-    #  settings, etc. are consistently applied to BOTH the
-    #  pipeline AND the portfolio simulation.
+    #  Config overrides applied to BOTH pipeline AND simulation
     # ══════════════════════════════════════════════════════════
     with _config_overrides(strategy):
 
-        # ── 4a. Run CASH pipeline (Phases 0 – 4) ─────────────
+        # ── 4a. Determine pipeline feature flags ──────────────
+        engines = mcfg.get("engines", ["scoring"])
+        run_rotation = (
+            strategy.enable_rotation
+            and "rotation" in engines
+        )
+        run_convergence = (
+            strategy.enable_convergence
+            and run_rotation
+        )
+
+        # ── 4b. Run CASH pipeline ────────────────────────────
         try:
             orch = Orchestrator(
+                market=market,
                 universe=list(sliced.keys()),
                 benchmark=benchmark,
                 capital=capital,
+                lookback_days=strategy.lookback_days,
                 enable_breadth=True,
-                enable_sectors=True,
+                enable_sectors=mcfg.get("sector_rs_enabled", True),
                 enable_signals=True,
-                enable_backtest=False,   # we run our own below
+                enable_backtest=False,
             )
 
             orch.load_data(preloaded=sliced, bench_df=bench_df)
             orch.compute_universe_context()
             orch.run_tickers()
+
+            # Rotation engine (US only, when enabled)
+            if run_rotation:
+                try:
+                    orch.run_rotation_engine(
+                        current_holdings=current_holdings or [],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Rotation engine failed: {e} — "
+                        f"continuing without rotation"
+                    )
+
+            # Convergence merge
+            if run_convergence:
+                try:
+                    orch.apply_convergence()
+                except Exception as e:
+                    logger.warning(
+                        f"Convergence failed: {e} — "
+                        f"continuing without convergence"
+                    )
+
             orch.cross_sectional_analysis()
             pipeline_result = orch.generate_reports()
 
@@ -358,12 +354,10 @@ def run_backtest_period(
                 error=f"Pipeline error: {e}",
             )
 
-        # ── 4b. Validate signals ─────────────────────────────
+        # ── 4c. Validate signals ─────────────────────────────
         signals_df = pipeline_result.signals
         if signals_df is None or signals_df.empty:
-            logger.warning(
-                f"No signals generated for '{strategy.name}'"
-            )
+            logger.warning(f"No signals generated for '{strategy.name}'")
             return BacktestRun(
                 strategy=strategy,
                 start_date=actual_start,
@@ -373,12 +367,12 @@ def run_backtest_period(
                 error="No signals generated — check pipeline logs",
             )
 
-        # ── 4c. Pre-process signals ──────────────────────────
+        # ── 4d. Pre-process signals ──────────────────────────
         signals_df = _preprocess_signals(
             signals_df, strategy, pipeline_result, sliced,
         )
 
-        # ── 4d. Run portfolio simulation ──────────────────────
+        # ── 4e. Run portfolio simulation ──────────────────────
         try:
             bt_config = _build_backtest_config(strategy, capital)
             bt_result = run_portfolio_backtest(
@@ -405,18 +399,28 @@ def run_backtest_period(
             bt_result=bt_result,
             proxy_prices=sliced[strategy.cash_proxy],
             initial_capital=capital,
+            proxy_ticker=strategy.cash_proxy,
         )
 
-    # Recompute daily returns from (possibly adjusted) equity
     daily_returns = equity_curve.pct_change().dropna()
 
-    # ── 6. Compute comprehensive metrics ──────────────────────
+    # ── 6. Extract breadth regime for conditional metrics ─────
+    breadth_regime = None
+    if (
+        pipeline_result.breadth is not None
+        and not pipeline_result.breadth.empty
+        and "breadth_regime" in pipeline_result.breadth.columns
+    ):
+        breadth_regime = pipeline_result.breadth["breadth_regime"]
+
+    # ── 7. Compute comprehensive metrics ──────────────────────
     metrics = compute_full_metrics(
         equity_curve=equity_curve,
         daily_returns=daily_returns,
         trades=bt_result.trades,
         initial_capital=capital,
         benchmark_equity=bench_equity,
+        breadth_regime=breadth_regime,
     )
 
     annual = _compute_annual_returns(equity_curve)
@@ -446,13 +450,6 @@ def run_backtest_period(
 
 @contextmanager
 def _config_overrides(strategy: StrategyConfig):
-    """
-    Temporarily patch global config dicts with strategy overrides.
-
-    Saves originals, applies overrides, yields control, then
-    restores originals in a ``finally`` block.  Safe for
-    sequential use across many strategies.
-    """
     import common.config as cfg
 
     config_targets = [
@@ -463,24 +460,16 @@ def _config_overrides(strategy: StrategyConfig):
         ("BREADTH_PORTFOLIO", cfg.BREADTH_PORTFOLIO, strategy.breadth_portfolio),
     ]
 
-    # Save originals  ──  shallow copy is sufficient because we
-    # only call .update() (not nested mutation) on the dicts.
     originals: list[tuple[str, dict, dict]] = []
     for name, target_dict, overrides in config_targets:
         originals.append((name, target_dict, dict(target_dict)))
         if overrides:
-            logger.debug(
-                f"Config override [{strategy.name}] {name}: "
-                f"{overrides}"
-            )
+            logger.debug(f"Config override [{strategy.name}] {name}: {overrides}")
             target_dict.update(overrides)
 
     n_overridden = sum(1 for _, _, ov in config_targets if ov)
     if n_overridden:
-        logger.info(
-            f"Applied {n_overridden} config overrides for "
-            f"'{strategy.name}'"
-        )
+        logger.info(f"Applied {n_overridden} config overrides for '{strategy.name}'")
 
     try:
         yield
@@ -495,19 +484,11 @@ def _config_overrides(strategy: StrategyConfig):
 # ═══════════════════════════════════════════════════════════════
 
 def _detect_columns(df: pd.DataFrame) -> dict[str, str | None]:
-    """
-    Identify key column names in a signals DataFrame.
-
-    Returns a dict with keys ``signal``, ``ticker``, ``date``,
-    ``score``, ``regime`` mapped to the actual column name found
-    (or *None* if absent).
-    """
     def _find(candidates):
         for c in candidates:
             if c in df.columns:
                 return c
         return None
-
     return {
         "signal": _find(_SIGNAL_COLS),
         "ticker": _find(_TICKER_COLS),
@@ -518,7 +499,7 @@ def _detect_columns(df: pd.DataFrame) -> dict[str, str | None]:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SIGNAL PRE-PROCESSING  (master function)
+#  SIGNAL PRE-PROCESSING
 # ═══════════════════════════════════════════════════════════════
 
 def _preprocess_signals(
@@ -527,13 +508,6 @@ def _preprocess_signals(
     pipeline_result: PipelineResult,
     price_data: dict[str, pd.DataFrame],
 ) -> pd.DataFrame:
-    """
-    Apply all signal-level modifications before the portfolio sim.
-
-    1. Breadth crisis response  — block equity BUYs during
-       weak / critical regimes and boost cash-proxy score.
-    2. Minimum holding period   — suppress premature SELLs.
-    """
     cols = _detect_columns(signals_df)
     sig_col    = cols["signal"]
     ticker_col = cols["ticker"]
@@ -541,22 +515,19 @@ def _preprocess_signals(
 
     if not sig_col or not ticker_col:
         logger.warning(
-            "Cannot detect signal/ticker columns in signals_df "
-            f"(columns: {list(signals_df.columns)[:15]}…) — "
+            "Cannot detect signal/ticker columns — "
             "skipping all signal preprocessing"
         )
         return signals_df
 
     df = signals_df.copy()
 
-    # ── 1. Breadth crisis override ────────────────────────────
     if strategy.breadth_defensive:
         df = _apply_breadth_override(
             df, strategy, pipeline_result,
             sig_col, ticker_col, date_col, cols["score"],
         )
 
-    # ── 2. Minimum holding period ─────────────────────────────
     if strategy.min_hold_days > 0 and date_col:
         df = _enforce_min_hold(
             df, strategy.min_hold_days,
@@ -575,15 +546,6 @@ def _extract_regime_column(
     pipeline_result: PipelineResult,
     date_col: str | None,
 ) -> tuple[pd.DataFrame, str | None]:
-    """
-    Ensure *df* has a breadth-regime column.
-
-    Checks the DataFrame first; if absent, tries to pull regime
-    data from ``pipeline_result`` and merge it in by date.
-
-    Returns ``(possibly-modified df, regime_column_name or None)``.
-    """
-    # Already present?
     for col in _REGIME_COLS:
         if col in df.columns:
             return df, col
@@ -591,55 +553,25 @@ def _extract_regime_column(
     if pipeline_result is None or date_col is None:
         return df, None
 
-    # Search pipeline_result for breadth data
-    breadth = None
-    for attr in (
-        "breadth", "breadth_data", "breadth_df",
-        "market_breadth", "universe_context",
-    ):
-        val = getattr(pipeline_result, attr, None)
-        if val is not None:
-            breadth = val
-            break
-
+    breadth = getattr(pipeline_result, "breadth", None)
     if breadth is None:
         return df, None
 
-    # Normalise to a single-column DataFrame with a regime label
     regime_series: pd.Series | None = None
 
-    if isinstance(breadth, pd.Series):
-        regime_series = breadth
-
-    elif isinstance(breadth, pd.DataFrame):
+    if isinstance(breadth, pd.DataFrame):
         for col in _REGIME_COLS:
             if col in breadth.columns:
                 regime_series = breadth[col]
                 break
-        # Fallback: last column if it looks categorical
-        if regime_series is None and breadth.shape[1] > 0:
-            last = breadth.iloc[:, -1]
-            if last.dtype == object or str(last.dtype) == "category":
-                regime_series = last
-
-    elif isinstance(breadth, dict) and "regime" in breadth:
-        val = breadth["regime"]
-        if isinstance(val, (pd.Series, pd.DataFrame)):
-            regime_series = (
-                val if isinstance(val, pd.Series) else val.iloc[:, 0]
-            )
 
     if regime_series is None:
         return df, None
 
-    # Merge into df by date
     regime_df = regime_series.to_frame(name="_breadth_regime")
     if date_col in df.columns:
         df = df.merge(
-            regime_df,
-            left_on=date_col,
-            right_index=True,
-            how="left",
+            regime_df, left_on=date_col, right_index=True, how="left",
         )
         return df, "_breadth_regime"
 
@@ -655,23 +587,11 @@ def _apply_breadth_override(
     date_col: str | None,
     score_col: str | None,
 ) -> pd.DataFrame:
-    """
-    Block equity BUY signals during weak / critical breadth
-    regimes and (optionally) boost the cash-proxy score so it
-    gets selected by the portfolio builder.
-    """
-    df, regime_col = _extract_regime_column(
-        df, pipeline_result, date_col,
-    )
+    df, regime_col = _extract_regime_column(df, pipeline_result, date_col)
 
     if regime_col is None:
-        logger.debug(
-            "No breadth-regime column found — "
-            "skipping crisis override"
-        )
         return df
 
-    # Identify which rows are in a weak/critical regime
     regime_lower = df[regime_col].astype(str).str.lower()
     weak_mask     = regime_lower == "weak"
     critical_mask = regime_lower == "critical"
@@ -680,12 +600,10 @@ def _apply_breadth_override(
     if not crisis_mask.any():
         return df
 
-    # Determine signal type (string vs numeric)
     sample_sig = df[sig_col].dropna().iloc[0] if len(df) else "BUY"
     hold = _hold_value(sample_sig)
     buy  = _buy_value(sample_sig)
 
-    # ── Block equity BUYs ─────────────────────────────────────
     is_equity = ~df[ticker_col].isin(DEFENSIVE_TICKERS)
     is_buy    = df[sig_col].apply(_is_buy)
     block     = crisis_mask & is_equity & is_buy
@@ -693,24 +611,15 @@ def _apply_breadth_override(
 
     if n_blocked:
         df.loc[block, sig_col] = hold
-        logger.info(
-            f"Breadth override: blocked {n_blocked:,} equity BUY "
-            f"signals in weak/critical regime"
-        )
+        logger.info(f"Breadth override: blocked {n_blocked:,} equity BUY signals")
 
-    # ── Boost cash proxy so it fills freed slots ──────────────
     proxy = strategy.cash_proxy
     if proxy and score_col and proxy in df[ticker_col].values:
         proxy_crisis = crisis_mask & (df[ticker_col] == proxy)
         if proxy_crisis.any():
-            # Give cash proxy the maximum score during crises
             max_score = df[score_col].max()
             df.loc[proxy_crisis, score_col] = max_score
             df.loc[proxy_crisis, sig_col]   = buy
-            logger.info(
-                f"Breadth override: boosted {proxy} score on "
-                f"{int(proxy_crisis.sum()):,} crisis days"
-            )
 
     return df
 
@@ -726,47 +635,23 @@ def _enforce_min_hold(
     ticker_col: str,
     date_col: str,
 ) -> pd.DataFrame:
-    """
-    Suppress SELL signals that arrive fewer than *min_hold_days*
-    calendar days after the most recent BUY for the same ticker.
-
-    Operates ticker-by-ticker using fast index iteration rather
-    than ``iterrows()``.
-    """
-    if min_hold_days <= 0:
-        return df
-
-    # Ensure we have a sortable date column
-    if date_col not in df.columns:
-        logger.debug(
-            f"Date column '{date_col}' not in DataFrame — "
-            "skipping min-hold enforcement"
-        )
+    if min_hold_days <= 0 or date_col not in df.columns:
         return df
 
     result = df.copy()
-
-    # Determine the replacement value for suppressed SELLs.
-    # We replace with BUY (= "keep holding") rather than HOLD,
-    # because the portfolio sim interprets BUY as "remain in
-    # position" for an existing holding.
-    sample_sig = (
-        result[sig_col].dropna().iloc[0] if len(result) else "BUY"
-    )
+    sample_sig = result[sig_col].dropna().iloc[0] if len(result) else "BUY"
     keep_holding = _buy_value(sample_sig)
 
     total_suppressed = 0
 
     for ticker, group_indices in result.groupby(ticker_col).groups.items():
-        sub = result.loc[group_indices, [date_col, sig_col]].sort_values(
-            date_col
-        )
-        dates   = sub[date_col].values        # numpy datetime64
-        signals = sub[sig_col].values          # numpy object / int
-        indices = sub.index.values             # positional index
+        sub = result.loc[group_indices, [date_col, sig_col]].sort_values(date_col)
+        dates   = sub[date_col].values
+        signals = sub[sig_col].values
+        indices = sub.index.values
 
         in_position = False
-        entry_ts: np.datetime64 | None = None
+        entry_ts = None
         fix_list: list = []
 
         for i in range(len(indices)):
@@ -777,24 +662,18 @@ def _enforce_min_hold(
                 in_position = True
                 entry_ts = dt
             elif _is_buy(sig) and in_position:
-                # Consecutive BUY — stay in position, don't reset
-                # entry date (hold clock runs from original entry)
                 pass
             elif _is_sell(sig) and in_position:
                 try:
-                    days_held = (
-                        pd.Timestamp(dt) - pd.Timestamp(entry_ts)
-                    ).days
+                    days_held = (pd.Timestamp(dt) - pd.Timestamp(entry_ts)).days
                 except Exception:
-                    days_held = min_hold_days  # fail-open
+                    days_held = min_hold_days
 
                 if days_held < min_hold_days:
                     fix_list.append(indices[i])
                 else:
                     in_position = False
                     entry_ts = None
-            elif _is_sell(sig) and not in_position:
-                pass  # not holding — irrelevant
 
         if fix_list:
             result.loc[fix_list, sig_col] = keep_holding
@@ -810,7 +689,7 @@ def _enforce_min_hold(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CASH PROXY — EQUITY ADJUSTMENT
+#  CASH PROXY — EQUITY ADJUSTMENT  (BUG FIXED)
 # ═══════════════════════════════════════════════════════════════
 
 def _apply_cash_proxy_to_equity(
@@ -818,31 +697,14 @@ def _apply_cash_proxy_to_equity(
     bt_result: BacktestResult,
     proxy_prices: pd.DataFrame,
     initial_capital: float,
+    proxy_ticker: str = "SHY",
 ) -> pd.Series:
     """
     Retroactively credit idle cash with the proxy's return.
 
-    Tries to obtain a per-day cash balance from the backtest
-    result.  If unavailable, falls back to a conservative
-    estimate (20 % of equity assumed idle on average).
-
-    Parameters
-    ----------
-    equity_curve : pd.Series
-        Unadjusted equity from the portfolio sim.
-    bt_result : BacktestResult
-        Portfolio simulation output.
-    proxy_prices : pd.DataFrame
-        OHLCV for the cash proxy ticker.
-    initial_capital : float
-        Starting capital.
-
-    Returns
-    -------
-    pd.Series
-        Adjusted equity curve.
+    Fixed: proxy_ticker is now passed explicitly instead of
+    relying on a misnamed helper function.
     """
-    # ── Proxy daily returns ───────────────────────────────────
     if "close" in proxy_prices.columns:
         proxy_close = proxy_prices["close"]
     else:
@@ -850,60 +712,55 @@ def _apply_cash_proxy_to_equity(
 
     proxy_ret = proxy_close.pct_change().fillna(0.0)
 
-    # ── Try to get actual cash balance ────────────────────────
+    # Try to get actual cash balance from backtest result
     cash_series: pd.Series | None = None
 
-    for attr in (
-        "cash", "cash_series", "cash_balance",
-        "cash_values", "available_cash",
-    ):
+    for attr in ("cash", "cash_series", "cash_balance"):
         val = getattr(bt_result, attr, None)
         if isinstance(val, pd.Series) and len(val) > 0:
             cash_series = val
             break
 
-    # Try reconstructing: equity minus position values
     if cash_series is None:
-        for attr in (
-            "positions_value", "invested_value",
-            "position_values", "gross_exposure",
-        ):
+        for attr in ("positions_value", "invested_value"):
             val = getattr(bt_result, attr, None)
             if isinstance(val, pd.Series) and len(val) > 0:
                 cash_series = (equity_curve - val).clip(lower=0.0)
                 break
 
     if cash_series is None:
-        # Last resort: assume 20 % of equity is idle (conservative)
+        # Try to reconstruct from positions DataFrame
+        if hasattr(bt_result, "positions") and not bt_result.positions.empty:
+            pos_df = bt_result.positions
+            if "_cash" in pos_df.columns:
+                cash_series = pos_df["_cash"]
+
+    if cash_series is None:
         logger.debug(
-            "No cash-balance data in BacktestResult — "
-            "using 20 %% fallback for cash-proxy adjustment"
+            "No cash-balance data — using 20% fallback for cash-proxy"
         )
         cash_series = equity_curve * 0.20
 
-    # ── Align indices ─────────────────────────────────────────
+    # Align indices
     common_idx = (
         equity_curve.index
         .intersection(proxy_ret.index)
         .intersection(cash_series.index)
     )
     if len(common_idx) < 2:
-        logger.debug("Not enough overlap for cash-proxy adjustment")
         return equity_curve
 
     cash   = cash_series.reindex(common_idx).ffill().fillna(0.0)
     p_ret  = proxy_ret.reindex(common_idx).fillna(0.0)
 
-    # ── Walk forward: compound cash PnL day-by-day ────────────
     adjusted = equity_curve.reindex(common_idx).copy()
     cum_cash_pnl = 0.0
 
-    values = adjusted.values.copy()  # numpy for speed
+    values = adjusted.values.copy()
     cash_vals = cash.values
     ret_vals  = p_ret.values
 
     for i in range(1, len(values)):
-        # Cash at start-of-day earns the proxy's return
         cash_pnl = cash_vals[i - 1] * ret_vals[i]
         cum_cash_pnl += cash_pnl
         values[i] += cum_cash_pnl
@@ -911,24 +768,14 @@ def _apply_cash_proxy_to_equity(
     adjusted = pd.Series(values, index=common_idx, name=equity_curve.name)
 
     added_pct = (
-        (adjusted.iloc[-1] / equity_curve.reindex(common_idx).iloc[-1])
-        - 1.0
+        (adjusted.iloc[-1] / equity_curve.reindex(common_idx).iloc[-1]) - 1.0
     ) * 100
     logger.info(
-        f"Cash proxy adjustment: +{added_pct:.2f} %% total return "
-        f"from idle cash in {strategy_cash_proxy_name(proxy_prices)}"
+        f"Cash proxy adjustment: +{added_pct:.2f}% total return "
+        f"from idle cash in {proxy_ticker}"
     )
 
     return adjusted
-
-
-def strategy_cash_proxy_name(proxy_prices: pd.DataFrame) -> str:
-    """Best-effort human-readable name for the proxy ticker."""
-    if hasattr(proxy_prices, "name") and proxy_prices.name:
-        return str(proxy_prices.name)
-    if hasattr(proxy_prices, "attrs") and "ticker" in proxy_prices.attrs:
-        return proxy_prices.attrs["ticker"]
-    return "SHY"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -939,7 +786,6 @@ def _build_backtest_config(
     strategy: StrategyConfig,
     capital: float,
 ) -> BacktestConfig:
-    """Build ``BacktestConfig`` from strategy overrides."""
     sizing_kw    = strategy.sizing_config_overrides or {}
     bt_overrides = strategy.backtest_config_overrides or {}
 
@@ -954,8 +800,6 @@ def _build_backtest_config(
     }
     rebalance = RebalanceConfig(**rebalance_kw) if rebalance_kw else RebalanceConfig()
 
-    # Build the BacktestConfig, passing through only the
-    # fields that BacktestConfig actually accepts.
     bc_fields = set(BacktestConfig.__dataclass_fields__)
     bc_kwargs: dict[str, Any] = {
         "initial_capital": capital,
@@ -963,13 +807,10 @@ def _build_backtest_config(
         "rebalance": rebalance,
     }
 
-    # Standard optional fields
     for key in ("execution_delay", "rebalance_holds"):
         if key in bt_overrides and key in bc_fields:
             bc_kwargs[key] = bt_overrides[key]
 
-    # Pass through min_hold_days and cash_proxy if BacktestConfig
-    # supports them (future-proof).
     if "min_hold_days" in bc_fields:
         bc_kwargs["min_hold_days"] = strategy.min_hold_days
     if "cash_proxy" in bc_fields:
@@ -983,10 +824,8 @@ def _build_backtest_config(
 # ═══════════════════════════════════════════════════════════════
 
 def _compute_annual_returns(equity: pd.Series) -> pd.Series:
-    """Year-by-year returns from an equity curve."""
     if equity.empty:
         return pd.Series(dtype=float)
-
     yearly = equity.resample("YE").last()
     returns = yearly.pct_change().dropna()
     returns.index = returns.index.year
@@ -994,34 +833,21 @@ def _compute_annual_returns(equity: pd.Series) -> pd.Series:
     return returns
 
 
-def _compute_monthly_returns(
-    daily_returns: pd.Series,
-) -> pd.DataFrame:
-    """
-    Monthly returns as a year × month pivot table.
-
-    Returns a DataFrame with years as rows, months (1–12) as
-    columns, and monthly percentage returns as values.
-    """
+def _compute_monthly_returns(daily_returns: pd.Series) -> pd.DataFrame:
     if daily_returns.empty:
         return pd.DataFrame()
-
     monthly = (1 + daily_returns).resample("ME").prod() - 1
     monthly_df = pd.DataFrame({
         "year":   monthly.index.year,
         "month":  monthly.index.month,
         "return": monthly.values,
     })
-
     pivot = monthly_df.pivot_table(
-        values="return",
-        index="year",
-        columns="month",
-        aggfunc="first",
+        values="return", index="year", columns="month", aggfunc="first",
     )
-    pivot.columns = [
+    month_names = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ][: len(pivot.columns)]
-
+    ]
+    pivot.columns = [month_names[c - 1] for c in pivot.columns]
     return pivot

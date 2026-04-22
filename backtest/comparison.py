@@ -2,16 +2,9 @@
 backtest/comparison.py
 ----------------------
 Run multiple strategy variants over the same period and produce
-a side-by-side comparison ranked by CAGR (or any metric).
+a side-by-side comparison.
 
-Usage
------
-    from backtest.comparison import compare_strategies
-    from backtest.data_loader import ensure_history
-
-    data = ensure_history()
-    results = compare_strategies(data, start="2010-01-01")
-    print(results["report"])
+Enhanced with equity curve export and per-period analysis.
 """
 
 from __future__ import annotations
@@ -22,81 +15,56 @@ from typing import Any
 import pandas as pd
 
 from backtest.engine import BacktestRun, StrategyConfig, run_backtest_period
-from backtest.strategies import ALL_STRATEGIES, BASELINE
+from backtest.strategies import ALL_STRATEGIES, US_STRATEGIES
 from backtest.metrics import metrics_report
 
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  COMPARE ALL STRATEGIES
-# ═══════════════════════════════════════════════════════════════
-
 def compare_strategies(
     data: dict[str, pd.DataFrame],
     *,
     strategies: list[StrategyConfig] | None = None,
+    market: str = "US",
     start: str | None = None,
     end: str | None = None,
     capital: float = 100_000.0,
     rank_by: str = "cagr",
+    current_holdings: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Run every strategy variant over the same period and return
     a comparison.
 
-    Parameters
-    ----------
-    data : dict[str, pd.DataFrame]
-        From ``ensure_history()``.
-    strategies : list[StrategyConfig] or None
-        Strategies to test.  None = all from ``ALL_STRATEGIES``.
-    start, end : str or None
-        Date range.
-    capital : float
-        Initial capital for each run.
-    rank_by : str
-        Metric to rank by.  Default ``"cagr"``.
-
-    Returns
-    -------
-    dict with keys:
-        runs          list[BacktestRun]  — individual results
-        table         pd.DataFrame       — comparison table
-        report        str                — formatted text report
-        best          BacktestRun        — best by rank_by metric
-        worst         BacktestRun        — worst by rank_by metric
+    Enhanced: filters strategies by market, exports equity curves.
     """
     if strategies is None:
-        strategies = list(ALL_STRATEGIES.values())
+        market_strats = {
+            k: v for k, v in ALL_STRATEGIES.items()
+            if v.market == market.upper()
+        }
+        strategies = list(market_strats.values())
 
     logger.info(
-        f"Comparing {len(strategies)} strategies "
+        f"Comparing {len(strategies)} strategies [{market}] "
         f"({start or 'earliest'} → {end or 'latest'})"
     )
 
     runs: list[BacktestRun] = []
 
     for i, strat in enumerate(strategies, 1):
-        logger.info(
-            f"[{i}/{len(strategies)}] Running: {strat.name}"
-        )
+        logger.info(f"[{i}/{len(strategies)}] Running: {strat.name}")
         run = run_backtest_period(
-            data,
-            start=start,
-            end=end,
-            strategy=strat,
-            capital=capital,
+            data, start=start, end=end,
+            strategy=strat, capital=capital,
+            current_holdings=current_holdings,
         )
         runs.append(run)
 
-    # ── Build comparison table ────────────────────────────────
     table = _build_comparison_table(runs, rank_by=rank_by)
-
-    # ── Text report ───────────────────────────────────────────
     report = _comparison_report(runs, table, rank_by)
+    equity_curves = _build_equity_curves(runs)
 
-    # ── Best / worst ──────────────────────────────────────────
     valid_runs = [r for r in runs if r.ok]
     best = max(valid_runs, key=lambda r: r.metrics.get(rank_by, -999)) if valid_runs else None
     worst = min(valid_runs, key=lambda r: r.metrics.get(rank_by, 999)) if valid_runs else None
@@ -105,95 +73,89 @@ def compare_strategies(
         "runs": runs,
         "table": table,
         "report": report,
+        "equity_curves": equity_curves,
         "best": best,
         "worst": worst,
     }
 
 
-# ═══════════════════════════════════════════════════════════════
-#  COMPARISON TABLE
-# ═══════════════════════════════════════════════════════════════
+def _build_equity_curves(runs: list[BacktestRun]) -> pd.DataFrame:
+    """Build a DataFrame of equity curves for all successful runs."""
+    curves: dict[str, pd.Series] = {}
+    for run in runs:
+        if run.ok and run.backtest_result:
+            eq = run.backtest_result.equity_curve
+            if not eq.empty:
+                curves[run.strategy.name] = eq
+    if not curves:
+        return pd.DataFrame()
+    return pd.DataFrame(curves)
+
 
 def _build_comparison_table(
     runs: list[BacktestRun],
     rank_by: str = "cagr",
 ) -> pd.DataFrame:
-    """Build a DataFrame comparing all strategy runs."""
     rows = []
     for run in runs:
         m = run.metrics
         rows.append({
             "strategy":       run.strategy.name,
-            "cagr":           m.get("cagr", None),
-            "total_return":   m.get("total_return", None),
-            "sharpe":         m.get("sharpe_ratio", None),
-            "sortino":        m.get("sortino_ratio", None),
-            "calmar":         m.get("calmar_ratio", None),
-            "max_drawdown":   m.get("max_drawdown", None),
-            "annual_vol":     m.get("annual_volatility", None),
-            "win_rate":       m.get("win_rate", None),
-            "total_trades":   m.get("total_trades", None),
-            "profit_factor":  m.get("profit_factor", None),
-            "excess_cagr":    m.get("excess_cagr", None),
-            "info_ratio":     m.get("information_ratio", None),
-            "final_capital":  m.get("final_capital", None),
-            "best_year":      m.get("best_year", None),
-            "worst_year":     m.get("worst_year", None),
+            "market":         run.strategy.market,
+            "cagr":           m.get("cagr"),
+            "total_return":   m.get("total_return"),
+            "sharpe":         m.get("sharpe_ratio"),
+            "sortino":        m.get("sortino_ratio"),
+            "calmar":         m.get("calmar_ratio"),
+            "max_drawdown":   m.get("max_drawdown"),
+            "annual_vol":     m.get("annual_volatility"),
+            "win_rate":       m.get("win_rate"),
+            "total_trades":   m.get("total_trades"),
+            "profit_factor":  m.get("profit_factor"),
+            "expectancy":     m.get("expectancy"),
+            "excess_cagr":    m.get("excess_cagr"),
+            "alpha":          m.get("alpha"),
+            "beta":           m.get("beta"),
+            "info_ratio":     m.get("information_ratio"),
+            "final_capital":  m.get("final_capital"),
+            "best_year":      m.get("best_year"),
+            "worst_year":     m.get("worst_year"),
             "elapsed_s":      run.elapsed_seconds,
             "error":          run.error,
         })
 
     df = pd.DataFrame(rows)
-
-    # Sort by rank_by metric (descending for returns/ratios)
     if rank_by in df.columns and df[rank_by].notna().any():
         ascending = rank_by in ("max_drawdown", "annual_vol")
         df = df.sort_values(rank_by, ascending=ascending, na_position="last")
-
     df = df.reset_index(drop=True)
-    df.index = df.index + 1  # 1-based ranking
+    df.index = df.index + 1
     df.index.name = "rank"
-
     return df
 
-
-# ═══════════════════════════════════════════════════════════════
-#  TEXT REPORT
-# ═══════════════════════════════════════════════════════════════
 
 def _comparison_report(
     runs: list[BacktestRun],
     table: pd.DataFrame,
     rank_by: str,
 ) -> str:
-    """Format the comparison as a text report."""
     ln: list[str] = []
-    div = "=" * 90
-    sub = "-" * 90
+    div = "=" * 94
+    sub = "-" * 94
 
-    # Header
     valid = [r for r in runs if r.ok]
     if not valid:
         return "No successful backtest runs to compare."
 
     first = valid[0]
     ln.append(div)
-    ln.append("  STRATEGY COMPARISON")
+    ln.append(f"  STRATEGY COMPARISON [{first.strategy.market}]")
     ln.append(div)
-    ln.append(
-        f"  Period:     {first.start_date.date()} → "
-        f"{first.end_date.date()}"
-    )
-    ln.append(
-        f"  Capital:    ${first.metrics.get('initial_capital', 0):,.0f}"
-    )
-    ln.append(
-        f"  Strategies: {len(runs)} tested, "
-        f"{len(valid)} successful"
-    )
+    ln.append(f"  Period:     {first.start_date.date()} → {first.end_date.date()}")
+    ln.append(f"  Capital:    ${first.metrics.get('initial_capital', 0):,.0f}")
+    ln.append(f"  Strategies: {len(runs)} tested, {len(valid)} successful")
     ln.append(f"  Ranked by:  {rank_by}")
 
-    # Comparison table
     ln.append("")
     ln.append(sub)
     ln.append(
@@ -205,10 +167,7 @@ def _comparison_report(
 
     for idx, row in table.iterrows():
         if row.get("error"):
-            ln.append(
-                f"  {idx:>2}  {row['strategy']:<24s}  "
-                f"ERROR: {row['error']}"
-            )
+            ln.append(f"  {idx:>2}  {row['strategy']:<24s}  ERROR: {row['error']}")
             continue
 
         cagr_s = f"{row['cagr']:>+7.2%}" if pd.notna(row.get("cagr")) else "    N/A"
@@ -224,40 +183,24 @@ def _comparison_report(
             f"{dd_s} {wr_s} {trades_s} {final_s} {excess_s}"
         )
 
-    # Best/worst summary
     ln.append("")
     ln.append(sub)
     ln.append("  HIGHLIGHTS")
     ln.append(sub)
 
     if not table.empty and table["cagr"].notna().any():
-        best_idx = table["cagr"].idxmax()
-        worst_idx = table["cagr"].idxmin()
-        best_row = table.loc[best_idx]
-        worst_row = table.loc[worst_idx]
-
-        ln.append(
-            f"  Best CAGR:    {best_row['strategy']:<20s} "
-            f"{best_row['cagr']:>+7.2%}"
-        )
-        ln.append(
-            f"  Worst CAGR:   {worst_row['strategy']:<20s} "
-            f"{worst_row['cagr']:>+7.2%}"
-        )
+        best_row = table.loc[table["cagr"].idxmax()]
+        worst_row = table.loc[table["cagr"].idxmin()]
+        ln.append(f"  Best CAGR:    {best_row['strategy']:<20s} {best_row['cagr']:>+7.2%}")
+        ln.append(f"  Worst CAGR:   {worst_row['strategy']:<20s} {worst_row['cagr']:>+7.2%}")
 
     if not table.empty and table["sharpe"].notna().any():
         best_sh = table.loc[table["sharpe"].idxmax()]
-        ln.append(
-            f"  Best Sharpe:  {best_sh['strategy']:<20s} "
-            f"{best_sh['sharpe']:>6.2f}"
-        )
+        ln.append(f"  Best Sharpe:  {best_sh['strategy']:<20s} {best_sh['sharpe']:>6.2f}")
 
     if not table.empty and table["max_drawdown"].notna().any():
         best_dd = table.loc[table["max_drawdown"].idxmax()]
-        ln.append(
-            f"  Smallest DD:  {best_dd['strategy']:<20s} "
-            f"{best_dd['max_drawdown']:>7.2%}"
-        )
+        ln.append(f"  Smallest DD:  {best_dd['strategy']:<20s} {best_dd['max_drawdown']:>7.2%}")
 
     ln.append("")
     ln.append(div)

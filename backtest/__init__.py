@@ -7,6 +7,9 @@ Loads 20 years of OHLCV, runs the full pipeline over any date range,
 computes performance metrics (including CAGR), and compares strategy
 variants side-by-side.
 
+Supports multi-market backtesting (US, HK, India) and convergence-
+aware signal generation.
+
 Quick start
 -----------
     from backtest.engine import run_backtest_period
@@ -22,18 +25,32 @@ CLI
     python -m backtest.runner --start 2015 --end 2024  # custom period
     python -m backtest.runner --compare                # all strategies
     python -m backtest.runner --strategy momentum_heavy
+    python -m backtest.runner --market HK              # Hong Kong
+    python -m backtest.runner --market IN              # India
 """
 
-from backtest.engine import run_backtest_period, BacktestRun
-from backtest.metrics import compute_cagr, compute_full_metrics
+from backtest.engine import run_backtest_period, BacktestRun, StrategyConfig
+from backtest.metrics import (
+    compute_cagr,
+    compute_full_metrics,
+    cagr_from_equity,
+    rolling_cagr,
+    compute_monthly_returns_heatmap,
+    compute_regime_metrics,
+)
 from backtest.comparison import compare_strategies
 from backtest.data_loader import ensure_history, load_cached_history
 
 __all__ = [
     "run_backtest_period",
     "BacktestRun",
+    "StrategyConfig",
     "compute_cagr",
     "compute_full_metrics",
+    "cagr_from_equity",
+    "rolling_cagr",
+    "compute_monthly_returns_heatmap",
+    "compute_regime_metrics",
     "compare_strategies",
     "ensure_history",
     "load_cached_history",

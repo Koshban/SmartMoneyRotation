@@ -3,16 +3,16 @@ backtest/runner.py
 ------------------
 CLI entry point for backtesting.
 
+Enhanced with multi-market support and equity curve export.
+
 Usage:
-    python -m backtest.runner                                 # 20Y default
-    python -m backtest.runner --start 2010 --end 2020         # custom period
-    python -m backtest.runner --strategy momentum_heavy       # single variant
-    python -m backtest.runner --compare                       # all strategies
+    python -m backtest.runner                                 # 20Y US default
+    python -m backtest.runner --market HK --start 2015        # HK from 2015
+    python -m backtest.runner --market IN --compare           # India comparison
     python -m backtest.runner --compare --rank-by sharpe      # rank by Sharpe
+    python -m backtest.runner --strategy convergence_strong   # convergence
     python -m backtest.runner --list                          # list strategies
-    python -m backtest.runner --refresh                       # re-download data
-    python -m backtest.runner --capital 500000                # custom capital
-    python -m backtest.runner --output backtest_results/      # save reports
+    python -m backtest.runner --list --market HK              # HK strategies
 """
 
 from __future__ import annotations
@@ -24,11 +24,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from backtest.data_loader import (
-    ensure_history,
-    data_summary,
-    BACKTEST_CORE_UNIVERSE,
-)
+import pandas as pd
+
+from backtest.data_loader import ensure_history, data_summary
 from backtest.engine import run_backtest_period, StrategyConfig
 from backtest.strategies import (
     ALL_STRATEGIES,
@@ -48,59 +46,32 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m backtest.runner                          # 20Y backtest, baseline
-  python -m backtest.runner --start 2015 --end 2024  # custom period
-  python -m backtest.runner --compare                # compare all strategies
-  python -m backtest.runner --strategy conservative  # single variant
-  python -m backtest.runner --list                   # show available strategies
+  python -m backtest.runner                              # 20Y US backtest
+  python -m backtest.runner --market HK --start 2018     # HK from 2018
+  python -m backtest.runner --compare                    # compare all US strategies
+  python -m backtest.runner --compare --market HK        # compare HK strategies
+  python -m backtest.runner --strategy convergence_strong # convergence-aware
+  python -m backtest.runner --list --market IN            # list India strategies
         """,
     )
 
-    p.add_argument(
-        "--start", type=str, default=None,
-        help="Backtest start date (YYYY or YYYY-MM-DD).  Default: earliest available",
-    )
-    p.add_argument(
-        "--end", type=str, default=None,
-        help="Backtest end date.  Default: latest available",
-    )
-    p.add_argument(
-        "--strategy", "-s", type=str, default="baseline",
-        help="Strategy name to run (default: baseline)",
-    )
-    p.add_argument(
-        "--compare", action="store_true",
-        help="Run all strategies and compare side-by-side",
-    )
-    p.add_argument(
-        "--rank-by", type=str, default="cagr",
-        choices=["cagr", "sharpe", "sortino", "calmar", "max_drawdown"],
-        help="Metric to rank strategies by (default: cagr)",
-    )
-    p.add_argument(
-        "--capital", type=float, default=100_000,
-        help="Initial capital (default: 100,000)",
-    )
-    p.add_argument(
-        "--output", "-o", type=str, default=None,
-        help="Directory to save backtest reports",
-    )
-    p.add_argument(
-        "--refresh", action="store_true",
-        help="Force re-download of historical data",
-    )
-    p.add_argument(
-        "--list", action="store_true", dest="list_strats",
-        help="List available strategies and exit",
-    )
-    p.add_argument(
-        "--tickers", nargs="+", default=None,
-        help="Override the backtest universe with specific tickers",
-    )
-    p.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Debug logging",
-    )
+    p.add_argument("--start", type=str, default=None)
+    p.add_argument("--end", type=str, default=None)
+    p.add_argument("--strategy", "-s", type=str, default="baseline")
+    p.add_argument("--market", "-m", type=str, default="US",
+                   choices=["US", "HK", "IN"],
+                   help="Market to backtest (default: US)")
+    p.add_argument("--compare", action="store_true")
+    p.add_argument("--rank-by", type=str, default="cagr",
+                   choices=["cagr", "sharpe", "sortino", "calmar", "max_drawdown"])
+    p.add_argument("--capital", type=float, default=100_000)
+    p.add_argument("--output", "-o", type=str, default=None)
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--list", action="store_true", dest="list_strats")
+    p.add_argument("--tickers", nargs="+", default=None)
+    p.add_argument("--holdings", type=str, default="",
+                   help="Comma-separated current holdings for rotation evaluation")
+    p.add_argument("--verbose", "-v", action="store_true")
 
     return p
 
@@ -109,7 +80,6 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # ── Logging ───────────────────────────────────────────────
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -121,34 +91,35 @@ def main():
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("yfinance").setLevel(logging.WARNING)
 
+    market = args.market.upper()
+
     # ── List strategies ───────────────────────────────────────
     if args.list_strats:
-        print("\nAvailable strategies:")
+        strats = list_strategies(market)
+        print(f"\nAvailable strategies for {market}:")
         print("-" * 60)
-        for name, strat in ALL_STRATEGIES.items():
+        for name in strats:
+            strat = ALL_STRATEGIES[name]
             print(f"  {name:<24s} {strat.description}")
         print()
         return
 
     # ── Load data ─────────────────────────────────────────────
     t0 = time.time()
-    tickers = (
-        [t.upper() for t in args.tickers]
-        if args.tickers
-        else None
-    )
+    tickers = [t.upper() for t in args.tickers] if args.tickers else None
 
     print("\n" + "=" * 70)
-    print("  CASH — BACKTESTING HARNESS")
+    print(f"  CASH — BACKTESTING HARNESS [{market}]")
     print("=" * 70)
 
     data = ensure_history(
         tickers=tickers,
+        market=market,
         force_refresh=args.refresh,
     )
 
     if not data:
-        print("ERROR: No data loaded.  Check your internet connection.")
+        print("ERROR: No data loaded.")
         sys.exit(1)
 
     summary = data_summary(data)
@@ -157,30 +128,34 @@ def main():
           f"{summary['latest_end'].date()}")
     print(f"  Total bars:  {summary['total_bars']:,}")
 
-    # ── Normalise date args ───────────────────────────────────
     start = _normalise_date(args.start)
     end = _normalise_date(args.end)
 
+    holdings = (
+        [t.strip().upper() for t in args.holdings.split(",") if t.strip()]
+        if args.holdings else None
+    )
+
     # ── Compare mode ──────────────────────────────────────────
     if args.compare:
-        print(f"\n  Running comparison of {len(ALL_STRATEGIES)} strategies...")
-        print()
+        market_strats = [
+            v for v in ALL_STRATEGIES.values()
+            if v.market == market
+        ]
+        print(f"\n  Running comparison of {len(market_strats)} "
+              f"{market} strategies...")
 
         result = compare_strategies(
-            data,
-            start=start,
-            end=end,
-            capital=args.capital,
-            rank_by=args.rank_by,
+            data, strategies=market_strats, market=market,
+            start=start, end=end, capital=args.capital,
+            rank_by=args.rank_by, current_holdings=holdings,
         )
 
         print(result["report"])
 
-        # Detailed report for best strategy
         if result["best"]:
             print("\n" + metrics_report(result["best"]))
 
-        # Save if output dir specified
         if args.output:
             _save_comparison(result, args.output)
 
@@ -195,18 +170,22 @@ def main():
         print(f"ERROR: {e}")
         sys.exit(1)
 
+    if strategy.market != market:
+        print(f"WARNING: Strategy '{strategy.name}' is for {strategy.market}, "
+              f"but --market is {market}. Using strategy's market.")
+        market = strategy.market
+
     print(f"\n  Strategy:    {strategy.name}")
     print(f"  Description: {strategy.description}")
+    print(f"  Market:      {strategy.market}")
     print(f"  Period:      {start or 'earliest'} → {end or 'latest'}")
     print(f"  Capital:     ${args.capital:,.0f}")
     print()
 
     run = run_backtest_period(
-        data,
-        start=start,
-        end=end,
-        strategy=strategy,
-        capital=args.capital,
+        data, start=start, end=end,
+        strategy=strategy, capital=args.capital,
+        current_holdings=holdings,
     )
 
     if run.ok:
@@ -214,7 +193,6 @@ def main():
     else:
         print(f"\n  ERROR: {run.error}")
 
-    # Save if output dir specified
     if args.output and run.ok:
         _save_single(run, args.output)
 
@@ -222,12 +200,7 @@ def main():
     print(f"\n  Total time: {elapsed:.0f}s")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════════
-
 def _normalise_date(date_str: str | None) -> str | None:
-    """Convert 'YYYY' to 'YYYY-01-01' for convenience."""
     if date_str is None:
         return None
     if len(date_str) == 4 and date_str.isdigit():
@@ -236,30 +209,26 @@ def _normalise_date(date_str: str | None) -> str | None:
 
 
 def _save_comparison(result: dict, output_dir: str) -> None:
-    """Save comparison report and CSV to output directory."""
     import os
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── Text report ───────────────────────────────────────
     report_path = os.path.join(output_dir, "comparison_report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(result["report"])
 
-    # ── CSV summary ───────────────────────────────────────
-    if "summary_df" in result:
+    if isinstance(result.get("table"), pd.DataFrame):
         csv_path = os.path.join(output_dir, "comparison_summary.csv")
-        result["summary_df"].to_csv(csv_path, index=False, encoding="utf-8")
+        result["table"].to_csv(csv_path, index=True, encoding="utf-8")
 
-    # ── Per-strategy equity curves ────────────────────────
-    if "equity_curves" in result:
+    eq_curves = result.get("equity_curves")
+    if isinstance(eq_curves, pd.DataFrame) and not eq_curves.empty:
         eq_path = os.path.join(output_dir, "equity_curves.csv")
-        result["equity_curves"].to_csv(eq_path, encoding="utf-8")
+        eq_curves.to_csv(eq_path, encoding="utf-8")
 
     print(f"\n  Results saved to: {output_dir}/")
 
 
-def _save_single(run: "BacktestRun", output_dir: str) -> None:
-    """Save a single backtest run."""
+def _save_single(run: BacktestRun, output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -269,20 +238,19 @@ def _save_single(run: "BacktestRun", output_dir: str) -> None:
         f.write(metrics_report(run))
     print(f"  Report saved → {report_path}")
 
-    # Save equity curve as CSV
     if run.backtest_result and not run.backtest_result.equity_curve.empty:
         eq_path = out / f"equity_{run.strategy.name}_{ts}.csv"
-        eq_df = pd.DataFrame({
-            "equity": run.backtest_result.equity_curve,
-        })
+        eq_df = pd.DataFrame({"equity": run.backtest_result.equity_curve})
         if not run.benchmark_equity.empty:
             eq_df["benchmark"] = run.benchmark_equity
         eq_df.to_csv(eq_path)
         print(f"  Equity saved → {eq_path}")
 
+    if not run.monthly_returns.empty:
+        monthly_path = out / f"monthly_{run.strategy.name}_{ts}.csv"
+        run.monthly_returns.to_csv(monthly_path)
+        print(f"  Monthly returns saved → {monthly_path}")
 
-# Need pandas import for _save_single
-import pandas as pd
 
 if __name__ == "__main__":
     main()
