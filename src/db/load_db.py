@@ -22,6 +22,7 @@ import argparse
 import logging
 import pandas as pd
 from sqlalchemy import text
+import numpy as np
 
 SRC = Path(__file__).resolve().parent.parent
 ROOT = SRC.parent
@@ -170,7 +171,15 @@ def load_options(market: str) -> int:
     if df.empty:
         LOG.warning(f"{table}: no valid rows after cleaning")
         return 0
+    # ── Fix types: parquet stores volume/oi as DOUBLE (can contain inf/NaN)
+    #    but PostgreSQL expects INTEGER ──
+    
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df["volume"] = df["volume"].astype("Int64")
+    df["oi"]     = df["oi"].astype("Int64")
+    df["dte"]    = df["dte"].astype("Int64")
 
+    # Upsert — IBKR data (with greeks) overwrites yfinance data (without)
     # Upsert — IBKR data (with greeks) overwrites yfinance data (without)
     engine = get_engine()
     upsert_sql = f"""

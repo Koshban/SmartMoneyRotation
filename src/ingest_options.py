@@ -7,20 +7,32 @@ Sources:
   IBKR TWS  — US/HK options (full greeks, real-time)
 
 Auto-selects:
-  --period ≤ 5d AND market in (us, hk)  →  IBKR
-  Otherwise                              →  yfinance
+  market == "hk"  →  IBKR  (yfinance has no HK options)
+  Otherwise       →  yfinance
+
+HK Options Notes:
+  - HKEX stock options expire on the penultimate business day
+    of the month (NOT the 3rd Friday like US).
+  - The IBKR fetcher bypasses pre-calculated target dates for HK
+    and picks expiries directly from the available chain, which
+    is robust regardless of holiday calendar.
+  - IBKR HK option contracts use exchange "SEHK" and "HKD".
+  - HK stock codes have leading zeros stripped for IBKR
+    (e.g. 0700.HK → "700", 9988.HK → "9988").
 
 Usage:
-    python src/ingest_options.py --market us                    # yfinance (backfill)
-    python src/ingest_options.py --market us --source ibkr      # IBKR (recent + greeks)
-    python src/ingest_options.py --market hk                    # IBKR only (auto)
+    python src/ingest_options.py --market us                    # yfinance
+    python src/ingest_options.py --market us --source ibkr      # IBKR
+    python src/ingest_options.py --market hk                    # IBKR (auto)
+    python src/ingest_options.py --market hk --tickers 9988.HK  # single HK
     python src/ingest_options.py --market us --rungs 7
-    python src/ingest_options.py --market us --consolidate      # CSVs → parquet
+    python src/ingest_options.py --market us --consolidate
 """
 import sys
 from pathlib import Path
-_SRC  = Path(__file__).resolve().parent        # .../src
-_ROOT = _SRC.parent                            # .../SmartMoneyRotation
+
+_SRC  = Path(__file__).resolve().parent
+_ROOT = _SRC.parent
 for _p in (str(_ROOT), str(_SRC)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -32,11 +44,6 @@ from datetime import date
 import pandas as pd
 import yfinance as yf
 
-# ── Path setup ─────────────────────────────────────────────────
-SRC  = Path(__file__).resolve().parent
-ROOT = SRC.parent
-sys.path.insert(0, str(ROOT))
-
 from common.universe import (
     get_us_only_etfs,
     get_all_single_names,
@@ -44,7 +51,11 @@ from common.universe import (
     is_hk_ticker,
     is_india_ticker,
 )
-from common.expiry import next_monthly_expiries, match_expiry
+from common.expiry import (
+    next_monthly_expiries,
+    match_expiry,
+    select_expiries_from_chain,
+)
 
 try:
     from common.credentials import IBKR_PORT, IBKR_HOST
@@ -63,10 +74,10 @@ logging.basicConfig(
 )
 LOG = logging.getLogger(__name__)
 
-DATA_DIR = ROOT / "data"
+DATA_DIR = _ROOT / "data"
 RUNGS    = 5
 DELAY_YF = 1.5
-DELAY_IBKR = 0.6   # IBKR pacing: ~60 requests per 10 min
+DELAY_IBKR = 0.6
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -74,7 +85,6 @@ DELAY_IBKR = 0.6   # IBKR pacing: ~60 requests per 10 min
 # ═══════════════════════════════════════════════════════════════
 
 def get_symbols(market: str) -> list[str]:
-    """Build symbol list for a market."""
     if market == "us":
         etfs = get_us_only_etfs()
         singles = [
@@ -90,20 +100,18 @@ def get_symbols(market: str) -> list[str]:
 
 
 def choose_source(market: str, force_source: str | None = None) -> str:
-    """Auto-select data source."""
     if force_source:
         return force_source
     if market == "hk":
-        return "ibkr"       # yfinance has no HK options
-    return "yfinance"        # default for US
+        return "ibkr"
+    return "yfinance"
 
 
 # ═══════════════════════════════════════════════════════════════
-#  YFINANCE FETCH  (existing logic, cleaned up)
+#  YFINANCE FETCH
 # ═══════════════════════════════════════════════════════════════
 
 def current_price_yf(ticker: yf.Ticker) -> float | None:
-    """Latest price from yfinance fast_info."""
     try:
         fi = ticker.fast_info
         return float(fi.get("lastPrice") or fi.get("regularMarketPrice"))
@@ -117,7 +125,6 @@ def select_strikes(
     price:    float,
     n:        int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Pick n nearest OTM strikes on each side of price."""
     otm_p = (
         puts_df[puts_df["strike"] <= price]
         .sort_values("strike", ascending=False)
@@ -135,7 +142,6 @@ def fetch_symbol_yfinance(
     symbol: str,
     n_rungs: int = 5,
 ) -> pd.DataFrame | None:
-    """Fetch options chain for one symbol via yfinance."""
     ticker = yf.Ticker(symbol)
     price = current_price_yf(ticker)
     if price is None:
@@ -174,58 +180,40 @@ def fetch_symbol_yfinance(
             LOG.warning(f"    {symbol} {exp_str}: chain error – {e}")
             continue
 
-        otm_p, otm_c = select_strikes(
-            chain.puts, chain.calls, price, n_rungs,
-        )
+        otm_p, otm_c = select_strikes(chain.puts, chain.calls, price, n_rungs)
 
         for _, r in otm_p.iterrows():
-            rows.append({
-                "date":             today.isoformat(),
-                "symbol":           symbol,
-                "expiry":           exp_date.isoformat(),
-                "strike":           r["strike"],
-                "opt_type":         "P",
-                "bid":              r.get("bid"),
-                "ask":              r.get("ask"),
-                "last":             r.get("lastPrice"),
-                "volume":           r.get("volume"),
-                "oi":               r.get("openInterest"),
-                "iv":               r.get("impliedVolatility"),
-                # yfinance doesn't provide greeks
-                "delta":            None,
-                "gamma":            None,
-                "theta":            None,
-                "vega":             None,
-                "rho":              None,
-                "underlying_price": price,
-                "source":           "yfinance",
-            })
+            rows.append(_yf_row(symbol, exp_date, r, "P", price, today))
 
         for _, r in otm_c.iterrows():
-            rows.append({
-                "date":             today.isoformat(),
-                "symbol":           symbol,
-                "expiry":           exp_date.isoformat(),
-                "strike":           r["strike"],
-                "opt_type":         "C",
-                "bid":              r.get("bid"),
-                "ask":              r.get("ask"),
-                "last":             r.get("lastPrice"),
-                "volume":           r.get("volume"),
-                "oi":               r.get("openInterest"),
-                "iv":               r.get("impliedVolatility"),
-                "delta":            None,
-                "gamma":            None,
-                "theta":            None,
-                "vega":             None,
-                "rho":              None,
-                "underlying_price": price,
-                "source":           "yfinance",
-            })
+            rows.append(_yf_row(symbol, exp_date, r, "C", price, today))
 
         time.sleep(DELAY_YF)
 
     return pd.DataFrame(rows) if rows else None
+
+
+def _yf_row(symbol, exp_date, r, opt_type, price, today) -> dict:
+    return {
+        "date":             today.isoformat(),
+        "symbol":           symbol,
+        "expiry":           exp_date.isoformat(),
+        "strike":           r["strike"],
+        "opt_type":         opt_type,
+        "bid":              r.get("bid"),
+        "ask":              r.get("ask"),
+        "last":             r.get("lastPrice"),
+        "volume":           r.get("volume"),
+        "oi":               r.get("openInterest"),
+        "iv":               r.get("impliedVolatility"),
+        "delta":            None,
+        "gamma":            None,
+        "theta":            None,
+        "vega":             None,
+        "rho":              None,
+        "underlying_price": price,
+        "source":           "yfinance",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -237,6 +225,8 @@ def _make_stock_contract(symbol: str, market: str):
     from ib_insync import Stock
 
     if market == "hk":
+        # IBKR uses numeric code without leading zeros for SEHK
+        # 0700.HK → "700",  9988.HK → "9988",  0005.HK → "5"
         ibkr_sym = symbol.replace(".HK", "").lstrip("0") or "0"
         return Stock(ibkr_sym, "SEHK", "HKD")
     else:
@@ -257,12 +247,76 @@ def _make_option_contract(
     if market == "hk":
         ibkr_sym = symbol.replace(".HK", "").lstrip("0") or "0"
         return Option(
-            ibkr_sym, expiry_str, strike, right, "SEHK", currency="HKD",
+            ibkr_sym, expiry_str, strike, right,
+            "SEHK", currency="HKD",
         )
     else:
         ibkr_sym = symbol.split(".")[0]
         return Option(
-            ibkr_sym, expiry_str, strike, right, "SMART", currency="USD",
+            ibkr_sym, expiry_str, strike, right,
+            "SMART", currency="USD",
+        )
+
+
+def _ibkr_expiry_to_iso(expiry: str) -> str:
+    """Convert IBKR '20250620' format to '2025-06-20'."""
+    if len(expiry) == 8 and expiry.isdigit():
+        return f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+    return expiry
+
+
+def _select_expiries_for_market(
+    available_expiries: list[str],
+    market: str,
+) -> list[tuple[date, str]]:
+    """
+    Select the next 2 monthly expiries from IBKR's available list,
+    using the appropriate method for each market.
+
+    For HK: Directly pick from the chain (bypasses pre-calculated
+            targets entirely — robust regardless of HKEX holidays).
+
+    For US: Match against 3rd-Friday targets first.  If that fails
+            (can happen around holidays), fall back to chain-based
+            selection.
+
+    Returns list of (expiry_date, ISO string) pairs.
+    """
+    iso_expiries = [_ibkr_expiry_to_iso(e) for e in available_expiries]
+
+    if market == "hk":
+        # ── HK: use chain-based selection ─────────────────────
+        # HK expiry convention (penultimate business day) differs
+        # from US (3rd Friday).  Pre-calculated targets often miss
+        # because of holidays and the ~2 week offset.  The robust
+        # approach is to pick directly from what IBKR says is
+        # available.
+        selected = select_expiries_from_chain(
+            available_expiries, n=2,
+        )
+        if selected:
+            return selected
+
+        # Fallback: try matching with HK-specific targets and
+        # a wider gap tolerance
+        targets = next_monthly_expiries(market="hk", n=2)
+        matched = match_expiry(targets, iso_expiries, max_gap_days=12)
+        return matched
+
+    else:
+        # ── US: match against 3rd-Friday targets ──────────────
+        targets = next_monthly_expiries(market="us", n=2)
+        matched = match_expiry(targets, iso_expiries, max_gap_days=7)
+        if matched:
+            return matched
+
+        # Fallback: direct chain-based selection
+        LOG.debug(
+            "US target matching failed — falling back to "
+            "chain-based expiry selection"
+        )
+        return select_expiries_from_chain(
+            available_expiries, n=2,
         )
 
 
@@ -276,8 +330,12 @@ def fetch_symbol_ibkr(
     Fetch options chain for one symbol via IBKR TWS.
 
     Returns DataFrame with full greeks.
+
+    HK-specific handling:
+      - Stock contract on SEHK in HKD
+      - Expiry selection uses chain-based approach (not 3rd Friday)
+      - Option contracts also on SEHK in HKD
     """
-    from ib_insync import util
 
     # ── Get underlying price ──────────────────────────────────
     stock = _make_stock_contract(symbol, market)
@@ -288,13 +346,12 @@ def fetch_symbol_ibkr(
 
     stock = qualified[0]
 
-    # Request market data snapshot for current price
     ib.reqMarketDataType(3)  # delayed-frozen as fallback
     ticker_data = ib.reqMktData(stock, "", False, False)
     ib.sleep(2)
 
     price = ticker_data.marketPrice()
-    if price is None or price != price:  # NaN check
+    if price is None or price != price:
         price = ticker_data.close
     if price is None or price != price or price <= 0:
         LOG.warning(f"    {symbol}: no price from IBKR")
@@ -303,7 +360,7 @@ def fetch_symbol_ibkr(
 
     ib.cancelMktData(stock)
 
-    # ── Get available expiries via security definitions ───────
+    # ── Get available option chains ───────────────────────────
     try:
         chains = ib.reqSecDefOptParams(
             stock.symbol, "", stock.secType, stock.conId,
@@ -316,8 +373,11 @@ def fetch_symbol_ibkr(
         LOG.warning(f"    {symbol}: no option chains available")
         return None
 
-    # Pick the chain with the most strikes (usually SMART for US)
+    # For HK, IBKR may return multiple chain objects.
+    # Pick the one with the most strikes (usually the primary exchange).
+    # For US, this is typically the SMART chain.
     chain = max(chains, key=lambda c: len(c.strikes))
+
     available_expiries = sorted(chain.expirations)
     available_strikes = sorted(chain.strikes)
 
@@ -325,29 +385,36 @@ def fetch_symbol_ibkr(
         LOG.warning(f"    {symbol}: no expiries in chain")
         return None
 
-    # ── Match to next 2 monthly expiries ──────────────────────
-    expiry_market = "us" if market != "hk" else "us"  # both use 3rd Friday
-    targets = next_monthly_expiries(market=expiry_market, n=2)
-    matched = match_expiry(
-        targets,
-        [_ibkr_expiry_to_iso(e) for e in available_expiries],
+    LOG.debug(
+        f"    {symbol}: {len(available_expiries)} expiries, "
+        f"{len(available_strikes)} strikes  "
+        f"(exchange={chain.exchange}, "
+        f"tradingClass={chain.tradingClass})"
+    )
+
+    # ── Select next 2 monthly expiries ────────────────────────
+    matched = _select_expiries_for_market(
+        available_expiries, market,
     )
 
     if not matched:
-        LOG.warning(f"    {symbol}: no monthly expiry matched from IBKR")
+        LOG.warning(
+            f"    {symbol}: no monthly expiry matched  "
+            f"(available: {available_expiries[:6]}...)"
+        )
         return None
 
     LOG.info(
         f"    {symbol:<10s}  price={price:>10.2f}   "
         f"expiries={[str(d) for d, _ in matched]}  "
-        f"({len(available_strikes)} strikes available)"
+        f"({len(available_strikes)} strikes)"
     )
 
     today = date.today()
     rows = []
 
     for exp_date, exp_str in matched:
-        # Convert back to IBKR format (YYYYMMDD)
+        # Convert ISO to IBKR format (YYYYMMDD)
         ibkr_expiry = exp_str.replace("-", "")
 
         # Select nearest OTM strikes
@@ -392,11 +459,14 @@ def _fetch_single_option(
         )
         qualified = ib.qualifyContracts(contract)
         if not qualified:
+            LOG.debug(
+                f"    {symbol} {right}{strike} {ibkr_expiry}: "
+                f"could not qualify"
+            )
             return None
 
         contract = qualified[0]
 
-        # Request market data
         ticker = ib.reqMktData(contract, "106", False, False)
         ib.sleep(1.5)
 
@@ -410,19 +480,31 @@ def _fetch_single_option(
             "ask":              _safe_float(ticker.ask),
             "last":             _safe_float(ticker.last),
             "volume":           _safe_int(ticker.volume),
-            "oi":               None,  # populated from
-            "iv":               _safe_float(ticker.modelGreeks.impliedVol
-                                            if ticker.modelGreeks else None),
-            "delta":            _safe_float(ticker.modelGreeks.delta
-                                            if ticker.modelGreeks else None),
-            "gamma":            _safe_float(ticker.modelGreeks.gamma
-                                            if ticker.modelGreeks else None),
-            "theta":            _safe_float(ticker.modelGreeks.theta
-                                            if ticker.modelGreeks else None),
-            "vega":             _safe_float(ticker.modelGreeks.vega
-                                            if ticker.modelGreeks else None),
-            "rho":              _safe_float(ticker.modelGreeks.rho
-                                            if ticker.modelGreeks else None),
+            "oi":               None,
+            "iv":               _safe_float(
+                ticker.modelGreeks.impliedVol
+                if ticker.modelGreeks else None
+            ),
+            "delta":            _safe_float(
+                ticker.modelGreeks.delta
+                if ticker.modelGreeks else None
+            ),
+            "gamma":            _safe_float(
+                ticker.modelGreeks.gamma
+                if ticker.modelGreeks else None
+            ),
+            "theta":            _safe_float(
+                ticker.modelGreeks.theta
+                if ticker.modelGreeks else None
+            ),
+            "vega":             _safe_float(
+                ticker.modelGreeks.vega
+                if ticker.modelGreeks else None
+            ),
+            "rho":              _safe_float(
+                ticker.modelGreeks.rho
+                if ticker.modelGreeks else None
+            ),
             "underlying_price": underlying_price,
             "source":           "ibkr",
         }
@@ -437,20 +519,12 @@ def _fetch_single_option(
         return None
 
 
-def _ibkr_expiry_to_iso(expiry: str) -> str:
-    """Convert IBKR '20250620' format to '2025-06-20'."""
-    if len(expiry) == 8 and expiry.isdigit():
-        return f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
-    return expiry
-
-
 def _safe_float(val) -> float | None:
-    """Safely convert to float, handling NaN and None."""
     if val is None:
         return None
     try:
         f = float(val)
-        if f != f:  # NaN
+        if f != f:
             return None
         return f
     except (TypeError, ValueError):
@@ -458,7 +532,6 @@ def _safe_float(val) -> float | None:
 
 
 def _safe_int(val) -> int | None:
-    """Safely convert to int."""
     if val is None:
         return None
     try:
@@ -475,7 +548,6 @@ def _safe_int(val) -> int | None:
 # ═══════════════════════════════════════════════════════════════
 
 def run_ibkr(symbols: list[str], market: str, n_rungs: int):
-    """Fetch all symbols via IBKR with connection management."""
     try:
         from ib_insync import IB
     except ImportError:
@@ -488,7 +560,6 @@ def run_ibkr(symbols: list[str], market: str, n_rungs: int):
         LOG.info(f"[IBKR] Connected to TWS at {IBKR_HOST}:{IBKR_PORT}")
     except Exception as e:
         LOG.error(f"[IBKR] Cannot connect to TWS: {e}")
-        LOG.warning("[IBKR] Is TWS/Gateway running? Falling back to yfinance.")
         if market == "hk":
             LOG.error("HK options require IBKR — no fallback available.")
             return
@@ -518,7 +589,6 @@ def run_ibkr(symbols: list[str], market: str, n_rungs: int):
                 skips += 1
                 continue
 
-            # Save per-ticker CSV (append-safe)
             fname = sym.replace(".", "_").replace("/", "_") + ".csv"
             path = out_dir / fname
             _append_save(df, path)
@@ -542,7 +612,6 @@ def run_ibkr(symbols: list[str], market: str, n_rungs: int):
 # ═══════════════════════════════════════════════════════════════
 
 def run_yfinance(symbols: list[str], n_rungs: int):
-    """Fetch all symbols via yfinance."""
     out_dir = DATA_DIR / "options" / "us"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -581,15 +650,10 @@ def run_yfinance(symbols: list[str], n_rungs: int):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CONSOLIDATION — CSVs → Parquet
+#  CONSOLIDATION
 # ═══════════════════════════════════════════════════════════════
 
 def consolidate(market: str = "us") -> pd.DataFrame:
-    """
-    Read all per-ticker option CSVs and combine into one parquet.
-
-    This creates the file that load_db.py expects for DB loading.
-    """
     csv_dir = DATA_DIR / "options" / market
     if not csv_dir.exists():
         LOG.warning(f"No options directory: {csv_dir}")
@@ -626,10 +690,6 @@ def consolidate(market: str = "us") -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════
 
 def _append_save(df: pd.DataFrame, path: Path):
-    """
-    Save DataFrame to CSV, appending to existing data.
-    Replaces today's rows if re-running.
-    """
     if path.exists():
         prev = pd.read_csv(path, dtype={"date": str})
         prev = prev[prev["date"] != date.today().isoformat()]
@@ -646,42 +706,31 @@ def main():
         description="Fetch options chains (yfinance + IBKR)",
     )
     parser.add_argument(
-        "--market",
-        choices=["us", "hk"],
-        default="us",
+        "--market", choices=["us", "hk"], default="us",
         help="Market to fetch (default: us)",
     )
     parser.add_argument(
-        "--source",
-        choices=["yfinance", "ibkr"],
-        default=None,
+        "--source", choices=["yfinance", "ibkr"], default=None,
         help="Force data source (default: auto)",
     )
     parser.add_argument(
-        "--rungs",
-        type=int,
-        default=RUNGS,
+        "--rungs", type=int, default=RUNGS,
         help=f"OTM strikes per side (default: {RUNGS})",
     )
     parser.add_argument(
-        "--consolidate",
-        action="store_true",
+        "--consolidate", action="store_true",
         help="Consolidate per-ticker CSVs into one parquet",
     )
     parser.add_argument(
-        "--tickers",
-        nargs="+",
-        default=None,
+        "--tickers", nargs="+", default=None,
         help="Fetch specific tickers only",
     )
     args = parser.parse_args()
 
-    # ── Consolidate mode ──────────────────────────────────────
     if args.consolidate:
         consolidate(args.market)
         return
 
-    # ── Fetch mode ────────────────────────────────────────────
     if args.tickers:
         symbols = [t.upper() for t in args.tickers]
     else:
