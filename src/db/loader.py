@@ -1,10 +1,10 @@
 """
-srcdb/loader.py
+src/db/loader.py
 --------------
 Unified OHLCV data loader for the CASH compute pipeline.
 
 Reads from:
-  1. Local parquet files (data/universe_ohlcv.parquet, data/india_cash.parquet)
+  1. Local parquet files (data/universe_ohlcv.parquet, data/india_ohlcv.parquet)
   2. PostgreSQL regional cash tables (if parquet unavailable)
   3. yfinance (fallback for missing tickers)
 
@@ -12,10 +12,16 @@ Returns DataFrames in the standard format expected by compute/:
   - Columns: open, high, low, close, volume
   - DatetimeIndex named "date", sorted ascending
   - No NaN/zero closes
+
+The optional ``days`` parameter on every public function limits
+output to the most recent N calendar days.  Data sources that
+support it (DB, yfinance) use server-side filtering for speed;
+parquet data is filtered after reading from cache.
 """
 from __future__ import annotations
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 
 _SRC  = Path(__file__).resolve().parent.parent  # .../src
 _ROOT = _SRC.parent                             # .../SmartMoneyRotation
@@ -25,21 +31,64 @@ for _p in (str(_ROOT), str(_SRC)):
 
 import numpy as np
 import pandas as pd
-import logging
 from common.config import DATA_DIR
-
+import logging
 logger = logging.getLogger(__name__)
 
 # ── Parquet paths ─────────────────────────────────────────────
 _UNIVERSE_PARQUET = DATA_DIR / "universe_ohlcv.parquet"
-_INDIA_PARQUET    = DATA_DIR / "india_cash.parquet"
+_INDIA_PARQUET    = DATA_DIR / "india_ohlcv.parquet"
 
 _REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 
 # ── Module-level cache ────────────────────────────────────────
-# Loaded once per session to avoid re-reading parquet on every
-# single-ticker call.  Keyed by parquet path.
 _parquet_cache: dict[Path, pd.DataFrame] = {}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DAYS FILTER HELPER
+# ═══════════════════════════════════════════════════════════════
+
+def _apply_days_filter(
+    df: pd.DataFrame,
+    days: int | None,
+) -> pd.DataFrame:
+    """
+    Trim a DatetimeIndex-ed DataFrame to the most recent *days*
+    calendar days.  Returns *df* unchanged if ``days`` is None
+    or the frame is empty.
+    """
+    if days is None or df.empty:
+        return df
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
+    filtered = df[df.index >= cutoff]
+    return filtered
+
+
+def _days_to_yf_period(days: int) -> str:
+    """
+    Convert a calendar-day count to the closest yfinance period
+    string that is guaranteed to cover at least ``days``.
+
+    yfinance only accepts: 1d 5d 1mo 3mo 6mo 1y 2y 5y 10y max
+    """
+    if days <= 5:
+        return "5d"
+    if days <= 30:
+        return "1mo"
+    if days <= 90:
+        return "3mo"
+    if days <= 180:
+        return "6mo"
+    if days <= 365:
+        return "1y"
+    if days <= 730:
+        return "2y"
+    if days <= 1825:
+        return "5y"
+    if days <= 3650:
+        return "10y"
+    return "max"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -49,6 +98,7 @@ _parquet_cache: dict[Path, pd.DataFrame] = {}
 def load_ohlcv(
     ticker: str,
     source: str = "auto",
+    days: int | None = None,
 ) -> pd.DataFrame:
     """
     Load OHLCV for a single ticker.
@@ -62,6 +112,11 @@ def load_ohlcv(
         "db"      — PostgreSQL only
         "yfinance"— yfinance download
         "auto"    — try parquet → db → yfinance
+    days : int, optional
+        If given, only return the most recent *days* calendar days
+        of data.  For DB and yfinance sources the filter is applied
+        server-side; for parquet it is applied after reading from
+        cache.
 
     Returns
     -------
@@ -74,23 +129,23 @@ def load_ohlcv(
         # Try parquet first (fast, no network)
         df = _load_from_parquet(ticker)
         if not df.empty:
-            return df
+            return _apply_days_filter(df, days)
 
         # Try DB
-        df = _load_from_db(ticker)
+        df = _load_from_db(ticker, days=days)
         if not df.empty:
-            return df
+            return df          # already filtered by SQL
 
         # Fallback to yfinance
-        df = _load_from_yfinance(ticker)
-        return df
+        df = _load_from_yfinance(ticker, days=days)
+        return df              # already filtered by period/start-end
 
     if source == "parquet":
-        return _load_from_parquet(ticker)
+        return _apply_days_filter(_load_from_parquet(ticker), days)
     elif source == "db":
-        return _load_from_db(ticker)
+        return _load_from_db(ticker, days=days)
     elif source == "yfinance":
-        return _load_from_yfinance(ticker)
+        return _load_from_yfinance(ticker, days=days)
     else:
         logger.warning(f"Unknown source '{source}' for {ticker}")
         return pd.DataFrame()
@@ -99,15 +154,26 @@ def load_ohlcv(
 def load_universe_ohlcv(
     tickers: list[str],
     source: str = "auto",
+    days: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Load OHLCV for multiple tickers.
 
-    For parquet sources, this is efficient: reads the file once
-    and extracts all tickers from the cached DataFrame.
+    Parameters
+    ----------
+    tickers : list[str]
+        Symbols to load.
+    source : str
+        Data source — see :func:`load_ohlcv`.
+    days : int, optional
+        Limit each ticker's data to the most recent *days*
+        calendar days.
 
-    Returns {ticker: DataFrame} for successfully loaded symbols.
-    Failed tickers are logged and skipped.
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        ``{ticker: DataFrame}`` for successfully loaded symbols.
+        Failed tickers are logged and skipped.
     """
     # Pre-warm the parquet cache if using auto/parquet
     if source in ("auto", "parquet"):
@@ -118,7 +184,7 @@ def load_universe_ohlcv(
 
     for ticker in tickers:
         try:
-            df = load_ohlcv(ticker, source=source)
+            df = load_ohlcv(ticker, source=source, days=days)
             if not df.empty:
                 result[ticker] = df
             else:
@@ -130,6 +196,7 @@ def load_universe_ohlcv(
     logger.info(
         f"Loaded {len(result)}/{len(tickers)} tickers"
         + (f" (missing: {len(missing)})" if missing else "")
+        + (f" [days={days}]" if days else "")
     )
 
     if missing and len(missing) <= 20:
@@ -141,9 +208,6 @@ def load_universe_ohlcv(
 def get_available_tickers(source: str = "parquet") -> list[str]:
     """
     Return list of tickers available in the data source.
-
-    Useful for verifying universe coverage before running
-    the pipeline.
     """
     if source == "parquet":
         _ensure_parquet_cached()
@@ -160,9 +224,6 @@ def get_available_tickers(source: str = "parquet") -> list[str]:
 def data_summary() -> dict:
     """
     Quick summary of available data files and coverage.
-
-    Returns dict with file paths, sizes, ticker counts,
-    date ranges.
     """
     info = {}
 
@@ -247,7 +308,6 @@ def _load_from_parquet(ticker: str) -> pd.DataFrame:
 def _read_parquet_raw(path: Path) -> pd.DataFrame:
     """Read a parquet file, resetting any index."""
     df = pd.read_parquet(path)
-    # If the index looks like a date, reset it to a column
     if isinstance(df.index, pd.DatetimeIndex) or df.index.name in (
         "Date", "date", "trade_date",
     ):
@@ -259,12 +319,16 @@ def _read_parquet_raw(path: Path) -> pd.DataFrame:
 #  DATABASE LOADING
 # ═══════════════════════════════════════════════════════════════
 
-def _load_from_db(ticker: str) -> pd.DataFrame:
+def _load_from_db(
+    ticker: str,
+    days: int | None = None,
+) -> pd.DataFrame:
     """
     Load from PostgreSQL regional cash tables.
 
-    Determines the correct table (us_cash, hk_cash, india_cash,
-    others_cash) from the ticker suffix.
+    When *days* is given the SQL WHERE clause restricts to
+    ``date >= today - days`` so only the needed rows are
+    transferred from the database.
     """
     try:
         import psycopg2
@@ -272,18 +336,31 @@ def _load_from_db(ticker: str) -> pd.DataFrame:
     except ImportError:
         return pd.DataFrame()
 
-    # Determine region/table
     table = _ticker_to_cash_table(ticker)
 
     try:
         conn = psycopg2.connect(**PG_CONFIG)
-        query = f"""
-            SELECT date as date, open, high, low, close, volume
-            FROM {table}
-            WHERE symbol = %s
-            ORDER BY date ASC
-        """
-        df = pd.read_sql(query, conn, params=(ticker,))
+
+        if days is not None:
+            cutoff = (datetime.now() - timedelta(days=days)).strftime(
+                "%Y-%m-%d"
+            )
+            query = f"""
+                SELECT date, open, high, low, close, volume
+                FROM {table}
+                WHERE symbol = %s AND date >= %s
+                ORDER BY date ASC
+            """
+            df = pd.read_sql(query, conn, params=(ticker, cutoff))
+        else:
+            query = f"""
+                SELECT date, open, high, low, close, volume
+                FROM {table}
+                WHERE symbol = %s
+                ORDER BY date ASC
+            """
+            df = pd.read_sql(query, conn, params=(ticker,))
+
         conn.close()
 
         if df.empty:
@@ -316,8 +393,15 @@ def _ticker_to_cash_table(ticker: str) -> str:
 def _load_from_yfinance(
     ticker: str,
     period: str = "2y",
+    days: int | None = None,
 ) -> pd.DataFrame:
-    """Load from yfinance as last-resort fallback."""
+    """
+    Load from yfinance as last-resort fallback.
+
+    When *days* is given, a start/end date range is used instead
+    of the less-precise ``period`` string, ensuring we fetch
+    exactly the window we need.
+    """
     try:
         import yfinance as yf
     except ImportError:
@@ -325,12 +409,28 @@ def _load_from_yfinance(
         return pd.DataFrame()
 
     try:
-        raw = yf.download(
-            ticker, period=period, progress=False, auto_adjust=False,
-        )
+        if days is not None:
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(days=days)
+            raw = yf.download(
+                ticker,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                progress=False,
+                auto_adjust=False,
+            )
+        else:
+            raw = yf.download(
+                ticker,
+                period=period,
+                progress=False,
+                auto_adjust=False,
+            )
+
         if raw.empty:
             return pd.DataFrame()
         return _normalise(raw)
+
     except Exception as e:
         logger.debug(f"yfinance failed for {ticker}: {e}")
         return pd.DataFrame()
@@ -363,7 +463,6 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).lower().strip() for c in df.columns]
 
     # ── Rename known variants to canonical names ──────────────
-    # Applied once — downstream code only references canonical names.
     _COLUMN_RENAMES = {
         "adj close":  "adj_close",
         "trade_date": "date",
@@ -387,11 +486,6 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     df.index.name = "date"
 
     # ── Drop non-OHLCV columns ────────────────────────────────
-    # After renaming, only canonical names exist.  We keep
-    # exactly _REQUIRED_COLS and discard everything else.
-    # This is safer than maintaining an ever-growing deny-list:
-    # new metadata columns from DB or yfinance are automatically
-    # excluded without needing code changes.
     keep = [c for c in df.columns if c in _REQUIRED_COLS]
     missing = [c for c in _REQUIRED_COLS if c not in df.columns]
 
@@ -409,11 +503,9 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     df = df[~df.index.duplicated(keep="last")]
     df = df[df["close"].notna() & (df["close"] > 0)]
 
-    # Ensure numeric types
     for col in _REQUIRED_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop rows where any OHLC is NaN (volume NaN is OK, fill with 0)
     df = df.dropna(subset=["open", "high", "low", "close"])
     df["volume"] = df["volume"].fillna(0).astype(np.int64)
 
@@ -453,6 +545,7 @@ def _find_date_col(df: pd.DataFrame) -> str | None:
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import argparse
     import json
 
     logging.basicConfig(
@@ -460,8 +553,21 @@ if __name__ == "__main__":
         format="%(asctime)s  %(levelname)-8s  %(message)s",
     )
 
+    parser = argparse.ArgumentParser(description="Data loader diagnostics")
+    parser.add_argument(
+        "--days", type=int, default=None,
+        help="Only show the most recent N calendar days of data",
+    )
+    parser.add_argument(
+        "--tickers", nargs="+", default=["SPY", "QQQ", "XLK"],
+        help="Tickers to test (default: SPY QQQ XLK)",
+    )
+    cli_args = parser.parse_args()
+
     print("\n" + "=" * 60)
     print("  DATA LOADER — Diagnostics")
+    if cli_args.days:
+        print(f"  Days filter: {cli_args.days}")
     print("=" * 60)
 
     # Summary
@@ -478,11 +584,11 @@ if __name__ == "__main__":
             print(f"    Range:   {info.get('date_min', '?')} → "
                   f"{info.get('date_max', '?')}")
 
-    # Test loading a few tickers
-    test_tickers = ["SPY", "QQQ", "XLK"]
-    print(f"\n  Test loading: {test_tickers}")
-    for t in test_tickers:
-        df = load_ohlcv(t)
+    # Test loading
+    print(f"\n  Test loading: {cli_args.tickers}"
+          + (f" (last {cli_args.days} days)" if cli_args.days else ""))
+    for t in cli_args.tickers:
+        df = load_ohlcv(t, days=cli_args.days)
         if df.empty:
             print(f"    {t}: NO DATA")
         else:

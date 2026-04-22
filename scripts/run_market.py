@@ -7,20 +7,17 @@ recommendations report.
 
 Usage
 ─────
-  # US (default) — scoring + rotation convergence
+  # US, default 365 days
   python -m scripts.run_market
 
-  # Hong Kong — scoring only, 180 days data
-  python -m scripts.run_market -m HK -n 180
+  # Hong Kong, 180 days lookback
+  python -m scripts.run_market -m HK --days 180
 
-  # India — open report in browser automatically
-  python -m scripts.run_market -m IN --open
+  # India, 90 days, open browser
+  python -m scripts.run_market -m IN --days 90 --open
 
-  # US with current holdings for rotation sell evaluation
-  python -m scripts.run_market -m US --holdings NVDA,CRWD,PANW
-
-  # Custom output path
-  python -m scripts.run_market -m US -o ~/reports/us_today.html
+  # US with current holdings
+  python -m scripts.run_market -m US --days 365 --holdings NVDA,CRWD,PANW --open
 """
 
 from __future__ import annotations
@@ -33,13 +30,18 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
+# ── Path setup ────────────────────────────────────────────────
+_SCRIPTS = Path(__file__).resolve().parent
+_ROOT    = _SCRIPTS.parent
+_SRC     = _ROOT / "src"
+for _p in (str(_ROOT), str(_SRC)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-# ── Pipeline imports ──────────────────────────────────────────
-from pipeline.orchestrator import Orchestrator, run_full_pipeline
+from pipeline.orchestrator import run_full_pipeline
 from strategy.convergence import convergence_report
 from reports.html_report import generate_html_report
-from common.config import MARKET_CONFIG, ACTIVE_MARKETS
+from common.config import MARKET_CONFIG
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -48,10 +50,9 @@ from common.config import MARKET_CONFIG, ACTIVE_MARKETS
 
 def _setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    fmt = "%(asctime)s  %(levelname)-7s  %(name)s  %(message)s"
     logging.basicConfig(
         level=level,
-        format=fmt,
+        format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
         datefmt="%H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
@@ -64,13 +65,21 @@ def _setup_logging(verbose: bool = False) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="run_market",
-        description="Run CASH pipeline and generate HTML report",
+        description=(
+            "Run the CASH pipeline: load N days of data from "
+            "existing parquet / DB / yfinance, analyse, and "
+            "generate an HTML recommendations report."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python -m scripts.run_market
-  python -m scripts.run_market -m HK -n 180
-  python -m scripts.run_market -m US --holdings NVDA,CRWD --open
+  python -m scripts.run_market                                  # US, 365d
+  python -m scripts.run_market -m HK --days 180                 # HK, 180d
+  python -m scripts.run_market -m IN --days 90 --open           # IN, 90d, open
+  python -m scripts.run_market -m US --days 365 --holdings NVDA,CRWD --open
+
+NOTE: Data must already exist in parquet/DB.  To download first:
+  python src/ingest_cash.py --market us --days 365
         """,
     )
 
@@ -78,14 +87,18 @@ examples:
         "-m", "--market",
         type=str,
         default="US",
-        choices=list(MARKET_CONFIG.keys()),
-        help="Market to analyse (default: US)",
+        choices=sorted(MARKET_CONFIG.keys()),
+        help="Market / region to analyse (default: US)",
     )
     p.add_argument(
         "-n", "--days",
         type=int,
         default=365,
-        help="Lookback days for data loading (default: 365)",
+        help=(
+            "Calendar days of data to analyse.  An extra warm-up "
+            "buffer (~220 days) is added automatically for "
+            "indicator initialisation. (default: 365)"
+        ),
     )
     p.add_argument(
         "-o", "--output",
@@ -97,8 +110,10 @@ examples:
         "--holdings",
         type=str,
         default="",
-        help="Comma-separated current holdings for rotation "
-             "sell evaluation (e.g. NVDA,CRWD,PANW)",
+        help=(
+            "Comma-separated current holdings for rotation "
+            "sell evaluation (e.g. NVDA,CRWD,PANW)"
+        ),
     )
     p.add_argument(
         "--capital",
@@ -122,10 +137,10 @@ examples:
         help="Enable debug logging",
     )
     p.add_argument(
-        "--no-backtest",
+        "--backtest",
         action="store_true",
-        default=True,
-        help="Skip backtest phase (default: skip)",
+        default=False,
+        help="Run backtest phase (off by default for quick runs)",
     )
 
     return p.parse_args()
@@ -138,7 +153,6 @@ examples:
 def main() -> None:
     args = parse_args()
     _setup_logging(args.verbose)
-
     logger = logging.getLogger("run_market")
 
     market = args.market.upper()
@@ -156,46 +170,56 @@ def main() -> None:
             if t.strip()
         ]
 
-    # ── Info banner ───────────────────────────────────────────
+    # ── Banner ────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info(f"  CASH Pipeline — {market}")
-    logger.info(f"  Benchmark  : {mcfg['benchmark']}")
-    logger.info(f"  Universe   : {len(mcfg['universe'])} tickers")
-    logger.info(f"  Engines    : {mcfg['engines']}")
-    logger.info(f"  Lookback   : {args.days} days")
+    logger.info(f"  Benchmark   : {mcfg['benchmark']}")
+    logger.info(f"  Universe    : {len(mcfg['universe'])} tickers")
+    logger.info(f"  Engines     : {mcfg.get('engines', ['scoring'])}")
+    logger.info(f"  Lookback    : {args.days} days")
     if holdings:
-        logger.info(f"  Holdings   : {holdings}")
+        logger.info(f"  Holdings    : {holdings}")
     logger.info("=" * 60)
 
     # ── Run pipeline ──────────────────────────────────────────
-    t0 = time.perf_counter()
+    wall_t0 = time.perf_counter()
 
     try:
         result = run_full_pipeline(
             market=market,
+            lookback_days=args.days,
             capital=args.capital,
-            current_holdings=holdings if holdings else None,
-            enable_backtest=not args.no_backtest,
+            current_holdings=holdings or None,
+            enable_backtest=args.backtest,
         )
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error(f"Pipeline failed: {exc}", exc_info=True)
         sys.exit(1)
 
-    elapsed = time.perf_counter() - t0
-    logger.info(f"Pipeline completed in {elapsed:.1f}s")
+    wall_elapsed = time.perf_counter() - wall_t0
+
+    # ── Pipeline errors? ──────────────────────────────────────
+    if result.n_errors > 0:
+        logger.warning(
+            f"{result.n_errors} error(s) during pipeline:"
+        )
+        for e in result.errors:
+            logger.warning(f"  • {e}")
+
+    if result.convergence is None:
+        logger.error("No convergence result — cannot generate report")
+        sys.exit(1)
 
     # ── Text report (optional) ────────────────────────────────
-    if args.text and result.convergence:
+    if args.text:
         print()
         print(convergence_report(result.convergence))
         print()
 
     # ── HTML report ───────────────────────────────────────────
     logger.info("Generating HTML report…")
-
     html = generate_html_report(result)
 
-    # Determine output path
     if args.output:
         out_path = Path(args.output)
     else:
@@ -209,25 +233,30 @@ def main() -> None:
     logger.info(f"Report written: {out_path}  ({size_kb:.0f} KB)")
 
     # ── Summary to stdout ─────────────────────────────────────
-    if result.convergence:
-        conv = result.convergence
-        print()
-        print(f"  {market}  |  {conv.n_tickers} tickers")
-        print(f"  STRONG_BUY : {len(conv.strong_buys)}")
-        print(f"  BUY        : {len(conv.buys)}")
-        print(f"  CONFLICT   : {len(conv.conflicts)}")
-        print(f"  SELL        : {len(conv.sells)}")
-        print(f"  HOLD       : {len(conv.holds)}")
+    conv = result.convergence
+    print()
+    print(f"  {'─' * 44}")
+    print(f"  {market}  │  {conv.n_tickers} tickers  │  "
+          f"{args.days}d lookback  │  {wall_elapsed:.1f}s")
+    print(f"  {'─' * 44}")
+    print(f"  STRONG BUY : {len(conv.strong_buys):>3}")
+    print(f"  BUY        : {len(conv.buys):>3}")
+    print(f"  CONFLICT   : {len(conv.conflicts):>3}")
+    print(f"  SELL       : {len(conv.sells):>3}")
+    print(f"  HOLD       : {len(conv.holds):>3}")
 
-        if conv.strong_buys:
-            print()
-            print("  Top STRONG_BUY:")
-            for s in conv.strong_buys[:5]:
-                print(f"    #{s.rank}  {s.ticker:<8s}  "
-                      f"adj={s.adjusted_score:.3f}")
+    if conv.strong_buys:
+        print()
+        print("  Top Strong-Buy picks:")
+        for s in conv.strong_buys[:5]:
+            print(
+                f"    #{s.rank:<3}  {s.ticker:<8s}  "
+                f"adj={s.adjusted_score:.3f}  "
+                f"{s.scoring_regime}"
+            )
 
     print()
-    print(f"  Report → {out_path.resolve()}")
+    print(f"  📄  {out_path.resolve()}")
     print()
 
     # ── Open in browser ───────────────────────────────────────

@@ -34,10 +34,10 @@ notebook use via the ``Orchestrator`` class.
 Typical Usage
 ─────────────
   # One-shot (CLI / cron)
-  result = run_full_pipeline()
+  result = run_full_pipeline(lookback_days=365)
 
   # Interactive (notebook)
-  orch = Orchestrator()
+  orch = Orchestrator(lookback_days=180)
   orch.load_data()
   orch.compute_universe_context()
   orch.run_tickers()
@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 import numpy as np
 import pandas as pd
+
 # ── Convergence ───────────────────────────────────────────────
 from strategy.convergence import (
     run_convergence,
@@ -79,6 +80,7 @@ from strategy.rotation import (
     RotationConfig,
     RotationResult,
 )
+
 # ── Config ────────────────────────────────────────────────────
 from common.config import (
     BENCHMARK_TICKER,
@@ -86,8 +88,8 @@ from common.config import (
     SECTOR_ETFS,
     TICKER_SECTOR_MAP,
     UNIVERSE,
-    MARKET_CONFIG, 
-    ACTIVE_MARKETS
+    MARKET_CONFIG,
+    ACTIVE_MARKETS,
 )
 
 # ── Compute ───────────────────────────────────────────────────
@@ -126,6 +128,10 @@ from reports.recommendations import build_report
 
 logger = logging.getLogger(__name__)
 
+# Extra calendar days fetched before the requested window so        # ← NEW
+# long-period indicators (200-day MA, etc.) can warm up.            # ← NEW
+_DEFAULT_WARMUP_DAYS = 220                                          # ← NEW
+
 
 # ═══════════════════════════════════════════════════════════════
 #  PIPELINE RESULT
@@ -150,12 +156,12 @@ class PipelineResult:
     breadth: Optional[pd.DataFrame] = None
     breadth_scores: Optional[pd.DataFrame] = None
     sector_rs: Optional[pd.DataFrame] = None
-    bench_df: Optional[pd.DataFrame] = None       # ← NEW
+    bench_df: Optional[pd.DataFrame] = None
 
-    # ── NEW: convergence + rotation ───────────────────────────
     rotation_result: Optional[Any] = None            # RotationResult
     convergence: Optional[Any] = None                # MarketSignalResult
     market: str = "US"
+    lookback_days: int = 365                                        # ← NEW
 
     recommendation_report: Optional[dict] = None
     backtest: Any = None                          # BacktestResult or None
@@ -187,6 +193,7 @@ class PipelineResult:
             f"{self.n_tickers} tickers scored, "
             f"{self.n_errors} errors, "
             f"top={top}, "
+            f"lookback={self.lookback_days}d, "                     # ← NEW
             f"{self.total_time:.1f}s"
         )
 
@@ -203,68 +210,73 @@ class Orchestrator:
     debugging).  For one-shot usage, prefer ``run_full_pipeline()``.
     """
 
-    class Orchestrator:
-        def __init__(
-            self,
-            *,
-            market: str = "US",                       # ← NEW
-            universe: list[str] | None = None,
-            benchmark: str | None = None,
-            capital: float | None = None,
-            as_of: pd.Timestamp | None = None,
-            enable_breadth: bool = True,
-            enable_sectors: bool = True,
-            enable_signals: bool = True,
-            enable_backtest: bool = False,
-        ):
-            # ── Market-aware defaults ─────────────────────────────
-            self.market: str = market                  # ← NEW
-            mcfg = MARKET_CONFIG.get(market, {})
+    def __init__(                                      # ← FIXED: was nested class
+        self,
+        *,
+        market: str = "US",
+        universe: list[str] | None = None,
+        benchmark: str | None = None,
+        capital: float | None = None,
+        lookback_days: int | None = None,              # ← NEW
+        as_of: pd.Timestamp | None = None,
+        enable_breadth: bool = True,
+        enable_sectors: bool = True,
+        enable_signals: bool = True,
+        enable_backtest: bool = False,
+    ):
+        # ── Market-aware defaults ─────────────────────────────
+        self.market: str = market
+        mcfg = MARKET_CONFIG.get(market, {})
 
-            self.tickers: list[str] = universe or list(
-                mcfg.get("universe", UNIVERSE)
-            )
-            self.benchmark: str = benchmark or mcfg.get(
-                "benchmark", BENCHMARK_TICKER
-            )
-            self.capital: float = capital or PORTFOLIO_PARAMS["total_capital"]
-            self.as_of: pd.Timestamp | None = as_of
+        self.tickers: list[str] = universe or list(
+            mcfg.get("universe", UNIVERSE)
+        )
+        self.benchmark: str = benchmark or mcfg.get(
+            "benchmark", BENCHMARK_TICKER
+        )
+        self.capital: float = capital or PORTFOLIO_PARAMS["total_capital"]
+        self.as_of: pd.Timestamp | None = as_of
 
-            # Respect market config for feature flags
-            self.enable_breadth: bool = (
-                enable_breadth
-                and mcfg.get("scoring_weights", {}).get(
-                    "pillar_breadth", 0.10
-                ) > 0
-            )
-            self.enable_sectors: bool = (
-                enable_sectors
-                and mcfg.get("sector_rs_enabled", True)
-            )
-            self.enable_signals: bool = enable_signals
-            self.enable_backtest: bool = enable_backtest
+        # ── Lookback days ─────────────────────────────────────  # ← NEW
+        # None means "load all available data" (no filter).       # ← NEW
+        # When set, load_data() fetches lookback_days +           # ← NEW
+        # _DEFAULT_WARMUP_DAYS to allow indicator warm-up.        # ← NEW
+        self.lookback_days: int | None = lookback_days             # ← NEW
 
-            # ── Mutable state (populated phase by phase) ──────────
-            self._ohlcv: dict[str, pd.DataFrame] = {}
-            self._bench_df: pd.DataFrame = pd.DataFrame()
-            self._breadth: pd.DataFrame | None = None
-            self._breadth_scores: pd.DataFrame | None = None
-            self._sector_rs: pd.DataFrame | None = None
-            self._ticker_results: dict[str, TickerResult] = {}
-            self._scored_universe: dict[str, pd.DataFrame] = {}
-            self._snapshots: list[dict] = []
-            self._rankings: pd.DataFrame = pd.DataFrame()
-            self._portfolio: dict = {}
-            self._signals: pd.DataFrame = pd.DataFrame()
-            self._recommendation_report: dict | None = None
-            self._backtest: Any = None
+        # Respect market config for feature flags
+        self.enable_breadth: bool = (
+            enable_breadth
+            and mcfg.get("scoring_weights", {}).get(
+                "pillar_breadth", 0.10
+            ) > 0
+        )
+        self.enable_sectors: bool = (
+            enable_sectors
+            and mcfg.get("sector_rs_enabled", True)
+        )
+        self.enable_signals: bool = enable_signals
+        self.enable_backtest: bool = enable_backtest
 
-            # ── NEW: rotation + convergence state ─────────────────
-            self._rotation_result: Any = None           # RotationResult
-            self._convergence_result: Any = None        # MarketSignalResult
+        # ── Mutable state (populated phase by phase) ──────────
+        self._ohlcv: dict[str, pd.DataFrame] = {}
+        self._bench_df: pd.DataFrame = pd.DataFrame()
+        self._breadth: pd.DataFrame | None = None
+        self._breadth_scores: pd.DataFrame | None = None
+        self._sector_rs: pd.DataFrame | None = None
+        self._ticker_results: dict[str, TickerResult] = {}
+        self._scored_universe: dict[str, pd.DataFrame] = {}
+        self._snapshots: list[dict] = []
+        self._rankings: pd.DataFrame = pd.DataFrame()
+        self._portfolio: dict = {}
+        self._signals: pd.DataFrame = pd.DataFrame()
+        self._recommendation_report: dict | None = None
+        self._backtest: Any = None
 
-            self._timings: dict[str, float] = {}
-            self._phases_completed: list[str] = []
+        self._rotation_result: Any = None           # RotationResult
+        self._convergence_result: Any = None        # MarketSignalResult
+
+        self._timings: dict[str, float] = {}
+        self._phases_completed: list[str] = []
 
     # ───────────────────────────────────────────────────────
     #  Phase 0 — Data Loading
@@ -278,6 +290,12 @@ class Orchestrator:
         """
         Load OHLCV data for all tickers and the benchmark.
 
+        When ``self.lookback_days`` is set, requests
+        ``lookback_days + _DEFAULT_WARMUP_DAYS`` calendar days
+        from the data source so that long-period indicators
+        (200-day SMA, etc.) can initialise before the analysis
+        window begins.
+
         Parameters
         ----------
         preloaded : dict, optional
@@ -287,6 +305,16 @@ class Orchestrator:
         """
         t0 = time.perf_counter()
 
+        # ── Compute fetch window ──────────────────────────────  # ← NEW
+        fetch_days: int | None = None                              # ← NEW
+        if self.lookback_days is not None:                         # ← NEW
+            fetch_days = self.lookback_days + _DEFAULT_WARMUP_DAYS # ← NEW
+            logger.info(                                           # ← NEW
+                f"Phase 0: lookback={self.lookback_days}d "        # ← NEW
+                f"+ warmup={_DEFAULT_WARMUP_DAYS}d "               # ← NEW
+                f"→ fetching {fetch_days}d from source"            # ← NEW
+            )                                                      # ← NEW
+
         if preloaded is not None:
             self._ohlcv = preloaded
             logger.info(
@@ -295,10 +323,15 @@ class Orchestrator:
             )
         else:
             all_symbols = list(set(self.tickers + [self.benchmark]))
-            self._ohlcv = load_universe_ohlcv(all_symbols)
+            self._ohlcv = load_universe_ohlcv(                    # ← CHANGED
+                all_symbols,
+                days=fetch_days,                                   # ← NEW
+            )
             logger.info(
                 f"Phase 0: Loaded {len(self._ohlcv)} tickers "
                 f"from data source"
+                + (f" (last {fetch_days} days)"                    # ← NEW
+                   if fetch_days else "")                          # ← NEW
             )
 
         # ── Extract or load benchmark ─────────────────────────
@@ -307,7 +340,10 @@ class Orchestrator:
         elif self.benchmark in self._ohlcv:
             self._bench_df = self._ohlcv[self.benchmark]
         else:
-            self._bench_df = load_ohlcv(self.benchmark)
+            self._bench_df = load_ohlcv(                           # ← CHANGED
+                self.benchmark,
+                days=fetch_days,                                   # ← NEW
+            )
 
         if self._bench_df.empty:
             raise ValueError(
@@ -342,15 +378,6 @@ class Orchestrator:
         t0 = time.perf_counter()
 
         # ── Breadth ───────────────────────────────────────────
-        #
-        # compute_all_breadth() expects {ticker: OHLCV DataFrame}
-        # with at least 'close' and optionally 'volume' columns.
-        # It internally aligns them into a panel.
-        #
-        # breadth_to_pillar_scores() takes the breadth DataFrame
-        # plus a list of symbols and broadcasts the breadth score
-        # to every ticker (same market-level score per day).
-        #
         if self.enable_breadth:
             try:
                 self._breadth = compute_all_breadth(self._ohlcv)
@@ -382,12 +409,6 @@ class Orchestrator:
             logger.info("Phase 1: Breadth disabled — skipping")
 
         # ── Sector RS ─────────────────────────────────────────
-        #
-        # compute_all_sector_rs() expects:
-        #   sector_data: {sector_name: OHLCV DataFrame}
-        #   benchmark_df: OHLCV DataFrame
-        # Returns MultiIndex (date, sector) panel.
-        #
         if self.enable_sectors:
             try:
                 sector_ohlcv = _extract_sector_ohlcv(self._ohlcv)
@@ -460,7 +481,6 @@ class Orchestrator:
             f"{n_err} errors, {elapsed:.1f}s"
         )
 
-
     # ───────────────────────────────────────────────────────
     #  Phase 2.5 — Rotation Engine  (US only)
     # ───────────────────────────────────────────────────────
@@ -476,6 +496,17 @@ class Orchestrator:
         Only meaningful for US — skipped silently for HK/IN.
         Requires Phase 2 (run_tickers) to have completed so
         that OHLCV data is available.
+
+        When Phase 2 produced scored DataFrames, the indicator
+        data is passed to the rotation engine's quality filter.
+        This gates and scores candidates within leading sectors
+        on six technical dimensions (MA structure, RSI, MACD,
+        ADX, volume, volatility) and blends the quality score
+        with relative strength for final stock ranking.
+
+        When Phase 2 results are empty (or quality is disabled
+        in RotationConfig), the rotation engine falls back to
+        RS-only ranking — fully backward compatible.
         """
         self._require_phase("run_tickers")
 
@@ -501,14 +532,63 @@ class Orchestrator:
             )
             return
 
+        # ── Build indicator_data from Phase 2 results ─────
+        #
+        # self._scored_universe is {ticker: DataFrame} where
+        # each DataFrame has all indicator columns produced by
+        # compute_all_indicators() in the per-ticker pipeline
+        # (ema_30, sma_50, rsi_14, adx_14, macd_hist,
+        # obv_slope_10d, relative_volume, atr_14_pct, etc.).
+        #
+        # The rotation engine's quality filter reads these
+        # columns to gate and score each candidate stock.
+        #
+        # Tickers not in this dict (missing data, ETFs not in
+        # the scoring universe, failed tickers) receive neutral
+        # quality (0.5) and pass the gate by default — so they
+        # participate in ranking but don't get the quality bonus.
+        indicator_data: dict[str, pd.DataFrame] | None = None
+
+        if self._scored_universe:
+            indicator_data = {
+                ticker: df
+                for ticker, df in self._scored_universe.items()
+                if df is not None and not df.empty
+            }
+            if not indicator_data:
+                indicator_data = None
+
         try:
             r_cfg = config or RotationConfig(
                 benchmark=self.benchmark,
             )
+
+            # Log quality filter status
+            quality_enabled = r_cfg.quality.enabled
+            n_indicator = len(indicator_data) if indicator_data else 0
+
+            if quality_enabled and n_indicator > 0:
+                logger.info(
+                    f"Phase 2.5: Quality filter ON — "
+                    f"{n_indicator} tickers have indicator data"
+                )
+            elif quality_enabled and n_indicator == 0:
+                logger.info(
+                    f"Phase 2.5: Quality filter enabled but "
+                    f"no indicator data available — "
+                    f"falling back to RS-only"
+                )
+            else:
+                logger.info(
+                    f"Phase 2.5: Quality filter OFF "
+                    f"(disabled in config)"
+                )
+
             self._rotation_result = run_rotation(
                 prices=prices,
                 current_holdings=current_holdings or [],
                 config=r_cfg,
+                indicator_data=indicator_data,
             )
 
             rr = self._rotation_result
@@ -520,6 +600,11 @@ class Orchestrator:
                 f"{len(rr.holds)} HOLD  |  "
                 f"leading={rr.leading_sectors}"
             )
+
+            # Log quality impact on BUY picks
+            if quality_enabled and n_indicator > 0:
+                self._log_quality_summary(rr)
+
         except Exception as e:
             logger.warning(
                 f"Phase 2.5: Rotation failed — {e}.  "
@@ -530,7 +615,43 @@ class Orchestrator:
         elapsed = time.perf_counter() - t0
         self._timings["rotation"] = elapsed
         self._phases_completed.append("rotation")
-    
+
+
+    def _log_quality_summary(self, rr: RotationResult) -> None:
+        """
+        Log how the quality filter affected BUY recommendations.
+
+        Called from run_rotation_engine() when quality is active.
+        """
+        buys = rr.buys
+        if not buys:
+            return
+
+        q_scores = [
+            r.quality_score for r in buys
+            if r.quality_score > 0
+        ]
+        gate_fails = [
+            r.ticker for r in buys
+            if not r.quality_gate_passed
+        ]
+
+        if q_scores:
+            avg_q = sum(q_scores) / len(q_scores)
+            logger.info(
+                f"Phase 2.5: Quality summary — "
+                f"{len(buys)} BUYs, "
+                f"avg quality {avg_q:.2f}, "
+                f"range [{min(q_scores):.2f}, "
+                f"{max(q_scores):.2f}]"
+            )
+
+        if gate_fails:
+            logger.info(
+                f"Phase 2.5: {len(gate_fails)} BUY(s) had "
+                f"gate failures (included via fallback): "
+                f"{gate_fails[:5]}"
+            )
 
     # ───────────────────────────────────────────────────────
     #  Phase 2.75 — Convergence Merge
@@ -572,7 +693,6 @@ class Orchestrator:
         self._timings["convergence"] = elapsed
         self._phases_completed.append("convergence")
 
-
     # ───────────────────────────────────────────────────────
     #  Phase 3 — Cross-Sectional Analysis
     # ───────────────────────────────────────────────────────
@@ -600,11 +720,6 @@ class Orchestrator:
             return
 
         # ── 3a. Rankings ──────────────────────────────────────
-        #
-        # compute_all_rankings() takes {ticker: scored_df} and
-        # returns MultiIndex (date, ticker) panel with rank,
-        # pct_rank, pillar_agreement, rank_change columns.
-        #
         try:
             self._rankings = compute_all_rankings(
                 self._scored_universe
@@ -619,13 +734,6 @@ class Orchestrator:
             self._rankings = pd.DataFrame()
 
         # ── 3b. Portfolio Construction ────────────────────────
-        #
-        # build_portfolio() takes {ticker: scored_df} and
-        # internally does snapshot extraction, candidate
-        # filtering, ranking, selection, and weight
-        # normalization.  Returns a dict with target_weights,
-        # holdings DataFrame, sector_exposure, metadata, etc.
-        #
         try:
             self._portfolio = build_portfolio(
                 universe=self._scored_universe,
@@ -653,12 +761,6 @@ class Orchestrator:
             self._portfolio = {}
 
         # ── 3c. Portfolio-Level Signal Generation ─────────────
-        #
-        # compute_all_signals() takes the ranked panel from 3a
-        # and applies cross-sectional rank filters with
-        # hysteresis, position limits, and a breadth circuit
-        # breaker to produce BUY/HOLD/SELL/NEUTRAL signals.
-        #
         if self.enable_signals and not self._rankings.empty:
             try:
                 self._signals = compute_all_signals(
@@ -711,14 +813,6 @@ class Orchestrator:
         t0 = time.perf_counter()
 
         # ── Recommendation Report ─────────────────────────────
-        #
-        # build_report() expects a specific dict format with
-        # keys: summary, regime, risk_flags, portfolio_actions,
-        # ranked_buys, sells, holds, bucket_weights.
-        #
-        # _build_report_input() bridges from the orchestrator's
-        # internal state to that format.
-        #
         try:
             report_input = self._build_report_input()
             self._recommendation_report = build_report(
@@ -732,11 +826,6 @@ class Orchestrator:
             self._recommendation_report = None
 
         # ── Backtest (optional) ───────────────────────────────
-        #
-        # run_backtest() takes the signals DataFrame from
-        # Phase 3c (MultiIndex: date × ticker with signal,
-        # signal_strength, close columns).
-        #
         if self.enable_backtest:
             if not self._signals.empty:
                 try:
@@ -784,9 +873,10 @@ class Orchestrator:
             breadth_scores=self._breadth_scores,
             sector_rs=self._sector_rs,
             bench_df=self._bench_df,
-            rotation_result=self._rotation_result,       # ← NEW
-            convergence=self._convergence_result,        # ← NEW
-            market=self.market,                          # ← NEW
+            rotation_result=self._rotation_result,
+            convergence=self._convergence_result,
+            market=self.market,
+            lookback_days=self.lookback_days or 0,                 # ← NEW
             recommendation_report=self._recommendation_report,
             backtest=self._backtest,
             errors=errors,
@@ -813,7 +903,6 @@ class Orchestrator:
         self.compute_universe_context()
         self.run_tickers()
 
-        # ── NEW: rotation + convergence ───────────────────
         self.run_rotation_engine(
             current_holdings=current_holdings,
         )
@@ -909,11 +998,6 @@ class Orchestrator:
         (PipelineResult-style) to the legacy dict format with
         keys: summary, regime, risk_flags, portfolio_actions,
         ranked_buys, sells, holds, bucket_weights.
-
-        The snapshot dicts produced by ``runner._build_snapshot``
-        already contain the nested structure (sub_scores,
-        indicators, rs) that ``build_report`` reads, so this
-        is primarily a partitioning + metadata assembly step.
         """
         # ── Regime detection ──────────────────────────────
         regime_label, regime_desc = _detect_regime(
@@ -1072,14 +1156,15 @@ class Orchestrator:
 
 def run_full_pipeline(
     *,
-    market: str = "US",                                # ← NEW
+    market: str = "US",
     universe: list[str] | None = None,
     benchmark: str | None = None,
     capital: float | None = None,
+    lookback_days: int | None = None,                              # ← NEW
     as_of: pd.Timestamp | None = None,
     preloaded: dict[str, pd.DataFrame] | None = None,
     bench_df: pd.DataFrame | None = None,
-    current_holdings: list[str] | None = None,         # ← NEW
+    current_holdings: list[str] | None = None,
     enable_breadth: bool = True,
     enable_sectors: bool = True,
     enable_signals: bool = True,
@@ -1088,15 +1173,24 @@ def run_full_pipeline(
     """
     Run the full CASH pipeline end-to-end for one market.
 
+    Parameters
+    ----------
+    lookback_days : int, optional
+        Calendar days of analysis history.  When set, data
+        loading fetches ``lookback_days + 220`` days so that
+        long-period indicators can warm up.  When ``None``,
+        all available data is loaded (original behaviour).
+
     This is the main entry point for CLI usage and scheduled
     jobs.  For multi-market, use ``run_multi_market_pipeline()``.
     For interactive control, use ``Orchestrator`` directly.
     """
     orch = Orchestrator(
-        market=market,                                 # ← NEW
+        market=market,
         universe=universe,
         benchmark=benchmark,
         capital=capital,
+        lookback_days=lookback_days,                               # ← NEW
         as_of=as_of,
         enable_breadth=enable_breadth,
         enable_sectors=enable_sectors,
@@ -1107,7 +1201,7 @@ def run_full_pipeline(
     return orch.run_all(
         preloaded=preloaded,
         bench_df=bench_df,
-        current_holdings=current_holdings,             # ← NEW
+        current_holdings=current_holdings,
     )
 
 
@@ -1119,6 +1213,7 @@ def run_multi_market_pipeline(
     *,
     active_markets: list[str] | None = None,
     capital: float | None = None,
+    lookback_days: int | None = None,                              # ← NEW
     as_of: pd.Timestamp | None = None,
     preloaded: dict[str, dict[str, pd.DataFrame]] | None = None,
     current_holdings: dict[str, list[str]] | None = None,
@@ -1137,6 +1232,9 @@ def run_multi_market_pipeline(
         (typically ``["US", "HK", "IN"]``).
     capital : float, optional
         Portfolio value per market.
+    lookback_days : int, optional                                  # ← NEW
+        Calendar days of analysis history, applied to every       # ← NEW
+        market.  When ``None``, all available data is loaded.     # ← NEW
     as_of : pd.Timestamp, optional
         Cut-off date for backtesting.
     preloaded : dict, optional
@@ -1158,17 +1256,12 @@ def run_multi_market_pipeline(
     -------
     ::
 
-        results = run_multi_market_pipeline()
+        results = run_multi_market_pipeline(lookback_days=365)
         us = results["US"]
         hk = results["HK"]
 
-        # US has convergence data
         for s in us.convergence.strong_buys:
             print(f"{s.ticker}: STRONG BUY, adj={s.adjusted_score:.3f}")
-
-        # HK has scoring-only signals
-        for s in hk.convergence.buys:
-            print(f"{s.ticker}: BUY, score={s.composite_score:.3f}")
     """
     markets = active_markets or ACTIVE_MARKETS
     results: dict[str, PipelineResult] = {}
@@ -1186,6 +1279,8 @@ def run_multi_market_pipeline(
         logger.info(f"  Benchmark: {mcfg['benchmark']}")
         logger.info(f"  Universe: {len(mcfg['universe'])} tickers")
         logger.info(f"  Engines: {mcfg['engines']}")
+        if lookback_days is not None:                              # ← NEW
+            logger.info(f"  Lookback: {lookback_days} days")       # ← NEW
         logger.info(f"{'=' * 60}")
 
         # Pre-loaded data for this market
@@ -1201,6 +1296,7 @@ def run_multi_market_pipeline(
             orch = Orchestrator(
                 market=market,
                 capital=capital,
+                lookback_days=lookback_days,                       # ← NEW
                 as_of=as_of,
                 enable_backtest=enable_backtest,
             )
@@ -1232,6 +1328,7 @@ def run_multi_market_pipeline(
 
     logger.info(f"\nMulti-market complete: {list(results.keys())}")
     return results
+
 
 # ═══════════════════════════════════════════════════════════════
 #  PRIVATE HELPERS

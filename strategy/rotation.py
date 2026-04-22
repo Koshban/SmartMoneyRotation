@@ -8,6 +8,8 @@ Flow
   1. Compute composite relative strength (RS) for each sector ETF vs SPY
   2. Rank the 11 GICS sectors → Leading (top 3), Neutral, Lagging (bottom 3)
   3. Within each Leading sector, rank US single names by composite RS
+     **blended with a technical quality score** (SMA/EMA, RSI, MACD,
+     ADX, volume, volatility)
   4. Select the top N stocks per Leading sector → BUY candidates
   5. Evaluate every current holding against sell rules → SELL / REDUCE / HOLD
   6. Enforce max-position cap, combine, and return RotationResult
@@ -20,6 +22,23 @@ Relative Strength
       40 %  ×  21-day return   (≈ 1 month)   — recent momentum
       35 %  ×  63-day return   (≈ 3 months)
       25 %  × 126-day return   (≈ 6 months)  — persistence filter
+
+Quality Filter
+==============
+  When indicator data from the bottom-up pipeline is available,
+  each candidate stock is also evaluated on six technical
+  dimensions (MA structure, RSI zone, volume profile, MACD
+  state, ADX trend strength, volatility regime).
+
+  Candidates must pass a hard quality gate (price > 50 SMA,
+  EMA > SMA, RSI 30-75, ADX ≥ 18) before being ranked.
+
+  The final stock rank is a blend of normalised RS (60 %)
+  and quality score (40 %).  Weights are configurable via
+  RotationConfig.quality.
+
+  When indicator data is unavailable, the engine falls back
+  to RS-only ranking (original behaviour).
 
 Sell Rules (in priority order)
 ==============================
@@ -37,6 +56,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
+from typing import Optional
 
 import pandas as pd
 
@@ -45,6 +65,14 @@ from common.sector_map import (
     get_sector,
     get_sector_or_class,
     get_us_tickers_for_sector,
+)
+from strategy.rotation_filters import (
+    QualityConfig,
+    GateResult,
+    quality_gate,
+    quality_score,
+    blend_rs_quality,
+    quality_diagnostics,
 )
 
 log = logging.getLogger(__name__)
@@ -77,6 +105,9 @@ class RotationConfig:
     stocks_per_sector: int = 3
     min_rs_score: float = 0.0       # floor RS to be BUY-eligible
     prefer_positive_rs_vs_sector: bool = True   # must also beat sector ETF
+
+    # ── Technical quality filter ───────────────────────────────
+    quality: QualityConfig = field(default_factory=QualityConfig)
 
     # ── Sell thresholds ────────────────────────────────────────
     sell_if_sector_not_leading: bool = True
@@ -128,10 +159,18 @@ class Recommendation:
     rs_vs_sector_etf: float    # ticker RS vs its own sector ETF
     reason: str
 
+    # ── Quality filter results ─────────────────────────────────
+    quality_score: float = 0.0              # 0–1 quality from filters
+    quality_gate_passed: bool = True        # did the hard gate pass?
+    quality_gates: dict[str, bool] = field(default_factory=dict)
+    blended_score: float = 0.0              # final RS+quality blend
+
     def __repr__(self) -> str:
+        q_str = f"  Q {self.quality_score:.2f}" if self.quality_score > 0 else ""
         return (f"  {self.action.value:6s}  {self.ticker:8s}  │  "
                 f"{self.sector:24s} (rank {self.sector_rank:2d}, {self.sector_tier:8s})  │  "
-                f"RS {self.rs_composite:+.4f}  vs-sector {self.rs_vs_sector_etf:+.4f}  │  "
+                f"RS {self.rs_composite:+.4f}  vs-sector {self.rs_vs_sector_etf:+.4f}"
+                f"{q_str}  │  "
                 f"{self.reason}")
 
 
@@ -167,6 +206,40 @@ class RotationResult:
     @property
     def holds(self) -> list[Recommendation]:
         return [r for r in self.recommendations if r.action == Action.HOLD]
+
+    @property
+    def quality_stats(self) -> dict:
+        """
+        Aggregate quality statistics across all recommendations.
+
+        Returns a dict suitable for summary printing and JSON export.
+        ``enabled`` is False when no recommendation carries a non-zero
+        quality score (i.e. the quality filter was not active).
+        """
+        scored = [r for r in self.recommendations if r.quality_score > 0]
+        if not scored:
+            return {"enabled": False}
+
+        scores = [r.quality_score for r in scored]
+        gate_passed = sum(1 for r in scored if r.quality_gate_passed)
+        buy_scores = [r.quality_score for r in scored if r.action == Action.BUY]
+
+        stats: dict = {
+            "enabled": True,
+            "n_scored": len(scored),
+            "n_gate_passed": gate_passed,
+            "n_gate_failed": len(scored) - gate_passed,
+            "avg_quality": round(sum(scores) / len(scores), 3),
+            "min_quality": round(min(scores), 3),
+            "max_quality": round(max(scores), 3),
+        }
+
+        if buy_scores:
+            stats["avg_buy_quality"] = round(
+                sum(buy_scores) / len(buy_scores), 3
+            )
+
+        return stats
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -292,14 +365,32 @@ def _pick_stocks(
     prices: pd.DataFrame,
     config: RotationConfig,
     rs_all: pd.Series,
+    indicator_data: dict[str, pd.DataFrame] | None = None,
 ) -> list[Recommendation]:
     """
-    For each leading sector, rank US single names by RS and return
-    the top N as BUY recommendations.
+    For each leading sector, rank US single names by a blend of
+    RS and technical quality, and return the top N as BUY
+    recommendations.
 
-    Falls back to the sector ETF itself when no single names have data.
+    When ``indicator_data`` is provided and ``config.quality.enabled``
+    is True, each candidate must pass the quality gate (SMA, EMA,
+    RSI, ADX checks) and the final ranking uses a weighted blend
+    of normalised RS (default 60 %) and quality score (default 40 %).
+
+    When indicator data is unavailable or quality is disabled,
+    ranking falls back to raw RS (original behaviour).
+
+    Falls back to the sector ETF itself when no single names pass
+    both RS and quality filters.
     """
     buys: list[Recommendation] = []
+    qcfg = config.quality
+
+    use_quality = (
+        qcfg.enabled
+        and indicator_data is not None
+        and len(indicator_data) > 0
+    )
 
     for ss in leading:
         sector = ss.sector
@@ -310,55 +401,100 @@ def _pick_stocks(
         available = [t for t in candidates if t in prices.columns]
 
         if not available:
-            # fallback → buy the sector ETF
             log.info("No single-name data for %s — falling back to %s", sector, etf)
-            buys.append(Recommendation(
-                ticker=etf,
-                action=Action.BUY,
-                sector=sector,
-                sector_rank=ss.rank,
-                sector_tier=ss.tier,
-                rs_composite=rs_all.get(etf, 0.0),
-                rs_vs_sector_etf=0.0,
+            buys.append(_etf_fallback(
+                etf, sector, ss, rs_all,
                 reason=f"Sector ETF fallback (no single-name data for {sector})",
             ))
             continue
 
-        # score each candidate
-        scored: list[tuple[str, float, float]] = []
+        # ── Score each candidate ──────────────────────────
+        scored: list[tuple] = []
+        #   (ticker, sort_key, rs, rs_vs_etf, q_score, gate_passed, gates)
+
+        gate_failures: list[str] = []
+
         for t in available:
             rs = rs_all.get(t, 0.0)
             rs_vs_etf = _rs_vs(prices, t, etf, config)
 
-            # eligibility gates
+            # ── RS eligibility (unchanged) ────────────────
             if rs < config.min_rs_score:
                 continue
             if config.prefer_positive_rs_vs_sector and rs_vs_etf < 0:
                 continue
 
-            scored.append((t, rs, rs_vs_etf))
+            # ── Quality filter ────────────────────────────
+            if use_quality:
+                idf = indicator_data.get(t)
 
-        # sort by composite RS descending
+                if idf is not None and not idf.empty:
+                    gate = quality_gate(idf, qcfg)
+                    q_score = quality_score(idf, qcfg)
+
+                    if qcfg.gate_required and not gate.passed:
+                        gate_failures.append(t)
+                        log.debug(
+                            "  %s: failed quality gate — %s",
+                            t, gate.failed_gates,
+                        )
+                        continue
+
+                    blended = blend_rs_quality(rs, q_score, qcfg)
+                    scored.append((
+                        t, blended, rs, rs_vs_etf,
+                        q_score, gate.passed, gate.gates,
+                    ))
+                else:
+                    # No indicator data for this ticker —
+                    # include with neutral quality
+                    scored.append((
+                        t, blend_rs_quality(rs, 0.5, qcfg),
+                        rs, rs_vs_etf, 0.5, True, {},
+                    ))
+            else:
+                # Quality disabled — rank by raw RS
+                scored.append((
+                    t, rs, rs, rs_vs_etf,
+                    0.0, True, {},
+                ))
+
+        if gate_failures:
+            log.info(
+                "  %s: %d/%d candidates failed quality gate: %s",
+                sector, len(gate_failures),
+                len(gate_failures) + len(scored),
+                gate_failures[:5],
+            )
+
+        # Sort by blended score (or RS) descending
         scored.sort(key=lambda x: x[1], reverse=True)
-
         picks = scored[: config.stocks_per_sector]
 
         if not picks:
-            # all candidates below threshold → fall back to ETF
-            log.info("All candidates in %s below RS threshold — using %s", sector, etf)
-            buys.append(Recommendation(
-                ticker=etf,
-                action=Action.BUY,
-                sector=sector,
-                sector_rank=ss.rank,
-                sector_tier=ss.tier,
-                rs_composite=rs_all.get(etf, 0.0),
-                rs_vs_sector_etf=0.0,
-                reason=f"Sector ETF fallback (no candidates above RS threshold)",
+            # All candidates filtered out → fall back to ETF
+            reason = (
+                "Sector ETF fallback (no candidates passed"
+                f" RS + quality filters)"
+                if use_quality
+                else "Sector ETF fallback (no candidates above RS threshold)"
+            )
+            log.info(
+                "All candidates in %s filtered out — using %s",
+                sector, etf,
+            )
+            buys.append(_etf_fallback(
+                etf, sector, ss, rs_all, reason=reason,
             ))
             continue
 
-        for ticker, rs, rs_vs_etf in picks:
+        for (ticker, sort_key, rs, rs_vs_etf,
+             q_score, gate_passed, gates) in picks:
+
+            quality_note = ""
+            if use_quality and q_score > 0:
+                quality_note = f", quality {q_score:.2f}"
+
             buys.append(Recommendation(
                 ticker=ticker,
                 action=Action.BUY,
@@ -367,10 +503,37 @@ def _pick_stocks(
                 sector_tier=ss.tier,
                 rs_composite=rs,
                 rs_vs_sector_etf=rs_vs_etf,
-                reason=f"Top RS in leading sector {sector} (rank {ss.rank})",
+                reason=(
+                    f"Top ranked in leading sector {sector} "
+                    f"(rank {ss.rank}){quality_note}"
+                ),
+                quality_score=q_score,
+                quality_gate_passed=gate_passed,
+                quality_gates=gates,
+                blended_score=sort_key,
             ))
 
     return buys
+
+
+def _etf_fallback(
+    etf: str,
+    sector: str,
+    ss: SectorScore,
+    rs_all: pd.Series,
+    reason: str,
+) -> Recommendation:
+    """Build a Recommendation for the sector ETF as fallback."""
+    return Recommendation(
+        ticker=etf,
+        action=Action.BUY,
+        sector=sector,
+        sector_rank=ss.rank,
+        sector_tier=ss.tier,
+        rs_composite=rs_all.get(etf, 0.0),
+        rs_vs_sector_etf=0.0,
+        reason=reason,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -383,6 +546,7 @@ def _evaluate_holdings(
     prices: pd.DataFrame,
     config: RotationConfig,
     rs_all: pd.Series,
+    indicator_data: dict[str, pd.DataFrame] | None = None,
 ) -> list[Recommendation]:
     """
     Walk every current holding through the sell-rule waterfall.
@@ -393,10 +557,20 @@ def _evaluate_holdings(
     2.  Sector → Neutral         → REDUCE
     3.  Individual RS too weak   → SELL
     4.  Otherwise                → HOLD
+
+    Quality diagnostics are attached to every Recommendation for
+    reporting, but quality does NOT currently trigger sells.  That
+    can be added as a follow-up rule (e.g. quality collapse while
+    sector is only Neutral → SELL instead of REDUCE).
     """
     tier_map = {s.sector: s.tier for s in sector_scores}
     rank_map = {s.sector: s.rank for s in sector_scores}
     leading_set = {s.sector for s in sector_scores if s.tier == "Leading"}
+
+    use_quality = (
+        config.quality.enabled
+        and indicator_data is not None
+    )
 
     recs: list[Recommendation] = []
 
@@ -404,13 +578,34 @@ def _evaluate_holdings(
         sector = get_sector(ticker)
         label = get_sector_or_class(ticker)
 
-        sector_etf = SECTOR_ETFS.get(sector, config.benchmark) if sector else config.benchmark
+        sector_etf = (
+            SECTOR_ETFS.get(sector, config.benchmark)
+            if sector else config.benchmark
+        )
         rs = rs_all.get(ticker, 0.0)
         rs_vs_etf = _rs_vs(prices, ticker, sector_etf, config)
         s_rank = rank_map.get(sector, 99) if sector else 99
         s_tier = tier_map.get(sector, "n/a") if sector else "n/a"
 
-        # ── Rule 1 & 2: sector drift ──────────────────────────
+        # ── Quality diagnostics (informational) ───────────
+        q_score = 0.0
+        q_passed = True
+        q_gates: dict[str, bool] = {}
+
+        if use_quality:
+            idf = indicator_data.get(ticker)
+            if idf is not None and not idf.empty:
+                gate = quality_gate(idf, config.quality)
+                q_score = quality_score(idf, config.quality)
+                q_passed = gate.passed
+                q_gates = gate.gates
+
+        blended = (
+            blend_rs_quality(rs, q_score, config.quality)
+            if use_quality else rs
+        )
+
+        # ── Rule 1 & 2: sector drift ──────────────────────
         if config.sell_if_sector_not_leading and sector and sector not in leading_set:
             if s_tier == "Lagging":
                 recs.append(Recommendation(
@@ -418,6 +613,10 @@ def _evaluate_holdings(
                     sector=label, sector_rank=s_rank, sector_tier=s_tier,
                     rs_composite=rs, rs_vs_sector_etf=rs_vs_etf,
                     reason=f"Sector {sector} is Lagging (rank {s_rank}/11)",
+                    quality_score=q_score,
+                    quality_gate_passed=q_passed,
+                    quality_gates=q_gates,
+                    blended_score=blended,
                 ))
             else:
                 recs.append(Recommendation(
@@ -425,10 +624,14 @@ def _evaluate_holdings(
                     sector=label, sector_rank=s_rank, sector_tier=s_tier,
                     rs_composite=rs, rs_vs_sector_etf=rs_vs_etf,
                     reason=f"Sector {sector} drifted to Neutral (rank {s_rank}/11)",
+                    quality_score=q_score,
+                    quality_gate_passed=q_passed,
+                    quality_gates=q_gates,
+                    blended_score=blended,
                 ))
             continue
 
-        # ── Rule 3: individual RS collapse ─────────────────────
+        # ── Rule 3: individual RS collapse ─────────────────
         if rs < config.sell_individual_rs_below:
             recs.append(Recommendation(
                 ticker=ticker, action=Action.SELL,
@@ -436,15 +639,23 @@ def _evaluate_holdings(
                 rs_composite=rs, rs_vs_sector_etf=rs_vs_etf,
                 reason=(f"Individual RS {rs:+.3f} below floor "
                         f"({config.sell_individual_rs_below:+.3f})"),
+                quality_score=q_score,
+                quality_gate_passed=q_passed,
+                quality_gates=q_gates,
+                blended_score=blended,
             ))
             continue
 
-        # ── Rule 4: everything fine ────────────────────────────
+        # ── Rule 4: everything fine ────────────────────────
         recs.append(Recommendation(
             ticker=ticker, action=Action.HOLD,
             sector=label, sector_rank=s_rank, sector_tier=s_tier,
             rs_composite=rs, rs_vs_sector_etf=rs_vs_etf,
             reason=f"Sector {sector} still Leading (rank {s_rank}), RS OK",
+            quality_score=q_score,
+            quality_gate_passed=q_passed,
+            quality_gates=q_gates,
+            blended_score=blended,
         ))
 
     return recs
@@ -458,6 +669,7 @@ def run_rotation(
     prices: pd.DataFrame,
     current_holdings: list[str] | None = None,
     config: RotationConfig | None = None,
+    indicator_data: dict[str, pd.DataFrame] | None = None,
 ) -> RotationResult:
     """
     Run the full Smart Money Rotation.
@@ -477,12 +689,33 @@ def run_rotation(
     config : RotationConfig or None
         Override any defaults.  None → use RotationConfig().
 
+    indicator_data : dict[str, pd.DataFrame] or None
+        ``{ticker: DataFrame}`` where each DataFrame is the output
+        of ``compute_all_indicators()`` (and optionally
+        ``compute_all_rs()`` / ``compute_composite_score()``).
+
+        When provided and ``config.quality.enabled`` is True, the
+        quality filter enhances stock selection within leading
+        sectors by:
+          1. Gating on SMA/EMA trend structure, RSI, and ADX
+          2. Scoring MA positioning, momentum, volume, MACD,
+             directional strength, and volatility
+          3. Blending normalised RS with the quality score
+
+        When None, the engine uses RS-only ranking (original
+        behaviour — fully backward compatible).
+
+        The orchestrator provides this by passing
+        ``{ticker: result.df for ticker, result in ticker_results.items()
+           if result.ok}`` from the bottom-up pipeline.
+
     Returns
     -------
     RotationResult
         .sector_rankings  — ordered list of SectorScore
         .recommendations  — ordered list of Recommendation
         .buys / .sells / .reduces / .holds — convenience accessors
+        .quality_stats    — aggregate quality metrics (dict)
     """
     if config is None:
         config = RotationConfig()
@@ -500,8 +733,16 @@ def run_rotation(
              if hasattr(prices.index[-1], "date")
              else prices.index[-1])
 
-    log.info("Rotation as-of %s  |  %d days × %d tickers",
-             as_of, prices.shape[0], prices.shape[1])
+    n_indicators = len(indicator_data) if indicator_data else 0
+    quality_status = (
+        f"quality ON ({n_indicators} tickers)"
+        if config.quality.enabled and n_indicators > 0
+        else "quality OFF (RS only)"
+    )
+    log.info(
+        "Rotation as-of %s  |  %d days × %d tickers  |  %s",
+        as_of, prices.shape[0], prices.shape[1], quality_status,
+    )
 
     # ── Step 1: rank sectors ───────────────────────────────────
     sector_rankings = _rank_sectors(prices, config)
@@ -514,7 +755,9 @@ def run_rotation(
     rs_all, _ = composite_rs_all(prices, config)
 
     # ── Step 2: pick stocks in leading sectors ─────────────────
-    raw_buys = _pick_stocks(leading, prices, config, rs_all)
+    raw_buys = _pick_stocks(
+        leading, prices, config, rs_all, indicator_data,
+    )
 
     # Remove tickers already held (they'll appear as HOLD instead)
     held_set = set(current_holdings)
@@ -527,6 +770,7 @@ def run_rotation(
         prices=prices,
         config=config,
         rs_all=rs_all,
+        indicator_data=indicator_data,
     )
 
     # ── Step 4: enforce max-position cap ───────────────────────
@@ -613,9 +857,18 @@ def load_price_matrix(
 def print_result(result: RotationResult) -> None:
     """Pretty-print the full rotation output to stdout."""
 
-    w = 72
+    w = 80
+    q_stats = result.quality_stats
+    has_quality = q_stats.get("enabled", False)
+
     print(f"\n{'═' * w}")
     print(f"  SMART MONEY ROTATION  —  {result.as_of_date}")
+    if has_quality:
+        qcfg = result.config.quality
+        print(f"  Quality filter: ON  "
+              f"(RS {qcfg.w_rs:.0%} / Quality {qcfg.w_quality:.0%})")
+    else:
+        print(f"  Quality filter: OFF  (RS-only ranking)")
     print(f"{'═' * w}")
 
     # ── Sector Rankings ────────────────────────────────────────
@@ -634,29 +887,28 @@ def print_result(result: RotationResult) -> None:
         print(f"\n  🔴 SELL  ({len(result.sells)})")
         print(f"  {'─' * (w - 4)}")
         for r in result.sells:
-            print(f"    {r.ticker:8s}  RS {r.rs_composite:+.4f}  │  {r.reason}")
+            _print_rec(r, has_quality)
 
     # ── Reduce ─────────────────────────────────────────────────
     if result.reduces:
         print(f"\n  🟡 REDUCE  ({len(result.reduces)})")
         print(f"  {'─' * (w - 4)}")
         for r in result.reduces:
-            print(f"    {r.ticker:8s}  RS {r.rs_composite:+.4f}  │  {r.reason}")
+            _print_rec(r, has_quality)
 
     # ── Buy ────────────────────────────────────────────────────
     if result.buys:
         print(f"\n  🟢 BUY  ({len(result.buys)})")
         print(f"  {'─' * (w - 4)}")
         for r in result.buys:
-            print(f"    {r.ticker:8s}  RS {r.rs_composite:+.4f}  "
-                  f"vs-sector {r.rs_vs_sector_etf:+.4f}  │  {r.reason}")
+            _print_rec(r, has_quality)
 
     # ── Hold ───────────────────────────────────────────────────
     if result.holds:
         print(f"\n  ⚪ HOLD  ({len(result.holds)})")
         print(f"  {'─' * (w - 4)}")
         for r in result.holds:
-            print(f"    {r.ticker:8s}  RS {r.rs_composite:+.4f}  │  {r.reason}")
+            _print_rec(r, has_quality)
 
     # ── Summary ────────────────────────────────────────────────
     print(f"\n  {'─' * (w - 4)}")
@@ -666,7 +918,38 @@ def print_result(result: RotationResult) -> None:
           f"({total} total)")
     print(f"  Leading sectors : {', '.join(result.leading_sectors)}")
     print(f"  Lagging sectors : {', '.join(result.lagging_sectors)}")
+
+    if has_quality:
+        print(f"  Quality scored  : {q_stats['n_scored']} tickers  "
+              f"(gate pass {q_stats['n_gate_passed']}, "
+              f"fail {q_stats['n_gate_failed']})")
+        print(f"  Quality range   : {q_stats['min_quality']:.2f} – "
+              f"{q_stats['max_quality']:.2f}  "
+              f"(avg {q_stats['avg_quality']:.2f})")
+        if "avg_buy_quality" in q_stats:
+            print(f"  Avg BUY quality : {q_stats['avg_buy_quality']:.2f}")
+
     print(f"{'═' * w}\n")
+
+
+def _print_rec(r: Recommendation, show_quality: bool) -> None:
+    """Print a single Recommendation line."""
+    line = f"    {r.ticker:8s}  RS {r.rs_composite:+.4f}"
+
+    if show_quality and r.quality_score > 0:
+        gate_icon = "✓" if r.quality_gate_passed else "✗"
+        line += (
+            f"  Q={r.quality_score:.2f}[{gate_icon}]"
+            f"  blend={r.blended_score:.3f}"
+        )
+        # Show failed gates inline if any
+        if not r.quality_gate_passed and r.quality_gates:
+            failed = [k for k, v in r.quality_gates.items() if not v]
+            if failed:
+                line += f"  ⚠{','.join(failed)}"
+
+    line += f"  │  {r.reason}"
+    print(line)
 
 
 # ═══════════════════════════════════════════════════════════════
