@@ -62,6 +62,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from common.config import MARKET_CONFIG
@@ -555,6 +556,109 @@ def enrich_snapshots(
         snap["rotation_reason"]      = cs.rotation_reason
 
     return snapshots
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ENRICH SCORED UNIVERSE — convergence → DataFrames
+# ═══════════════════════════════════════════════════════════════
+
+def enrich_scored_universe(
+    scored_universe: dict[str, pd.DataFrame],
+    convergence: MarketSignalResult,
+) -> dict[str, pd.DataFrame]:
+    """
+    Write convergence adjustments back into the per-ticker
+    scored DataFrames so that downstream consumers (portfolio
+    builder, rankings) see convergence-modified scores.
+
+    The convergence delta (boost or penalty) is extracted as
+    ``adjusted_score − composite_score`` and *added* to the
+    existing ``score_adjusted`` on the last row of each
+    DataFrame.  This preserves the sector tailwind that was
+    already applied by ``merge_sector_context()``.
+
+    Score path after this function:
+
+        score_composite                        (5-pillar raw)
+          + sector_tailwind                    (sector_rs.py)
+          + convergence_delta                  (this function)
+          ─────────────────
+        = score_adjusted                       (final score)
+
+    ``build_portfolio()`` → ``_get_score()`` reads
+    ``score_adjusted`` first, so convergence now influences
+    candidate ranking, position selection, and weight allocation.
+
+    Also writes ``convergence_label`` so portfolio diagnostics
+    and reports can reference it from the DataFrame.
+
+    Modifies DataFrames **in-place** and returns the same dict.
+
+    Parameters
+    ----------
+    scored_universe : dict[str, pd.DataFrame]
+        {ticker: scored DataFrame} — output of the per-ticker
+        pipeline (Phase 2).
+    convergence : MarketSignalResult
+        Output of ``run_convergence()`` (Phase 2.75).
+
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        Same reference, modified in-place.
+    """
+    sig_map = {s.ticker: s for s in convergence.signals}
+
+    for ticker, df in scored_universe.items():
+        if df is None or df.empty:
+            continue
+
+        cs = sig_map.get(ticker)
+        if cs is None:
+            # No convergence data — write neutral label only
+            df.loc[df.index[-1], "convergence_label"] = NEUTRAL
+            continue
+
+        # ── Convergence delta ─────────────────────────────────
+        # adjusted_score − composite_score isolates the boost
+        # (+0.10) or penalty (−0.05) from the convergence layer,
+        # independent of what base score was used in the snapshot.
+        delta = cs.adjusted_score - cs.composite_score
+
+        last_idx = df.index[-1]
+
+        # ── Apply delta to existing score_adjusted ────────────
+        # score_adjusted already contains sector tailwind from
+        # merge_sector_context().  Adding delta preserves that
+        # and layers convergence on top.
+        if "score_adjusted" in df.columns:
+            existing = df.loc[last_idx, "score_adjusted"]
+            if pd.notna(existing):
+                new_val = float(existing) + delta
+                df.loc[last_idx, "score_adjusted"] = max(
+                    0.0, min(1.0, new_val)
+                )
+            elif "score_composite" in df.columns:
+                # score_adjusted is NaN — fall back to composite
+                comp = df.loc[last_idx, "score_composite"]
+                if pd.notna(comp):
+                    df.loc[last_idx, "score_adjusted"] = max(
+                        0.0, min(1.0, float(comp) + delta)
+                    )
+        elif "score_composite" in df.columns:
+            # No score_adjusted column at all — create it from
+            # composite so the delta has somewhere to land
+            df["score_adjusted"] = df["score_composite"].copy()
+            comp = df.loc[last_idx, "score_composite"]
+            if pd.notna(comp):
+                df.loc[last_idx, "score_adjusted"] = max(
+                    0.0, min(1.0, float(comp) + delta)
+                )
+
+        # ── Write convergence metadata ────────────────────────
+        df.loc[last_idx, "convergence_label"] = cs.convergence_label
+
+    return scored_universe
 
 
 # ═══════════════════════════════════════════════════════════════

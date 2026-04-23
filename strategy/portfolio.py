@@ -115,14 +115,21 @@ def _breadth_exposure_multiplier(
 # ═══════════════════════════════════════════════════════════════
 
 _SNAPSHOT_COLS = [
+    # ── Scores ────────────────────────────────────────────────
     "score_adjusted", "score_composite",
-    "score_momentum", "score_trend", "score_volume", "score_volatility",
+    "score_rotation", "score_momentum", "score_volatility",
+    "score_microstructure", "score_breadth",
+    "score_percentile", "convergence_label",
+    # ── Per-ticker signal gates ───────────────────────────────
     "sig_confirmed", "sig_position_pct", "sig_reason",
     "sig_regime_ok", "sig_sector_ok", "sig_breadth_ok", "sig_momentum_ok",
     "sig_in_cooldown", "sig_effective_entry_min",
+    # ── Relative strength ─────────────────────────────────────
     "rs_regime", "rs_zscore",
+    # ── Sector context ────────────────────────────────────────
     "sect_rs_regime", "sect_rs_rank", "sect_rs_pctrank",
     "sector_name", "sector_tailwind",
+    # ── Breadth context ───────────────────────────────────────
     "breadth_regime", "breadth_score",
 ]
 

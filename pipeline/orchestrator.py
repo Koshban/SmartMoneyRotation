@@ -68,10 +68,12 @@ import numpy as np
 import pandas as pd
 
 # ── Convergence ───────────────────────────────────────────────
+# ── Convergence ───────────────────────────────────────────────
 from strategy.convergence import (
     run_convergence,
     build_price_matrix,
     enrich_snapshots,
+    enrich_scored_universe,          # ← NEW
     convergence_report,
     MarketSignalResult,
 )
@@ -667,6 +669,11 @@ class Orchestrator:
         Updates ``self._snapshots`` with convergence labels and
         adjusted scores so downstream phases (rankings, portfolio,
         reports) benefit from the convergence intelligence.
+
+        Also writes convergence adjustments back into
+        ``self._scored_universe`` DataFrames so that
+        ``build_portfolio()`` and ``compute_all_rankings()``
+        see convergence-modified ``score_adjusted`` values.
         """
         self._require_phase("run_tickers")
         t0 = time.perf_counter()
@@ -680,13 +687,21 @@ class Orchestrator:
         # Enrich snapshots in-place with convergence data
         enrich_snapshots(self._snapshots, self._convergence_result)
 
+        # Write convergence adjustments back into scored
+        # DataFrames so portfolio builder and rankings see
+        # the convergence-modified score_adjusted values.
+        enrich_scored_universe(
+            self._scored_universe, self._convergence_result
+        )
+
         n_strong = len(self._convergence_result.strong_buys)
         n_conflict = len(self._convergence_result.conflicts)
         logger.info(
             f"Phase 2.75: Convergence applied — "
             f"{self._convergence_result.n_tickers} tickers, "
             f"{n_strong} STRONG_BUY, "
-            f"{n_conflict} CONFLICT"
+            f"{n_conflict} CONFLICT  "
+            f"(scores written back to scored_universe)"
         )
 
         elapsed = time.perf_counter() - t0

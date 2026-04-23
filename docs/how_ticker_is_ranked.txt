@@ -1,0 +1,81 @@
+
+## The Composite Score: Five Pillars (scoring.py)
+
+The `score_composite` that drives everything is a weighted average of five pillar scores, each on a [0, 1] scale. The pillar weights come from `SCORING_WEIGHTS` in your 
+config (I don't have the actual numbers, but the structure is explicit). When breadth data is unavailable, the four remaining pillar weights are renormalized to sum to 1.0.
+
+**Pillar 1 — Rotation** (`score_rotation`): "Is smart money rotating in?" Built from four sub-components, each with its own sub-weight from config: the RS z-score 
+(sigmoid-mapped, so z=+2 → 0.88), the RS regime label (leading=1.0, improving=0.75, weakening=0.25, lagging=0.0), RS momentum (acceleration of the rotation, sigmoid-scaled), 
+and RS volume confirmation (binary — is above-average volume backing the RS improvement?).
+
+**Pillar 2 — Momentum** (`score_momentum`): "Is price action confirming?" Three sub-components: RSI via a piecewise-linear curve peaking in the 40–70 sweet spot 
+(trending, not overbought), MACD histogram as a rolling percentile rank (top of its own history = strong bullish momentum), and ADX via a piecewise ramp where >25 scores 
+highest (confirmed trend).
+
+**Pillar 3 — Volatility** (`score_volatility`): "Is risk/reward favorable?" Three sub-components, all using rolling percentile ranks: realized volatility through a tent 
+function (moderate = best, extremes = bad), ATR as a percentage of price through the same tent logic, and Amihud illiquidity inverted (more liquid = higher score, because
+ liquid names get capital first).
+
+**Pillar 4 — Microstructure** (`score_microstructure`): "Is institutional volume backing the move?" Three sub-components: OBV slope (rolling percentile rank — 
+rising OBV = accumulation), A/D line slope (same approach, but weighted by intra-bar position so more granular than OBV), and relative volume via a piecewise curve 
+peaking at 1.5–2.5× average (institutional interest range).
+
+**Pillar 5 — Breadth** (`score_breadth`): "Is the broad market confirming?" This is unique — it's the same value for every ticker on a given day. The universe-level 
+breadth score (itself a composite of advance ratio, % above 50d/200d SMA, hi-lo ratio, and McClellan oscillator) is rescaled from 0–100 to 0–1. When breadth is strong, 
+every stock gets a lift; when breadth deteriorates, all scores are dampened.
+
+The final formula: `score_composite = Σ (pillar_weight × pillar_score)`, clipped to [0, 1].
+
+---
+
+## The Sector Tailwind Adjustment (sector_rs.py)
+
+After the composite is computed, `merge_sector_context()` creates `score_adjusted = score_composite + sector_tailwind`, clipped to [0, 1]. The tailwind is a linear
+function of the sector's percentile rank among all 11 GICS sectors: rank 1.0 (strongest) gets `max_boost`, rank 0.0 (weakest) gets `max_penalty`, rank 0.5 gets zero 
+adjustment. This means a stock in a leading sector gets a score bump, while an identical stock in a lagging sector gets penalized — the sector tide matters.
+
+---
+
+## The Binary Filter Layer (signals.py)
+
+Before any ranking happens, every ticker must survive all seven hard gates simultaneously. If any single gate fails, `sig_confirmed = 0` and the ticker is eliminated from 
+candidacy:
+
+Gate 1: RS regime ∈ allowed set (leading/improving). Gate 1b: RSI between 30 and 70. Gate 2: Sector regime ∈ allowed set. Gate 3: Breadth regime not weak. Gate 4: Momentum 
+streak ≥ N consecutive days with score > 0.50. Gate 5: Not in cooldown after a recent exit. Gate 6: score_adjusted ≥ entry_score_min (breadth-adjusted threshold).
+
+This is pure pass/fail — no ranking contribution. But it's critically important because it defines the candidate pool that reaches the ranker.
+
+---
+
+## The Ranking and Selection (portfolio.py)
+
+`build_portfolio()` processes only tickers with `sig_confirmed == 1`:
+
+**Step 1 — Score extraction**: `_get_score()` prefers `score_adjusted` (composite + sector tailwind) over `score_composite` as the ranking axis.
+
+**Step 2 — Incumbent bonus**: If a ticker is already held, `incumbent_bonus` (from `PORTFOLIO_PARAMS`) is added to its score, creating `ranking_score = score + bonus`. This 
+prevents churn from tickers hovering near the same score threshold.
+
+**Step 3 — Sort**: Candidates are sorted by `ranking_score` descending. Rank 1 = highest.
+
+**Step 4 — Constrained selection**: The sorted list is walked top to bottom. Each candidate is accepted unless `max_positions` has been reached or the candidate's sector has
+ consumed its `max_sector_pct` allocation. Blocked candidates are logged with reasons.
+
+**Step 5 — Weight normalization**: Accepted positions get their raw weight (from `sig_position_pct`, which scales linearly with the score from 0.60→1.0, further scaled down 
+by the breadth exposure multiplier in neutral/weak markets) normalized through the waterfill algorithm to hit `target_invested_pct`. Each weight is clamped between
+ `min_single_pct` and `max_single_pct`, and sector caps are enforced a second time after rescaling.
+
+---
+
+## Where Convergence Actually Lands
+
+This is where my earlier answer had an imprecision. The convergence layer (`convergence.py`) runs in Phase 2.75 and enriches `self._snapshots` (the list of dicts) with 
+convergence labels and adjusted scores. However, `build_portfolio()` is called in Phase 3 with `self._scored_universe` (the dict of DataFrames), 
+which does **not** contain convergence adjustments. So the convergence boost (+0.10 for STRONG_BUY) and conflict penalty (−0.05) affect the **report output and display 
+ranking** but do **not** affect the actual portfolio position selection and weight allocation. The portfolio ranker sees 
+`score_adjusted = score_composite + sector_tailwind`, not the convergence-modified number.
+
+This may be intentional (convergence is advisory, the portfolio builder relies on the raw quality signal), or it may be a gap worth closing. If you want convergence to 
+influence position selection, you'd need to either write `adjusted_score` back into the scored DataFrames before Phase 3, or have `build_portfolio` read from the enriched 
+snapshots.

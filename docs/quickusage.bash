@@ -56,6 +56,9 @@ python -m scripts.run_market -m US --days 365 --holdings NVDA,CRWD,PANW --open
 # HK report
 python -m scripts.run_market -m HK --days 180 --open
 
+# Over Exhausted Sell
+python run_bounce_scan.py --market US
+
 #So which should you use?
 # If you want quick terminal output with flexibility over which analysis mode to run, use run_strategy.py. 
 # If you want a polished HTML report you can save, share, or open in a browser, use run_market.py. 

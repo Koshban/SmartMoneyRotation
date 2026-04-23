@@ -67,6 +67,7 @@ smartmoneyrotation/
 └──scripts/
     └──  run_market.py
     └──  run_strategy.py
+    └──  run_bounce_scan.py
 └── src/
     └──db.py
 	└── __init__.py

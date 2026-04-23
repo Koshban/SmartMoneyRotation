@@ -5,7 +5,7 @@
   "type": "pipeline",
   "n_tickers": 42,
   "n_errors": 0,
-  "total_time": 28.35,
+  "total_time": 23.5,
   "top_30": [
     {
       "ticker": "0992.HK",
