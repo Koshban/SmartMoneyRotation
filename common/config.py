@@ -33,10 +33,16 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 # The orchestrator imports this as the default ticker list.
 # Override at runtime via Orchestrator(universe=[...]).
-# ETF_UNIVERSE is the core rotation engine's scoreable set.
-# Single names and India/.HK tickers are additive — pass them
-# explicitly when data sources are configured for those markets.
-UNIVERSE = list(ETF_UNIVERSE)
+#
+# The base ETF_UNIVERSE (~68 ETFs) is expanded with US single
+# names from Tier 2 themes (~130 additional stocks) to give the
+# scoring and rotation engines a richer universe to rank.
+#
+# Requires data: python src/ingest_cash.py --market us --period 2y
+from common.universe import get_all_single_names as _get_singles
+_us_singles = [s for s in _get_singles()
+               if not s.endswith(".HK") and not s.endswith(".NS")]
+UNIVERSE = sorted(set(list(ETF_UNIVERSE) + _us_singles))
 
 # ═══════════════════════════════════════════════════════════════
 # 1.  PROJECT PATHS
@@ -430,6 +436,11 @@ SIGNAL_PARAMS = {
     "entry_percentile_min":   0.70,
     "entry_momentum_confirm": True,
 
+    # ── RSI hard gate (no BUY outside this range) ────────────
+    "rsi_entry_min":          30,
+    "rsi_entry_max":          70,
+
+    
     # ── Exit thresholds ──────────────────────────────────────
     "exit_score_below":       0.35,
     "exit_percentile_below":  0.25,

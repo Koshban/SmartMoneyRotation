@@ -1,0 +1,28 @@
+09:03:23 │ INFO     │ run_strategy           │ Strategy run: mode=full, market=HK
+09:03:23 │ INFO     │ run_strategy           │ Log file: C:\Users\kaush\OneDrive\Desktop\Code\smartmoneyrotation\logs\run_strategy_20260423_090323.log
+09:03:23 │ INFO     │ src.db.loader          │ Cached universe_ohlcv.parquet: 345,696 rows, 94 symbols
+09:03:28 │ INFO     │ src.db.loader          │ Loaded 43/43 tickers
+09:03:28 │ INFO     │ pipeline.orchestrator  │ Phase 0: Loaded 43 tickers from data source
+09:03:28 │ INFO     │ pipeline.orchestrator  │ Phase 0 complete: 43 tickers, benchmark=2800.HK (4508 bars), 5.3s
+09:03:28 │ INFO     │ pipeline.orchestrator  │ Phase 1: Breadth disabled — skipping
+09:03:28 │ INFO     │ pipeline.orchestrator  │ Phase 1: Sectors disabled — skipping
+09:03:28 │ INFO     │ pipeline.orchestrator  │ Phase 1 complete: 0.0s
+09:03:28 │ INFO     │ pipeline.runner        │   [1/43] 3988.HK...
+09:03:33 │ INFO     │ pipeline.runner        │   [10/43] 1810.HK...
+09:03:37 │ INFO     │ pipeline.runner        │   [20/43] 9888.HK...
+09:03:42 │ INFO     │ pipeline.runner        │   [30/43] 0002.HK...
+09:03:47 │ INFO     │ pipeline.runner        │   [40/43] 0700.HK...
+09:03:49 │ INFO     │ pipeline.runner        │   [43/43] 9626.HK...
+09:03:49 │ INFO     │ pipeline.runner        │ Batch complete: 42 succeeded, 0 errors, 1 skipped (of 43 total)
+09:03:49 │ INFO     │ pipeline.orchestrator  │ Phase 2 complete: 42 scored, 0 errors, 20.3s
+09:03:49 │ INFO     │ pipeline.orchestrator  │ Phase 2.5: Rotation not configured for HK — skipping
+09:03:49 │ INFO     │ strategy.convergence   │ [HK] Scoring only: 16 BUY, 0 SELL, 42 total
+09:03:49 │ INFO     │ strategy.convergence   │ [HK] 42 tickers  BUY_SCORING=16  HOLD=26
+09:03:49 │ INFO     │ pipeline.orchestrator  │ Phase 2.75: Convergence applied — 42 tickers, 0 STRONG_BUY, 0 CONFLICT
+09:03:49 │ INFO     │ pipeline.orchestrator  │ Phase 3a: Rankings computed — 130708 rows
+09:03:49 │ INFO     │ pipeline.orchestrator  │ Phase 3b: Portfolio built — 4 positions
+09:03:51 │ INFO     │ pipeline.orchestrator  │ Phase 3c: Signals generated — 130708 rows
+09:03:51 │ INFO     │ pipeline.orchestrator  │ Phase 3 complete: 2.7s
+09:03:51 │ INFO     │ pipeline.orchestrator  │ Phase 4: Recommendation report built
+09:03:51 │ INFO     │ pipeline.orchestrator  │ CASH Pipeline — 2026-04-23 — 42 tickers scored, 0 errors, top=0992.HK, lookback=0d, 28.3s
+09:03:51 │ INFO     │ run_strategy           │ Completed in 28.4s — log at C:\Users\kaush\OneDrive\Desktop\Code\smartmoneyrotation\logs\run_strategy_20260423_090323.log

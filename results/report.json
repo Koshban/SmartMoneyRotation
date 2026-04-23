@@ -1,0 +1,219 @@
+{
+  "mode": "full",
+  "run_date": "2026-04-22",
+  "markets": {
+    "US": {
+      "type": "pipeline",
+      "n_tickers": 67,
+      "n_errors": 0,
+      "total_time": 51.1,
+      "top_30": [
+        {
+          "ticker": "DRIV",
+          "composite_score": 0,
+          "signal": "HOLD",
+          "rs_score": 0
+        },
+        {
+          "ticker": "BLOK",
+          "composite_score": 0,
+          "signal": "BUY",
+          "rs_score": 0
+        },
+        {
+          "ticker": "QTUM",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "XLK",
+          "composite_score": 0,
+          "signal": "HOLD",
+          "rs_score": 0
+        },
+        {
+          "ticker": "ARKK",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "EWT",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "AIQ",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "MTUM",
+          "composite_score": 0,
+          "signal": "HOLD",
+          "rs_score": 0
+        },
+        {
+          "ticker": "ARKG",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "SMH",
+          "composite_score": 0,
+          "signal": "HOLD",
+          "rs_score": 0
+        },
+        {
+          "ticker": "QQQ",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "EWY",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "IWM",
+          "composite_score": 0,
+          "signal": "HOLD",
+          "rs_score": 0
+        },
+        {
+          "ticker": "LIT",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "SOXX",
+          "composite_score": 0,
+          "signal": "HOLD",
+          "rs_score": 0
+        },
+        {
+          "ticker": "URNM",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "FINX",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "VWO",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "EEM",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "XBI",
+          "composite_score": 0,
+          "signal": "HOLD",
+          "rs_score": 0
+        },
+        {
+          "ticker": "KWEB",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "XLRE",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "IGV",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "URA",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "EWG",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "MDY",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "XLY",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "SKYY",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "IBIT",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        },
+        {
+          "ticker": "BOTZ",
+          "composite_score": 0,
+          "signal": "NEUTRAL",
+          "rs_score": 0
+        }
+      ],
+      "rotation": {
+        "leading_sectors": [
+          "Technology",
+          "Energy",
+          "Materials"
+        ],
+        "lagging_sectors": [
+          "Utilities",
+          "Consumer Staples",
+          "Healthcare"
+        ],
+        "buys": [
+          "LIT",
+          "QTUM",
+          "XLE"
+        ],
+        "sells": []
+      },
+      "convergence": {
+        "strong_buys": [
+          "QTUM",
+          "LIT"
+        ],
+        "n_conflicts": 0
+      }
+    }
+  }
+}

@@ -369,7 +369,7 @@ python -m backtest.runner
 python -m backtest.runner --compare
 
 # Custom period
-python -m backtest.runner --start 2010-01-01 --end 2020-12-31
+python -m backtest.runner --start 2010-01-01 --end 2026-04-16
 
 Key metrics computed: CAGR, Sharpe ratio, Sortino ratio, Calmar ratio, maximum drawdown (depth and duration), win rate, profit factor, annual return breakdown, and total transaction costs.
 

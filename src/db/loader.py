@@ -44,6 +44,42 @@ _REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 # ── Module-level cache ────────────────────────────────────────
 _parquet_cache: dict[Path, pd.DataFrame] = {}
 
+# ── SQLAlchemy engine cache (one engine per unique PG_CONFIG) ─
+_sa_engine = None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SQLALCHEMY ENGINE HELPER
+# ═══════════════════════════════════════════════════════════════
+
+def _get_engine():
+    """
+    Build (and cache) a SQLAlchemy engine from PG_CONFIG.
+
+    Uses the ``postgresql+psycopg2`` dialect so psycopg2 stays
+    the underlying driver — the only change is that pandas
+    receives a proper SQLAlchemy connectable instead of a raw
+    DBAPI2 connection.
+    """
+    global _sa_engine
+    if _sa_engine is not None:
+        return _sa_engine
+
+    from sqlalchemy import create_engine
+    from common.credentials import PG_CONFIG
+
+    user = PG_CONFIG.get("user", "")
+    password = PG_CONFIG.get("password", "")
+    host = PG_CONFIG.get("host", "localhost")
+    port = PG_CONFIG.get("port", 5432)
+    dbname = PG_CONFIG.get("dbname", PG_CONFIG.get("database", ""))
+
+    url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+
+    _sa_engine = create_engine(url, pool_pre_ping=True)
+    logger.info("Created SQLAlchemy engine for PostgreSQL")
+    return _sa_engine
+
 
 # ═══════════════════════════════════════════════════════════════
 #  DAYS FILTER HELPER
@@ -324,44 +360,51 @@ def _load_from_db(
     days: int | None = None,
 ) -> pd.DataFrame:
     """
-    Load from PostgreSQL regional cash tables.
+    Load from PostgreSQL regional cash tables via SQLAlchemy.
+
+    Uses a module-level SQLAlchemy engine so pandas receives a
+    proper connectable — no more DBAPI2 UserWarning.
 
     When *days* is given the SQL WHERE clause restricts to
     ``date >= today - days`` so only the needed rows are
     transferred from the database.
     """
     try:
-        import psycopg2
-        from common.credentials import PG_CONFIG
+        from sqlalchemy import text
     except ImportError:
+        logger.debug("sqlalchemy not installed — skipping DB source")
         return pd.DataFrame()
 
     table = _ticker_to_cash_table(ticker)
 
     try:
-        conn = psycopg2.connect(**PG_CONFIG)
+        engine = _get_engine()
 
-        if days is not None:
-            cutoff = (datetime.now() - timedelta(days=days)).strftime(
-                "%Y-%m-%d"
-            )
-            query = f"""
-                SELECT date, open, high, low, close, volume
-                FROM {table}
-                WHERE symbol = %s AND date >= %s
-                ORDER BY date ASC
-            """
-            df = pd.read_sql(query, conn, params=(ticker, cutoff))
-        else:
-            query = f"""
-                SELECT date, open, high, low, close, volume
-                FROM {table}
-                WHERE symbol = %s
-                ORDER BY date ASC
-            """
-            df = pd.read_sql(query, conn, params=(ticker,))
-
-        conn.close()
+        with engine.connect() as conn:
+            if days is not None:
+                cutoff = (
+                    datetime.now() - timedelta(days=days)
+                ).strftime("%Y-%m-%d")
+                query = text(f"""
+                    SELECT date, open, high, low, close, volume
+                    FROM {table}
+                    WHERE symbol = :symbol AND date >= :cutoff
+                    ORDER BY date ASC
+                """)
+                df = pd.read_sql(query, conn, params={
+                    "symbol": ticker,
+                    "cutoff": cutoff,
+                })
+            else:
+                query = text(f"""
+                    SELECT date, open, high, low, close, volume
+                    FROM {table}
+                    WHERE symbol = :symbol
+                    ORDER BY date ASC
+                """)
+                df = pd.read_sql(query, conn, params={
+                    "symbol": ticker,
+                })
 
         if df.empty:
             return pd.DataFrame()

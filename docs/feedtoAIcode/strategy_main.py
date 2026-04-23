@@ -3240,16 +3240,18 @@ conditions before it earns a ``sig_confirmed == 1`` flag.
 
 Gates
 ─────
-  1.  score_adjusted  ≥  entry_score_min          (quality bar)
-  2.  rs_regime       ∈  allowed_rs_regimes       (stock trend)
-  3.  sect_rs_regime  ∈  allowed_sector_regimes   (sector tide)
+  1.  rs_regime       ∈  allowed_rs_regimes       (stock trend)
+  1b. rsi_14          ∈  [rsi_entry_min, rsi_entry_max]  (RSI range)
+  2.  sect_rs_regime  ∈  allowed_sector_regimes   (sector tide)
+  3.  breadth_regime  ∈  allowed_breadth_regimes  (market gate)
   4.  momentum_streak ≥  N consecutive days > 0.5 (persistence)
   5.  NOT in cooldown after recent exit            (anti-churn)
-  6.  breadth_regime  ∈  allowed_breadth_regimes  (market gate)
+  6.  score_adjusted  ≥  entry_score_min           (quality bar)
 
 Pipeline
 ────────
   scored_df  →  _gate_regime()
+             →  _gate_rsi()          ← NEW: hard RSI 30-70 gate
              →  _gate_sector()
              →  _gate_breadth()
              →  _gate_momentum()
@@ -3257,13 +3259,16 @@ Pipeline
              →  _gate_entry()
              →  _compute_exits()
              →  _position_sizing()
-             →  generate_signals()  ← master function
+             →  generate_signals()   ← master function
 
 Each gate adds its own boolean column so downstream analytics
 can diagnose *why* a signal was or wasn't generated.
- is the per-ticker quality filter. It runs on a single ticker's time series and 
- answers "is this ticker trade-worthy today?" through six gates (regime, sector, breadth, momentum, cooldown, score). 
- Its output is sig_confirmed, sig_exit, and all the sig_* diagnostic columns.
+
+This is the per-ticker quality filter. It runs on a single
+ticker's time series and answers "is this ticker trade-worthy
+today?" through seven gates (regime, RSI, sector, breadth,
+momentum, cooldown, score). Its output is sig_confirmed,
+sig_exit, and all the sig_* diagnostic columns.
 """
 
 from __future__ import annotations
@@ -3298,6 +3303,41 @@ def _gate_regime(df: pd.DataFrame) -> pd.DataFrame:
         result["sig_regime_ok"] = result["rs_regime"].isin(allowed)
     else:
         result["sig_regime_ok"] = True
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GATE 1b — RSI RANGE
+# ═══════════════════════════════════════════════════════════════
+
+def _gate_rsi(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Hard RSI gate: only allow entries when RSI is between 30 and 70.
+
+    RSI < 30  → oversold collapse in progress, not momentum
+    RSI > 70  → overbought, high risk of mean reversion
+
+    This is a HARD gate — no BUY signal is generated outside
+    this range regardless of how strong other indicators are.
+
+    The thresholds are configured via SIGNAL_PARAMS:
+      - rsi_entry_min  (default 30)
+      - rsi_entry_max  (default 70)
+    """
+    result = df.copy()
+    rsi_min = _sp("rsi_entry_min")
+    rsi_max = _sp("rsi_entry_max")
+
+    # The RSI column name from compute/indicators.py
+    rsi_col = "rsi_14"
+
+    if rsi_col in result.columns:
+        rsi = result[rsi_col].fillna(50.0)
+        result["sig_rsi_ok"] = (rsi >= rsi_min) & (rsi <= rsi_max)
+    else:
+        # No RSI data — pass by default (degrade gracefully)
+        result["sig_rsi_ok"] = True
 
     return result
 
@@ -3497,8 +3537,9 @@ def _gate_entry(df: pd.DataFrame) -> pd.DataFrame:
 
     scores = result[score_col]
 
-    # All gates must pass
+    # All gates must pass (RSI gate included)
     regime_ok   = result.get("sig_regime_ok", True)
+    rsi_ok      = result.get("sig_rsi_ok", True)
     sector_ok   = result.get("sig_sector_ok", True)
     breadth_ok  = result.get("sig_breadth_ok", True)
     momentum_ok = result.get("sig_momentum_ok", False)
@@ -3507,6 +3548,7 @@ def _gate_entry(df: pd.DataFrame) -> pd.DataFrame:
     confirmed = (
         (scores >= effective_min)
         & regime_ok
+        & rsi_ok
         & sector_ok
         & breadth_ok
         & momentum_ok
@@ -3516,39 +3558,47 @@ def _gate_entry(df: pd.DataFrame) -> pd.DataFrame:
     result["sig_confirmed"] = confirmed.astype(int)
 
     # ── Reason annotation ─────────────────────────────────────
+    # Priority order: RSI → regime → sector → breadth → cooldown
+    #                 → momentum → score → fallback
     reasons = pd.Series("", index=result.index)
 
     reasons = reasons.where(
         confirmed,
         np.where(
-            ~regime_ok.astype(bool) if not isinstance(
-                regime_ok, bool
-            ) else ~regime_ok,
-            "regime_blocked",
+            ~(rsi_ok.astype(bool) if not isinstance(
+                rsi_ok, bool
+            ) else rsi_ok),
+            "rsi_out_of_range",
             np.where(
-                ~sector_ok.astype(bool) if not isinstance(
-                    sector_ok, bool
-                ) else ~sector_ok,
-                "sector_blocked",
+                ~regime_ok.astype(bool) if not isinstance(
+                    regime_ok, bool
+                ) else ~regime_ok,
+                "regime_blocked",
                 np.where(
-                    ~breadth_ok.astype(bool) if not isinstance(
-                        breadth_ok, bool
-                    ) else ~breadth_ok,
-                    "breadth_weak",
+                    ~sector_ok.astype(bool) if not isinstance(
+                        sector_ok, bool
+                    ) else ~sector_ok,
+                    "sector_blocked",
                     np.where(
-                        cooldown.astype(bool) if not isinstance(
-                            cooldown, bool
-                        ) else cooldown,
-                        "cooldown",
+                        ~breadth_ok.astype(bool) if not isinstance(
+                            breadth_ok, bool
+                        ) else ~breadth_ok,
+                        "breadth_weak",
                         np.where(
-                            ~momentum_ok.astype(bool) if not isinstance(
-                                momentum_ok, bool
-                            ) else ~momentum_ok,
-                            "momentum_unconfirmed",
+                            cooldown.astype(bool) if not isinstance(
+                                cooldown, bool
+                            ) else cooldown,
+                            "cooldown",
                             np.where(
-                                scores < effective_min,
-                                "score_below_entry",
-                                "no_signal",
+                                ~momentum_ok.astype(bool) if not isinstance(
+                                    momentum_ok, bool
+                                ) else ~momentum_ok,
+                                "momentum_unconfirmed",
+                                np.where(
+                                    scores < effective_min,
+                                    "score_below_entry",
+                                    "no_signal",
+                                ),
                             ),
                         ),
                     ),
@@ -3655,6 +3705,15 @@ def generate_signals(
     Run the full signal pipeline on a single ticker's scored
     DataFrame.
 
+    Gates (all must pass for sig_confirmed = 1):
+      1.  RS regime        — stock in allowed regime
+      1b. RSI range        — RSI between 30 and 70
+      2.  Sector regime    — sector tide favourable
+      3.  Breadth regime   — market not weak
+      4.  Momentum streak  — N consecutive days above threshold
+      5.  Cooldown         — not recently exited
+      6.  Entry score      — composite above threshold
+
     Parameters
     ----------
     df : pd.DataFrame
@@ -3673,6 +3732,7 @@ def generate_signals(
         return pd.DataFrame()
 
     result = _gate_regime(df)
+    result = _gate_rsi(result)
     result = _gate_sector(result)
     result = _gate_breadth(result, breadth)
     result = _gate_momentum(result)
@@ -3682,7 +3742,6 @@ def generate_signals(
     result = _position_sizing(result)
 
     return result
-
 
 ####################################################################
 

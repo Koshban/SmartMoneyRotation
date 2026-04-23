@@ -22,6 +22,7 @@ smartmoneyrotation/
    └── config.py
    └── credentials.py
    └── universe.py
+   └── sector_map.py
    └── expiry.py
 └──compute/
      └──  __init__.py
@@ -35,6 +36,9 @@ smartmoneyrotation/
      └──universe_cash.parquet
      └── staging.json
      └── options/
+└──docs/
+    └── DataArchitecture.clj
+    └── DataFlow.clj
 └──logs/
 └──output/
     └──  __init__.py
@@ -88,9 +92,7 @@ smartmoneyrotation/
     └──  run_logger.py
  └── main.py  
  └── pyproject.toml         
- └── requirements.txt
- └── DataArchitecture.clj
- └── DataFlow.clj
+ └── requirements.txt 
  └── .gitignore
  
 """

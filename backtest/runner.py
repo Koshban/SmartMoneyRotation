@@ -3,16 +3,23 @@ backtest/runner.py
 ------------------
 CLI entry point for backtesting.
 
-Enhanced with multi-market support and equity curve export.
+The --universe flag is the primary control:
+  us / hk / india        → full universe from common.universe
+  us_core / hk_core / …  → hardcoded ETF/stock sets
+
+Market, benchmark, and strategy filtering are all derived from it.
 
 Usage:
-    python -m backtest.runner                                 # 20Y US default
-    python -m backtest.runner --market HK --start 2015        # HK from 2015
-    python -m backtest.runner --market IN --compare           # India comparison
-    python -m backtest.runner --compare --rank-by sharpe      # rank by Sharpe
-    python -m backtest.runner --strategy convergence_strong   # convergence
-    python -m backtest.runner --list                          # list strategies
-    python -m backtest.runner --list --market HK              # HK strategies
+    python -m backtest.runner --universe us                          # full US
+    python -m backtest.runner --universe hk                          # full HK
+    python -m backtest.runner --universe india                       # full India
+    python -m backtest.runner --universe us_core                     # 41 ETFs
+    python -m backtest.runner --show-universe --universe hk          # inspect HK
+    python -m backtest.runner --show-universe --universe india       # inspect India
+    python -m backtest.runner --compare --universe us                # compare US
+    python -m backtest.runner --compare --universe hk                # compare HK
+    python -m backtest.runner --strategy regime_adaptive --universe us
+    python -m backtest.runner --list --universe india                # India strats
 """
 
 from __future__ import annotations
@@ -26,7 +33,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from backtest.data_loader import ensure_history, data_summary
+from backtest.data_loader import (
+    ensure_history,
+    data_summary,
+    get_universe_tickers,
+    list_universe_tickers,
+    build_full_universe,
+    resolve_universe,
+    MARKET_BENCHMARKS,
+    VALID_UNIVERSES,
+    _MARKET_CORE,
+)
 from backtest.engine import run_backtest_period, StrategyConfig
 from backtest.strategies import (
     ALL_STRATEGIES,
@@ -40,46 +57,142 @@ logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
+    valid_str = ", ".join(VALID_UNIVERSES)
+
     p = argparse.ArgumentParser(
         prog="backtest",
         description="CASH — Historical Backtesting Harness",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+Universe choices: {valid_str}
+
 Examples:
-  python -m backtest.runner                              # 20Y US backtest
-  python -m backtest.runner --market HK --start 2018     # HK from 2018
-  python -m backtest.runner --compare                    # compare all US strategies
-  python -m backtest.runner --compare --market HK        # compare HK strategies
-  python -m backtest.runner --strategy convergence_strong # convergence-aware
-  python -m backtest.runner --list --market IN            # list India strategies
+  python -m backtest.runner --universe us                            # full US
+  python -m backtest.runner --universe hk --start 2020               # full HK
+  python -m backtest.runner --universe india --start 2022            # full India
+  python -m backtest.runner --universe us_core                       # 41 hardcoded ETFs
+  python -m backtest.runner --show-universe --universe hk            # inspect HK
+  python -m backtest.runner --show-universe --universe india         # inspect India
+  python -m backtest.runner --compare --universe us                  # compare US strats
+  python -m backtest.runner --compare --universe hk                  # compare HK strats
+  python -m backtest.runner --strategy regime_adaptive --universe us
+  python -m backtest.runner --list --universe india                  # India strategies
+  python -m backtest.runner --tickers AAPL MSFT GOOG --start 2020   # custom tickers
         """,
     )
 
-    p.add_argument("--start", type=str, default=None)
-    p.add_argument("--end", type=str, default=None)
-    p.add_argument("--strategy", "-s", type=str, default="baseline")
-    p.add_argument("--market", "-m", type=str, default="US",
-                   choices=["US", "HK", "IN"],
-                   help="Market to backtest (default: US)")
-    p.add_argument("--compare", action="store_true")
-    p.add_argument("--rank-by", type=str, default="cagr",
-                   choices=["cagr", "sharpe", "sortino", "calmar", "max_drawdown"])
-    p.add_argument("--capital", type=float, default=100_000)
-    p.add_argument("--output", "-o", type=str, default=None)
-    p.add_argument("--refresh", action="store_true")
-    p.add_argument("--list", action="store_true", dest="list_strats")
-    p.add_argument("--tickers", nargs="+", default=None)
-    p.add_argument("--holdings", type=str, default="",
-                   help="Comma-separated current holdings for rotation evaluation")
-    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument(
+        "--universe", "-u", type=str, default="us_core",
+        help=f"Universe: {valid_str} (default: us_core)",
+    )
+    p.add_argument(
+        "--start", type=str, default=None,
+        help="Backtest start date (YYYY or YYYY-MM-DD)",
+    )
+    p.add_argument(
+        "--end", type=str, default=None,
+        help="Backtest end date",
+    )
+    p.add_argument(
+        "--strategy", "-s", type=str, default="baseline",
+        help="Strategy name (default: baseline)",
+    )
+    p.add_argument(
+        "--show-universe", action="store_true",
+        help="Print the ticker list for the selected universe and exit",
+    )
+    p.add_argument(
+        "--compare", action="store_true",
+        help="Run all strategies for the market and compare",
+    )
+    p.add_argument(
+        "--rank-by", type=str, default="cagr",
+        choices=["cagr", "sharpe", "sortino", "calmar", "max_drawdown"],
+        help="Metric to rank by in compare mode (default: cagr)",
+    )
+    p.add_argument(
+        "--capital", type=float, default=100_000,
+        help="Initial capital (default: 100,000)",
+    )
+    p.add_argument(
+        "--output", "-o", type=str, default=None,
+        help="Directory to save reports",
+    )
+    p.add_argument(
+        "--refresh", action="store_true",
+        help="Force re-download of historical data",
+    )
+    p.add_argument(
+        "--list", action="store_true", dest="list_strats",
+        help="List available strategies for the market",
+    )
+    p.add_argument(
+        "--tickers", nargs="+", default=None,
+        help="Override universe with specific tickers (market auto-detected)",
+    )
+    p.add_argument(
+        "--holdings", type=str, default="",
+        help="Comma-separated current holdings for rotation",
+    )
+    p.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Debug logging",
+    )
+
+    # Hidden backward-compat alias
+    p.add_argument(
+        "--market", "-m", type=str, default=None,
+        help=argparse.SUPPRESS,
+    )
 
     return p
+
+
+def _resolve_market_and_scope(args) -> tuple[str, str]:
+    """
+    Derive (market, scope) from CLI args.
+
+    Priority:
+      1. --tickers  → custom scope, market auto-detected from suffixes
+      2. --universe → resolved via UNIVERSE_MAP
+      3. --market   → backward compat fallback (maps to core scope)
+    """
+    if args.tickers:
+        # Auto-detect market from first non-US-looking ticker
+        from backtest.data_loader import _ticker_market
+        tickers = [t.upper() for t in args.tickers]
+        markets = {_ticker_market(t) for t in tickers}
+        markets.discard("US")
+        if "HK" in markets:
+            return "HK", "custom"
+        if "IN" in markets:
+            return "IN", "custom"
+        return "US", "custom"
+
+    # --universe flag (primary)
+    universe_str = args.universe.lower().strip()
+
+    # Handle backward-compat --market flag
+    if args.market and universe_str in ("core", "full", "us_core"):
+        market_map = {"US": "us", "HK": "hk", "IN": "india"}
+        base = market_map.get(args.market.upper(), "us")
+        if universe_str == "full":
+            universe_str = base
+        else:
+            universe_str = f"{base}_core"
+
+    try:
+        return resolve_universe(universe_str)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    # ── Logging ───────────────────────────────────────────────
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -91,12 +204,26 @@ def main():
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("yfinance").setLevel(logging.WARNING)
 
-    market = args.market.upper()
+    market, scope = _resolve_market_and_scope(args)
+    benchmark = MARKET_BENCHMARKS.get(market, "SPY")
+
+    # ── Show universe ─────────────────────────────────────────
+    if args.show_universe:
+        uni_name = args.universe.lower().strip()
+        # Backward-compat: if they used --market
+        if args.market and uni_name in ("core", "full", "us_core"):
+            market_map = {"US": "us", "HK": "hk", "IN": "india"}
+            base = market_map.get(args.market.upper(), "us")
+            uni_name = base if uni_name == "full" else f"{base}_core"
+
+        list_universe_tickers(universe=uni_name)
+        return
 
     # ── List strategies ───────────────────────────────────────
     if args.list_strats:
         strats = list_strategies(market)
-        print(f"\nAvailable strategies for {market}:")
+        print(f"\nAvailable strategies for {market} "
+              f"(benchmark: {benchmark}):")
         print("-" * 60)
         for name in strats:
             strat = ALL_STRATEGIES[name]
@@ -104,17 +231,37 @@ def main():
         print()
         return
 
+    # ── Resolve tickers ───────────────────────────────────────
+    custom_tickers = (
+        [t.upper() for t in args.tickers] if args.tickers else None
+    )
+
+    # Build description for header
+    if custom_tickers:
+        universe_desc = f"custom ({len(custom_tickers)} tickers)"
+    elif scope == "full":
+        full_list = get_universe_tickers(market=market, scope="full")
+        core_count = len(_MARKET_CORE.get(market, []))
+        universe_desc = (
+            f"{market} full ({len(full_list)} tickers, "
+            f"{core_count} core + "
+            f"{len(full_list) - core_count} from universe.py)"
+        )
+    else:
+        core_list = get_universe_tickers(market=market, scope="core")
+        universe_desc = f"{market} core ({len(core_list)} tickers)"
+
     # ── Load data ─────────────────────────────────────────────
     t0 = time.time()
-    tickers = [t.upper() for t in args.tickers] if args.tickers else None
 
     print("\n" + "=" * 70)
     print(f"  CASH — BACKTESTING HARNESS [{market}]")
     print("=" * 70)
 
     data = ensure_history(
-        tickers=tickers,
+        tickers=custom_tickers,
         market=market,
+        scope=scope,
         force_refresh=args.refresh,
     )
 
@@ -123,7 +270,9 @@ def main():
         sys.exit(1)
 
     summary = data_summary(data)
-    print(f"\n  Data loaded: {summary['n_tickers']} tickers")
+    print(f"\n  Universe:    {universe_desc}")
+    print(f"  Benchmark:   {benchmark}")
+    print(f"  Data loaded: {summary['n_tickers']} tickers")
     print(f"  Range:       {summary['earliest_start'].date()} → "
           f"{summary['latest_end'].date()}")
     print(f"  Total bars:  {summary['total_bars']:,}")
@@ -142,8 +291,10 @@ def main():
             v for v in ALL_STRATEGIES.values()
             if v.market == market
         ]
-        print(f"\n  Running comparison of {len(market_strats)} "
-              f"{market} strategies...")
+        print(
+            f"\n  Comparing {len(market_strats)} {market} strategies "
+            f"on {universe_desc}..."
+        )
 
         result = compare_strategies(
             data, strategies=market_strats, market=market,
@@ -164,20 +315,44 @@ def main():
         return
 
     # ── Single strategy mode ──────────────────────────────────
+    strategy_name = args.strategy
+
+    # Auto-select default strategy for non-US markets
+    if market != "US" and strategy_name == "baseline":
+        market_defaults = {
+            "HK": "hk_baseline",
+            "IN": "in_baseline",
+        }
+        if market in market_defaults:
+            strategy_name = market_defaults[market]
+            logger.info(
+                f"Auto-selected '{strategy_name}' for {market} market"
+            )
+
     try:
-        strategy = get_strategy(args.strategy)
+        strategy = get_strategy(strategy_name)
     except KeyError as e:
         print(f"ERROR: {e}")
+        available = list_strategies(market)
+        if available:
+            print(f"\nAvailable {market} strategies: "
+                  f"{', '.join(available)}")
         sys.exit(1)
 
+    # Warn if strategy market doesn't match universe market
     if strategy.market != market:
-        print(f"WARNING: Strategy '{strategy.name}' is for {strategy.market}, "
-              f"but --market is {market}. Using strategy's market.")
-        market = strategy.market
+        print(
+            f"  WARNING: Strategy '{strategy.name}' is for "
+            f"{strategy.market}, but universe is {market}."
+        )
+        response = input("  Continue anyway? [y/N] ").strip().lower()
+        if response != "y":
+            sys.exit(0)
 
     print(f"\n  Strategy:    {strategy.name}")
     print(f"  Description: {strategy.description}")
-    print(f"  Market:      {strategy.market}")
+    print(f"  Market:      {market}")
+    print(f"  Benchmark:   {benchmark}")
     print(f"  Period:      {start or 'earliest'} → {end or 'latest'}")
     print(f"  Capital:     ${args.capital:,.0f}")
     print()
@@ -185,6 +360,7 @@ def main():
     run = run_backtest_period(
         data, start=start, end=end,
         strategy=strategy, capital=args.capital,
+        benchmark=benchmark,
         current_holdings=holdings,
     )
 
@@ -199,6 +375,10 @@ def main():
     elapsed = time.time() - t0
     print(f"\n  Total time: {elapsed:.0f}s")
 
+
+# ═══════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════
 
 def _normalise_date(date_str: str | None) -> str | None:
     if date_str is None:
@@ -228,7 +408,7 @@ def _save_comparison(result: dict, output_dir: str) -> None:
     print(f"\n  Results saved to: {output_dir}/")
 
 
-def _save_single(run: BacktestRun, output_dir: str) -> None:
+def _save_single(run, output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

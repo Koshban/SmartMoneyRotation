@@ -1,0 +1,37 @@
+09:05:32 │ INFO     │ run_strategy           │ Strategy run: mode=full, market=IN
+09:05:32 │ INFO     │ run_strategy           │ Log file: C:\Users\kaush\OneDrive\Desktop\Code\smartmoneyrotation\logs\run_strategy_20260423_090532.log
+09:05:32 │ INFO     │ src.db.loader          │ Cached universe_ohlcv.parquet: 345,696 rows, 94 symbols
+09:05:35 │ ERROR    │ yfinance               │ HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: TATAMOTORS.NS"}}}
+09:05:35 │ ERROR    │ yfinance               │ $TATAMOTORS.NS: possibly delisted; no price data found  (period=2y) (Yahoo error = "No data found, symbol may be delisted")
+09:05:35 │ ERROR    │ yfinance               │ 
+1 Failed download:
+09:05:35 │ ERROR    │ yfinance               │ ['TATAMOTORS.NS']: possibly delisted; no price data found  (period=2y) (Yahoo error = "No data found, symbol may be delisted")
+09:05:37 │ ERROR    │ yfinance               │ HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: BAJFINSV.NS"}}}
+09:05:38 │ ERROR    │ yfinance               │ $BAJFINSV.NS: possibly delisted; no price data found  (period=2y) (Yahoo error = "No data found, symbol may be delisted")
+09:05:38 │ ERROR    │ yfinance               │ 
+1 Failed download:
+09:05:38 │ ERROR    │ yfinance               │ ['BAJFINSV.NS']: possibly delisted; no price data found  (period=2y) (Yahoo error = "No data found, symbol may be delisted")
+09:05:38 │ INFO     │ src.db.loader          │ Loaded 45/47 tickers (missing: 2)
+09:05:38 │ INFO     │ pipeline.orchestrator  │ Phase 0: Loaded 45 tickers from data source
+09:05:38 │ INFO     │ pipeline.orchestrator  │ Phase 0 complete: 45 tickers, benchmark=NIFTYBEES.NS (4263 bars), 5.8s
+09:05:38 │ INFO     │ pipeline.orchestrator  │ Phase 1: Breadth disabled — skipping
+09:05:38 │ INFO     │ pipeline.orchestrator  │ Phase 1: Sectors disabled — skipping
+09:05:38 │ INFO     │ pipeline.orchestrator  │ Phase 1 complete: 0.0s
+09:05:38 │ INFO     │ pipeline.runner        │   [1/45] HEROMOTOCO.NS...
+09:05:44 │ INFO     │ pipeline.runner        │   [10/45] ONGC.NS...
+09:05:55 │ INFO     │ pipeline.runner        │   [30/45] SBIN.NS...
+09:06:02 │ INFO     │ pipeline.runner        │   [40/45] RELIANCE.NS...
+09:06:04 │ INFO     │ pipeline.runner        │   [45/45] DRREDDY.NS...
+09:06:05 │ INFO     │ pipeline.runner        │ Batch complete: 44 succeeded, 0 errors, 1 skipped (of 45 total)
+09:06:05 │ INFO     │ pipeline.orchestrator  │ Phase 2 complete: 44 scored, 0 errors, 27.1s
+09:06:05 │ INFO     │ pipeline.orchestrator  │ Phase 2.5: Rotation not configured for IN — skipping
+09:06:05 │ INFO     │ strategy.convergence   │ [IN] Scoring only: 17 BUY, 0 SELL, 44 total
+09:06:05 │ INFO     │ strategy.convergence   │ [IN] 44 tickers  BUY_SCORING=17  HOLD=27
+09:06:05 │ INFO     │ pipeline.orchestrator  │ Phase 2.75: Convergence applied — 44 tickers, 0 STRONG_BUY, 0 CONFLICT
+09:06:05 │ INFO     │ pipeline.orchestrator  │ Phase 3a: Rankings computed — 182892 rows
+09:06:05 │ INFO     │ pipeline.orchestrator  │ Phase 3b: Portfolio built — 3 positions
+09:06:07 │ INFO     │ pipeline.orchestrator  │ Phase 3c: Signals generated — 182892 rows
+09:06:07 │ INFO     │ pipeline.orchestrator  │ Phase 3 complete: 2.2s
+09:06:07 │ INFO     │ pipeline.orchestrator  │ Phase 4: Recommendation report built
+09:06:07 │ INFO     │ pipeline.orchestrator  │ CASH Pipeline — 2026-04-23 — 44 tickers scored, 0 errors, top=ADANIENT.NS, lookback=0d, 35.1s
+09:06:07 │ INFO     │ run_strategy           │ Completed in 35.1s — log at C:\Users\kaush\OneDrive\Desktop\Code\smartmoneyrotation\logs\run_strategy_20260423_090532.log
