@@ -768,7 +768,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
+##########################################################    
 """
 src/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
 

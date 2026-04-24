@@ -6,6 +6,7 @@ __pycache__/
 .env
 data/*/*/*.csv
 **/test*html
+**/*.log
 **/*.parquet
 **/result*json
 

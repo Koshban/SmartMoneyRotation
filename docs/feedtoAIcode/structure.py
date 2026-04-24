@@ -1,13 +1,4 @@
 """
-Let me provide the complete codebase again, and you check if CASH is complete or anything else needs rejigging.
-If all completed now then We need to write a module for backtesting the entire project we have created for CASH smartmoneyrotattion strategies. 
-We will need to load 20 years worth of Data , and then be able to backtest for any given period. We should also be able to backtest by default for the 20 years worth of data.
-
-We can load data using the src/*/* components for the last 20 years.
-We can create a separate backtest folder to then Test the strategies.
-We will also need a method to calculate CAGR so that we can confirm which strategies ( if we need to tweak them ) gives best returns.
-"""
-"""
 smartmoneyrotation/
 └── backtest/
     ├── __init__.py
@@ -96,4 +87,135 @@ smartmoneyrotation/
  └── requirements.txt 
  └── .gitignore
  
+"""
+
+"""
+smartmoneyrotation/
+├── backtest/
+│   ├── __init__.py
+│   ├── data_loader.py
+│   ├── engine.py
+│   ├── metrics.py
+│   ├── strategies.py
+│   ├── comparison.py
+│   ├── runner.py
+│   └── phase2/
+│       ├── __init__.py
+│       ├── README.md
+│       ├── signal_study.py
+│       ├── portfolio_sim.py
+│       ├── reversal_study.py
+│       └── run_backtests.py
+│
+├── common/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── credentials.py
+│   ├── universe.py
+│   ├── sector_map.py
+│   └── expiry.py
+│
+├── compute/
+│   ├── __init__.py
+│   ├── breadth.py
+│   ├── indicators.py
+│   ├── relative_strength.py
+│   ├── scoring.py
+│   └── sector_rs.py
+│
+├── data/
+│   ├── us_cash.parquet
+│   ├── hk_cash.parquet
+│   ├── india_cash.parquet
+│   ├── universe_cash.parquet
+│   ├── staging.json
+│   └── options/
+│
+├── pipeline/
+│   ├── __init__.py
+│   ├── runner.py
+│   └── orchestrator.py
+│
+├── portfolio/
+│   ├── __init__.py
+│   ├── backtest.py
+│   ├── rebalance.py
+│   ├── risk.py
+│   └── sizing.py
+│
+├── refactor/
+│   ├── __init__.py
+│   ├── common/
+│   │   ├── __init__.py
+│   │   ├── config_refactor.py
+│   │   ├── market_config_v2.py
+│   │   └── universe_loader_v2.py
+│   ├── strategy/
+│   │   ├── __init__.py
+│   │   ├── adapters_v2.py
+│   │   ├── portfolio_v2.py
+│   │   ├── regime_v2.py
+│   │   ├── scoring_v2.py
+│   │   └── signals_v2.py
+│   ├── tests/
+│   │   └── test_refactor_smoke.py
+│   ├── demo_runner.py
+│   ├── pipeline_v2.py
+│   ├── report_v2.py
+│   └── runner_v2.py
+│
+├── reports/
+│   ├── __init__.py
+│   ├── portfolio_view.py
+│   ├── recommendations.py
+│   ├── weekly_report.py
+│   └── html_report.py
+│
+├── results/
+│   ├── comparison_report.txt
+│   └── run_logger.py
+│
+├── scripts/
+│   ├── run_market.py
+│   ├── run_strategy.py
+│   └── run_bounce_scan.py
+│
+├── src/
+│   ├── __init__.py
+│   ├── db.py
+│   ├── schema.py
+│   ├── load_db.py
+│   ├── loader.py
+│   ├── ingest_cash.py
+│   └── ingest_options.py
+│
+├── strategy/
+│   ├── __init__.py
+│   ├── signals.py
+│   ├── portfolio.py
+│   ├── rotation.py
+│   ├── rotation_filters.py
+│   └── convergence.py
+│
+├── output/
+│   ├── __init__.py
+│   ├── rankings.py
+│   ├── reports.py
+│   └── signals.py
+│
+├── tests/
+│   ├── __init__.py
+│   └── test_connections.py
+│
+├── utils/
+│   ├── __init__.py
+│   └── run_logger.py
+│
+├── docs/
+├── logs/
+├── main.py
+├── pyproject.toml
+├── requirements.txt
+└── .gitignore
+
 """
