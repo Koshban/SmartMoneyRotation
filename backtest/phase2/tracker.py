@@ -53,11 +53,6 @@ class PortfolioTracker:
         """
         Execute one day's actions.  Sells run first (free up cash),
         then buys fill up to max_positions.
-
-        Args:
-            date:    current date
-            actions: {ticker: "BUY" | "SELL" | "HOLD" | ...}
-            prices:  {ticker: open_price} for execution
         """
         # ── sells first ──────────────────────────────────────────
         for ticker, action in actions.items():
@@ -81,12 +76,13 @@ class PortfolioTracker:
             self._buy(date, ticker, prices[ticker])
 
     # ------------------------------------------------------------------
+    
     def _buy(self, date, ticker: str, raw_price: float) -> None:
         exec_price = raw_price * (1 + self.slippage_rate)
 
         target_value = min(
             self.initial_capital / self.max_positions,
-            self.cash * 0.95,                          # keep 5 % buffer
+            self.cash * 0.95,
         )
         if target_value < 1_000:
             return
@@ -109,9 +105,9 @@ class PortfolioTracker:
             shares=shares,
             cost_basis=total,
         )
-        log.debug(
-            "BUY  %s  %d @ %.3f  cost $%,.0f  comm $%.0f",
-            ticker, shares, exec_price, cost, commission,
+        log.info(
+            f"  ▲ BUY  {ticker:<10s}  {shares} shares @ {exec_price:.2f}"
+            f"  cost ${total:,.0f}"
         )
 
     # ------------------------------------------------------------------
@@ -147,9 +143,9 @@ class PortfolioTracker:
                 "holding_days": held,
             }
         )
-        log.debug(
-            "SELL %s  %d @ %.3f  PnL $%,.0f (%+.1f%%)  held %dd",
-            ticker, pos.shares, exec_price, pnl, pnl_pct * 100, held,
+        log.info(
+            f"  ▼ SELL {ticker:<10s}  {pos.shares} shares @ {exec_price:.2f}"
+            f"  PnL ${pnl:,.0f} ({pnl_pct:+.1%})  held {held}d"
         )
 
     # ------------------------------------------------------------------

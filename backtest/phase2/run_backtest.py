@@ -44,7 +44,7 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # ── file handler (verbose) ────────────────────────────────
+    # ── file handler (verbose — captures DEBUG from all modules) ──
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
@@ -53,7 +53,7 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
     ))
     root.addHandler(fh)
 
-    # ── console handler (concise) ─────────────────────────────
+    # ── console handler (concise — INFO only) ─────────────────────
     ch = logging.StreamHandler()
     ch.setLevel(level)
     ch.setFormatter(logging.Formatter(
@@ -61,6 +61,16 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
         datefmt="%H:%M:%S",
     ))
     root.addHandler(ch)
+
+    # ── silence noisy modules on the console ──────────────────────
+    # These still write DEBUG to the log file via the file handler.
+    for noisy in (
+        "refactor.strategy.rotation_v2",
+        "refactor.pipeline_v2",
+        "refactor.strategy",
+        "refactor.scoring",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     return log_file
 
@@ -85,10 +95,6 @@ BENCHMARKS = {
 
 
 def _get_tickers(market: str) -> list[str]:
-    """
-    Pull the ticker list from common/universe.py via get_universe_for_market().
-    Supports 'US', 'HK', and 'IN'.
-    """
     return get_universe_for_market(market)
 
 
@@ -101,10 +107,6 @@ def load_data(
     data_dir: str = "data",
     lookback_bars: int = 300,
 ) -> BacktestDataSource:
-    """
-    Load from  data/{market}_cash.parquet  and filter to the
-    universe defined in common/universe.py.
-    """
     parquet_path = Path(data_dir) / f"{market}_cash.parquet"
     tickers = _get_tickers(market)
     benchmark = BENCHMARKS.get(market)
@@ -191,7 +193,7 @@ CONFIG_LOOSE = build_config_dict(
         "pullback_max_short_extension": 0.04, "pullback_rsi_max": 58.0,
         "cooldown_days": 4,
         "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10},
-        "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.07, "critical": 0.12, "unknown": 0.00},
+        "breadth_entry_adjustment": {"strong": -0.02, "neutral": 0.00, "weak": 0.03, "critical": 0.08, "unknown": 0.00},
         "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35},
     },
     convergence_params={
@@ -303,16 +305,19 @@ def main():
     log.info("--- Comparison Table ---")
     for _, row in comp.iterrows():
         log.info("  %-30s  %s=%s  %s=%s",
-                 row.get("metric", ""),
+                 row.get("Metric", ""),
                  args.name_a, row.get(args.name_a, ""),
                  args.name_b, row.get(args.name_b, ""))
 
+    # ── summary ───────────────────────────────────────────────
+    bench_ret_a = ra.get("metrics", {}).get("benchmark_total_return", 0)
     summary_lines = [
         f"Market          : {args.market}",
         f"Period          : {args.start} -> {args.end}",
         f"Start capital   : ${args.capital:,.0f}",
-        f"{args.name_a:15s} : ${ra['final_value']:,.0f}",
-        f"{args.name_b:15s} : ${rb['final_value']:,.0f}",
+        f"Benchmark       : {BENCHMARKS.get(args.market, '?')}  ({bench_ret_a:+.1%})",
+        f"{args.name_a:15s} : ${ra['final_value']:,.0f}  (alpha {ra.get('metrics', {}).get('alpha', 0):+.1%})",
+        f"{args.name_b:15s} : ${rb['final_value']:,.0f}  (alpha {rb.get('metrics', {}).get('alpha', 0):+.1%})",
     ]
     for line in summary_lines:
         _log_and_print(f"  {line}", f"  {line}")
@@ -323,9 +328,12 @@ def main():
 
     comp.to_csv(out / "comparison.csv", index=False)
 
-    eq = ra["equity_curve"].merge(
-        rb["equity_curve"], on="date", suffixes=(f"_{args.name_a}", f"_{args.name_b}")
-    )
+    # Merge equity curves — include benchmark once
+    eq_a = ra["equity_curve"][["date", "value"]].rename(columns={"value": f"value_{args.name_a}"})
+    eq_b = rb["equity_curve"][["date", "value"]].rename(columns={"value": f"value_{args.name_b}"})
+    eq_bench = ra["equity_curve"][["date", "benchmark"]].rename(columns={"benchmark": "benchmark"})
+
+    eq = eq_a.merge(eq_b, on="date").merge(eq_bench, on="date")
     eq.to_csv(out / "equity_curves.csv", index=False)
 
     if not ra["trade_log"].empty:

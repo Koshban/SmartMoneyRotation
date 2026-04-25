@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .env
-data/*/*/*.csv
+**/*/*.csv
 **/test*html
 **/runner_*html
 **/*.log

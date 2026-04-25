@@ -69,7 +69,7 @@ class BacktestEngine:
         )
 
         log.info(
-            "[%s] backtest %s -> %s  (%d days, %d tickers)",
+            "[%s] backtest %s → %s  (%d days, %d tickers)",
             self.config_name,
             self.start_date,
             self.end_date,
@@ -78,6 +78,7 @@ class BacktestEngine:
         )
 
         prev_actions: Dict[str, str] = {}
+        bench_start_close: float | None = None
 
         for i, day in enumerate(trading_days):
 
@@ -91,25 +92,47 @@ class BacktestEngine:
             except Exception as exc:
                 log.warning(
                     "[%s] pipeline error %s: %s",
-                    self.config_name, day, exc,
+                    self.config_name, day.strftime("%Y-%m-%d"), exc,
                 )
                 actions = {}
 
-            # 3 — execute PREVIOUS day's signals at TODAY's open ───
+            # 3 — log signals that will drive tomorrow's execution ─
+            buy_sigs = [t for t, a in actions.items() if a in ("BUY", "STRONG_BUY")]
+            sell_sigs = [t for t, a in actions.items() if a == "SELL"]
+            if buy_sigs or sell_sigs:
+                log.info(
+                    "[%s] %s  signals → BUY %s | SELL %s",
+                    self.config_name,
+                    day.strftime("%Y-%m-%d"),
+                    buy_sigs if buy_sigs else "—",
+                    sell_sigs if sell_sigs else "—",
+                )
+
+            # 4 — execute PREVIOUS day's signals at TODAY's open ───
             prices_open = self._prices(day, tickers, field="open")
             if i > 0 and prev_actions:
                 tracker.process_signals(day, prev_actions, prices_open)
 
-            # 4 — mark-to-market at close ──────────────────────────
+            # 5 — mark-to-market at close ──────────────────────────
             prices_close = self._prices(day, tickers, field="close")
             port_value = tracker.mark_to_market(day, prices_close)
 
-            # 5 — record ──────────────────────────────────────────
-            self.equity_curve.append((day, port_value))
+            # 6 — benchmark value (buy-and-hold from day 1) ───────
+            bench_value = self._benchmark_value(day, bench_start_close)
+            if bench_value is not None and bench_start_close is None:
+                # first day — initialise benchmark baseline
+                bench_df = self.data_source.fetch_benchmark()
+                if not bench_df.empty and day in bench_df.index:
+                    bench_start_close = float(bench_df.loc[day, "close"])
+                    bench_value = self.initial_capital
+
+            # 7 — record ──────────────────────────────────────────
+            self.equity_curve.append((day, port_value, bench_value))
             self.daily_log.append(
                 {
                     "date": day,
                     "portfolio_value": port_value,
+                    "benchmark_value": bench_value,
                     "cash": tracker.cash,
                     "n_positions": len(tracker.positions),
                     "positions": list(tracker.positions.keys()),
@@ -125,9 +148,10 @@ class BacktestEngine:
             prev_actions = actions
             self.action_history[day] = actions
 
-            if (i + 1) % 20 == 0 or i == len(trading_days) - 1:
+            # Progress every 50 days or on the last day
+            if (i + 1) % 50 == 0 or i == len(trading_days) - 1:
                 log.info(
-                    "[%s] %d/%d  %s  $%s  pos=%d",
+                    "[%s] %d/%d  %s  portfolio=$%s  pos=%d",
                     self.config_name,
                     i + 1,
                     len(trading_days),
@@ -141,7 +165,7 @@ class BacktestEngine:
             "config_name": self.config_name,
             "config": self.config,
             "equity_curve": pd.DataFrame(
-                self.equity_curve, columns=["date", "value"]
+                self.equity_curve, columns=["date", "value", "benchmark"]
             ),
             "daily_log": pd.DataFrame(self.daily_log),
             "trade_log": (
@@ -157,6 +181,29 @@ class BacktestEngine:
             "initial_capital": self.initial_capital,
             "open_positions": dict(tracker.positions),
         }
+
+    # ==================================================================
+    #  Benchmark helper
+    # ==================================================================
+    def _benchmark_value(
+        self, day, bench_start_close: float | None
+    ) -> float | None:
+        """
+        Return the benchmark portfolio value for *day* assuming
+        a buy-and-hold from the first trading day.
+        """
+        if bench_start_close is None:
+            # Will be initialised on first successful fetch
+            bench_df = self.data_source.fetch_benchmark()
+            if not bench_df.empty and day in bench_df.index:
+                return self.initial_capital  # first day
+            return None
+
+        bench_df = self.data_source.fetch_benchmark()
+        if bench_df.empty or day not in bench_df.index:
+            return None
+        bench_close_today = float(bench_df.loc[day, "close"])
+        return self.initial_capital * (bench_close_today / bench_start_close)
 
     # ==================================================================
     #  >>> INTEGRATION POINT 1 — run the pipeline for one day <<<
@@ -178,8 +225,6 @@ class BacktestEngine:
         # 2 — benchmark DataFrame via dedicated accessor
         bench_df = self.data_source.fetch_benchmark()
         if bench_df is None or bench_df.empty:
-            # fallback: try fetching benchmark by ticker name from
-            # ticker_data in case it was loaded as a regular ticker
             bench_ticker = self.config.get("BENCH_TICKER", "SPY")
             bench_df = self.data_source.fetch(bench_ticker)
         if bench_df is None or bench_df.empty:
@@ -241,7 +286,6 @@ class BacktestEngine:
             if not isinstance(df, pd.DataFrame) or df.empty:
                 continue
 
-            # find action column
             act_col = next(
                 (
                     c
@@ -253,7 +297,6 @@ class BacktestEngine:
             if act_col is None:
                 continue
 
-            # find ticker column or use index
             if "ticker" in df.columns:
                 for _, row in df.iterrows():
                     actions[row["ticker"]] = str(row[act_col]).upper()

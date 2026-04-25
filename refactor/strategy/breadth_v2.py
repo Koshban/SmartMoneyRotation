@@ -107,7 +107,12 @@ def compute_breadth(
     pct_above_sma200 = (close > sma200).sum(axis=1) / n_valid
 
     # ── 3. advance / decline ──────────────────────────────────────────────────
-    daily_ret = close.pct_change()
+    
+    #daily_ret = close.pct_change(fill_method=None)
+    #n_valid = daily_ret.notna().sum(axis=1)
+    #pct_advancing = (daily_ret > 0).sum(axis=1) / n_valid
+    #pct_advancing = pct_advancing.replace([np.inf, -np.inf], np.nan)
+    daily_ret = close.pct_change(fill_method=None)
     pct_advancing = (daily_ret > 0).sum(axis=1) / n_valid
 
     # ── 4. new-high / new-low (20-day rolling) ───────────────────────────────

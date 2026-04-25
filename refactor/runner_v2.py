@@ -27,7 +27,7 @@ logger = logging.getLogger("refactor.runner_v2")
 MARKET_PARQUET = {
     "US": "us_cash.parquet",
     "HK": "hk_cash.parquet",
-    "IN": "india_cash.parquet",
+    "IN": "in_cash.parquet",
 }
 DATE_CANDIDATE_COLS = ("date", "datetime", "timestamp", "dt")
 TICKER_CANDIDATE_COLS = ("ticker", "symbol")

@@ -1,6 +1,6 @@
 """
 backtest/phase2/metrics.py
-Performance metrics from backtest results.
+Performance metrics from backtest results, including benchmark comparison.
 """
 from __future__ import annotations
 
@@ -56,6 +56,9 @@ def compute_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
     # ── trade stats ───────────────────────────────────────────────
     tm = _trade_metrics(trades)
 
+    # ── benchmark comparison ──────────────────────────────────────
+    bm = _benchmark_metrics(equity, ann_ret, ann_factor)
+
     return {
         "total_return": total_ret,
         "annualized_return": ann_ret,
@@ -72,6 +75,96 @@ def compute_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
         "total_buy_signals": total_buys,
         "total_sell_signals": total_sells,
         **tm,
+        **bm,
+    }
+
+
+# ------------------------------------------------------------------
+def _benchmark_metrics(
+    equity: pd.DataFrame,
+    strategy_ann_ret: float,
+    ann_factor: float,
+) -> Dict[str, Any]:
+    """
+    Compute benchmark return and relative metrics (alpha, beta,
+    tracking error, information ratio) from the equity DataFrame.
+
+    Expects columns: 'value', 'benchmark'.
+    """
+    defaults = {
+        "benchmark_total_return": 0.0,
+        "benchmark_ann_return": 0.0,
+        "benchmark_ann_vol": 0.0,
+        "benchmark_sharpe": 0.0,
+        "benchmark_max_dd": 0.0,
+        "alpha": 0.0,
+        "beta": 0.0,
+        "tracking_error": 0.0,
+        "information_ratio": 0.0,
+    }
+
+    if "benchmark" not in equity.columns:
+        return defaults
+
+    bench = equity["benchmark"]
+    if bench.isna().all():
+        return defaults
+
+    # Forward-fill any gaps, then drop remaining NaNs
+    bench = bench.ffill()
+    valid = equity[["value", "benchmark"]].dropna()
+    if len(valid) < 10:
+        return defaults
+
+    bench_initial = valid["benchmark"].iloc[0]
+    bench_final = valid["benchmark"].iloc[-1]
+    bench_total_ret = (bench_final - bench_initial) / bench_initial if bench_initial > 0 else 0.0
+    bench_ann_ret = (1 + bench_total_ret) ** ann_factor - 1
+
+    # Daily returns for both
+    combined = pd.DataFrame({
+        "port_ret": valid["value"].pct_change(),
+        "bench_ret": valid["benchmark"].pct_change(),
+    }).dropna()
+
+    if len(combined) < 5:
+        return {**defaults, "benchmark_total_return": bench_total_ret, "benchmark_ann_return": bench_ann_ret}
+
+    bench_ann_vol = combined["bench_ret"].std() * np.sqrt(252)
+    bench_sharpe = bench_ann_ret / bench_ann_vol if bench_ann_vol > 0 else 0.0
+
+    # Benchmark drawdown
+    bench_peak = valid["benchmark"].cummax()
+    bench_dd = (valid["benchmark"] - bench_peak) / bench_peak
+    bench_max_dd = bench_dd.min()
+
+    # Excess returns
+    excess = combined["port_ret"] - combined["bench_ret"]
+    tracking_error = excess.std() * np.sqrt(252) if len(excess) > 1 else 0.0
+
+    # Beta = Cov(Rp, Rb) / Var(Rb)
+    bench_var = combined["bench_ret"].var()
+    if bench_var > 0:
+        beta = combined[["port_ret", "bench_ret"]].cov().iloc[0, 1] / bench_var
+    else:
+        beta = 0.0
+
+    # Jensen's alpha
+    alpha = strategy_ann_ret - beta * bench_ann_ret
+
+    # Information ratio
+    info_ratio = (strategy_ann_ret - bench_ann_ret) / tracking_error if tracking_error > 0 else 0.0
+
+    return {
+        "benchmark_total_return": bench_total_ret,
+        "benchmark_ann_return": bench_ann_ret,
+        "benchmark_ann_vol": bench_ann_vol,
+        "benchmark_sharpe": bench_sharpe,
+        "benchmark_max_dd": bench_max_dd,
+        "alpha": alpha,
+        "beta": beta,
+        "tracking_error": tracking_error,
+        "information_ratio": info_ratio,
     }
 
 

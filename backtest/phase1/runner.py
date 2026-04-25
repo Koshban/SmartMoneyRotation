@@ -4,7 +4,7 @@ backtest/runner.py
 CLI entry point for backtesting.
 
 The --universe flag is the primary control:
-  us / hk / india        → full universe from common.universe
+  us / hk / in       → full universe from common.universe
   us_core / hk_core / …  → hardcoded ETF/stock sets
 
 Market, benchmark, and strategy filtering are all derived from it.
@@ -12,14 +12,14 @@ Market, benchmark, and strategy filtering are all derived from it.
 Usage:
     python -m backtest.runner --universe us                          # full US
     python -m backtest.runner --universe hk                          # full HK
-    python -m backtest.runner --universe india                       # full India
+    python -m backtest.runner --universe in                       # full India
     python -m backtest.runner --universe us_core                     # 41 ETFs
     python -m backtest.runner --show-universe --universe hk          # inspect HK
-    python -m backtest.runner --show-universe --universe india       # inspect India
+    python -m backtest.runner --show-universe --universe in       # inspect India
     python -m backtest.runner --compare --universe us                # compare US
     python -m backtest.runner --compare --universe hk                # compare HK
     python -m backtest.runner --strategy regime_adaptive --universe us
-    python -m backtest.runner --list --universe india                # India strats
+    python -m backtest.runner --list --universe in                # India strats
 """
 
 from __future__ import annotations
@@ -69,14 +69,14 @@ Universe choices: {valid_str}
 Examples:
   python -m backtest.runner --universe us                            # full US
   python -m backtest.runner --universe hk --start 2020               # full HK
-  python -m backtest.runner --universe india --start 2022            # full India
+  python -m backtest.runner --universe in --start 2022            # full India
   python -m backtest.runner --universe us_core                       # 41 hardcoded ETFs
   python -m backtest.runner --show-universe --universe hk            # inspect HK
-  python -m backtest.runner --show-universe --universe india         # inspect India
+  python -m backtest.runner --show-universe --universe in         # inspect India
   python -m backtest.runner --compare --universe us                  # compare US strats
   python -m backtest.runner --compare --universe hk                  # compare HK strats
   python -m backtest.runner --strategy regime_adaptive --universe us
-  python -m backtest.runner --list --universe india                  # India strategies
+  python -m backtest.runner --list --universe in                  # India strategies
   python -m backtest.runner --tickers AAPL MSFT GOOG --start 2020   # custom tickers
         """,
     )
@@ -174,7 +174,7 @@ def _resolve_market_and_scope(args) -> tuple[str, str]:
 
     # Handle backward-compat --market flag
     if args.market and universe_str in ("core", "full", "us_core"):
-        market_map = {"US": "us", "HK": "hk", "IN": "india"}
+        market_map = {"US": "us", "HK": "hk", "IN": "in"}
         base = market_map.get(args.market.upper(), "us")
         if universe_str == "full":
             universe_str = base
@@ -212,7 +212,7 @@ def main():
         uni_name = args.universe.lower().strip()
         # Backward-compat: if they used --market
         if args.market and uni_name in ("core", "full", "us_core"):
-            market_map = {"US": "us", "HK": "hk", "IN": "india"}
+            market_map = {"US": "us", "HK": "hk", "IN": "in"}
             base = market_map.get(args.market.upper(), "us")
             uni_name = base if uni_name == "full" else f"{base}_core"
 

@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # ── Parquet paths ─────────────────────────────────────────────
 _UNIVERSE_PARQUET = DATA_DIR / "universe_ohlcv.parquet"
-_INDIA_PARQUET    = DATA_DIR / "india_ohlcv.parquet"
+_INDIA_PARQUET    = DATA_DIR / "in_cash.parquet"
 
 _REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 
@@ -422,7 +422,7 @@ def _ticker_to_cash_table(ticker: str) -> str:
     if t.endswith(".HK"):
         return "hk_cash"
     elif t.endswith(".NS") or t.endswith(".BO"):
-        return "india_cash"
+        return "in_cash"
     elif "." not in t:
         return "us_cash"
     else:

@@ -447,7 +447,7 @@ SIGNAL_PARAMS = {
     "exit_score_max":         0.35,
 
     # ── RS regime gate ───────────────────────────────────────
-    "allowed_rs_regimes":     ["leading", "improving"],
+    "allowed_rs_regimes": ("leading", "improving", "neutral"),
     "allowed_sector_regimes": ["leading", "improving", "neutral"],
 
     # ── Legacy regime keys ───────────────────────────────────

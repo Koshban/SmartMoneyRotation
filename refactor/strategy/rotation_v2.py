@@ -81,13 +81,6 @@ MIN_HISTORY = 60
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _detect_market(symbol_frames: dict[str, pd.DataFrame]) -> str:
-    """
-    Infer market from ticker suffixes in *symbol_frames*.
-
-    Heuristic: count tickers ending in ``.HK``, ``.NS`` / ``.BO``,
-    or neither.  Whichever suffix family has the majority wins.
-    Falls back to ``"US"`` when ambiguous.
-    """
     hk = 0
     india = 0
     other = 0
@@ -127,30 +120,6 @@ def compute_sector_rotation(
 
     For US: sector-ETF rotation (11 GICS sectors vs SPY).
     For HK / IN: per-stock rotation (every ticker vs market benchmark).
-
-    Parameters
-    ----------
-    symbol_frames : dict[str, DataFrame]
-        Universe of symbol OHLCV frames keyed by ticker.
-    bench_df : DataFrame
-        Benchmark OHLCV data (SPY / 2800.HK / NIFTYBEES.NS).
-    market : str or None
-        Market code: ``"US"``, ``"HK"``, or ``"IN"``.
-        If *None*, auto-detected from ticker suffixes.
-    rs_sma_period : int
-        Rolling window for the RS-ratio trend line (default 50).
-    rs_momentum_period : int
-        Lookback for rate-of-change of the RS ratio (default 20).
-    smooth_span : int
-        EMA span applied to the raw RS ratio (default 10).
-    min_history : int
-        Minimum aligned rows required to compute RS (default 60).
-
-    Returns
-    -------
-    dict
-        ``sector_summary`` (DataFrame), ``sector_regimes`` (dict),
-        ``ticker_regimes`` (dict).
     """
     if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
         logger.warning("compute_sector_rotation: benchmark missing or empty")
@@ -167,7 +136,7 @@ def compute_sector_rotation(
     # ── resolve market ────────────────────────────────────────────────────
     if market is None:
         market = _detect_market(symbol_frames)
-        logger.info(
+        logger.debug(
             "Sector rotation: auto-detected market=%s from %d tickers",
             market, len(symbol_frames),
         )
@@ -177,8 +146,6 @@ def compute_sector_rotation(
 
     # ── sector-ETF mode (US) ──────────────────────────────────────────────
     if sector_etfs:
-        # Check that at least some ETFs actually exist in symbol_frames
-        # before committing to sector-ETF mode.
         available = sum(
             1 for etf in sector_etfs.values()
             if etf in symbol_frames
@@ -186,7 +153,7 @@ def compute_sector_rotation(
             and not symbol_frames[etf].empty
         )
         if available > 0:
-            logger.info(
+            logger.debug(
                 "Sector rotation: sector-ETF mode  market=%s  "
                 "etfs_available=%d/%d",
                 market, available, len(sector_etfs),
@@ -201,7 +168,6 @@ def compute_sector_rotation(
                 smooth_span=smooth_span,
                 min_history=min_history,
             )
-            # If sector-ETF mode produced valid results, return them.
             if result["ticker_regimes"]:
                 return result
             logger.warning(
@@ -209,14 +175,14 @@ def compute_sector_rotation(
                 "falling back to per-stock mode"
             )
         else:
-            logger.info(
+            logger.debug(
                 "Sector rotation: market=%s but 0/%d sector ETFs "
                 "present in symbol_frames; falling back to per-stock mode",
                 market, len(sector_etfs),
             )
 
     # ── per-stock mode (HK, IN, or fallback) ─────────────────────────────
-    logger.info(
+    logger.debug(
         "Sector rotation: per-stock mode  market=%s  "
         "(%d tickers vs benchmark)",
         market, len(symbol_frames),
@@ -245,7 +211,6 @@ def _compute_rs_for_one(
 ) -> dict | None:
     """
     Compute RRG-style RS metrics for a single close series vs benchmark.
-
     Returns a dict of scalar metrics, or ``None`` if data is insufficient.
     """
     combined = pd.DataFrame(
@@ -255,24 +220,20 @@ def _compute_rs_for_one(
     if len(combined) < min_history:
         return None
 
-    # ── RS ratio (smoothed) ──────────────────────────────────────────────
     rs_raw = combined["target"] / combined["bench"]
     rs = rs_raw.ewm(
         span=smooth_span,
         min_periods=max(3, smooth_span // 2),
     ).mean()
 
-    # ── RS level: fractional distance from its own SMA ──────────────────
     rs_sma = rs.rolling(
         rs_sma_period,
         min_periods=int(rs_sma_period * 0.7),
     ).mean()
     rs_level = rs / rs_sma - 1.0
 
-    # ── RS momentum: rate-of-change of smoothed RS ratio ────────────────
     rs_mom = rs.pct_change(rs_momentum_period)
 
-    # ── Secondary metrics ────────────────────────────────────────────────
     rs_roc_5 = rs.pct_change(5)
     excess_20 = (
         combined["target"].pct_change(20)
@@ -333,9 +294,9 @@ def _log_regime_distribution(
     label_col: str,
     max_display: int = 20,
 ) -> None:
-    """Log regime counts and per-regime members."""
+    """Log regime counts and per-regime members — all at DEBUG level."""
     regime_dist = summary["regime"].value_counts().to_dict()
-    logger.info("Rotation regime distribution: %s", regime_dist)
+    logger.debug("Rotation regime distribution: %s", regime_dist)
 
     for regime in ("leading", "improving", "weakening", "lagging"):
         members = summary.loc[
@@ -347,7 +308,7 @@ def _log_regime_distribution(
             if len(members) > max_display
             else ""
         )
-        logger.info(
+        logger.debug(
             "  %-12s: %s%s",
             regime.title(),
             display or ["none"],
@@ -388,10 +349,6 @@ def _compute_sector_etf_rotation(
     for sector_name, etf_ticker in sector_etfs.items():
         etf_df = symbol_frames.get(etf_ticker)
         if etf_df is None or etf_df.empty or "close" not in etf_df.columns:
-            logger.debug(
-                "Sector rotation: %s (%s) not in symbol_frames",
-                etf_ticker, sector_name,
-            )
             skipped_missing += 1
             continue
 
@@ -402,16 +359,12 @@ def _compute_sector_etf_rotation(
         )
 
         if metrics is None:
-            logger.debug(
-                "Sector rotation: %s (%s) insufficient data or NaN at tail",
-                etf_ticker, sector_name,
-            )
             skipped_short += 1
             continue
 
         rows.append({"sector": sector_name, "etf": etf_ticker, **metrics})
 
-    logger.info(
+    logger.debug(
         "Sector rotation: computed=%d  skipped_missing=%d  skipped_short=%d",
         len(rows), skipped_missing, skipped_short,
     )
@@ -422,7 +375,6 @@ def _compute_sector_etf_rotation(
 
     summary = _classify_and_rank(pd.DataFrame(rows))
 
-    # ── lookup dicts ─────────────────────────────────────────────────────
     sector_regimes: dict[str, str] = dict(
         zip(summary["sector"], summary["regime"]),
     )
@@ -454,11 +406,6 @@ def _compute_per_stock_rotation(
 ) -> dict:
     """
     One RS computation per universe ticker vs the market benchmark.
-
-    Every stock is classified into its own RRG quadrant.
-    To keep output schema compatible with sector-ETF mode,
-    the ``sector`` column is set to the ticker itself, and
-    ``sector_regimes`` mirrors ``ticker_regimes``.
     """
     rows: list[dict] = []
     skipped = 0
@@ -475,16 +422,12 @@ def _compute_per_stock_rotation(
         )
 
         if metrics is None:
-            logger.debug(
-                "Per-stock rotation: %s skipped (insufficient data or NaN)",
-                ticker,
-            )
             skipped += 1
             continue
 
         rows.append({"ticker": ticker, "sector": ticker, **metrics})
 
-    logger.info(
+    logger.debug(
         "Per-stock rotation: computed=%d  skipped=%d  total=%d",
         len(rows), skipped, len(symbol_frames),
     )
@@ -501,10 +444,6 @@ def _compute_per_stock_rotation(
     ticker_regimes: dict[str, str] = dict(
         zip(summary["ticker"], summary["regime"]),
     )
-
-    # sector_regimes mirrors ticker_regimes so downstream code
-    # that looks up sectrsregime via sector_regimes gets real
-    # quadrants instead of "unknown".
     sector_regimes: dict[str, str] = dict(ticker_regimes)
 
     _log_regime_distribution(summary, "ticker")

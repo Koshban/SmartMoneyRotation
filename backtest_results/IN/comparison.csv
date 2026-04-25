@@ -1,26 +1,36 @@
 Metric,Loose,Tight,Better
-Total Return,-3.9%,-0.9%,Tight
-Annualized Return,-4.5%,-1.0%,Tight
-Final Value,"960,755","991,006",Tight
+Total Return,0.0%,0.0%,Tie
+Annualized Return,0.0%,0.0%,Tie
+Final Value,"1,000,000","1,000,000",Tie
 ────────────────────────────,,,
-Annualized Vol,1.5%,0.5%,Loose
-Sharpe Ratio,-3.02,-2.06,Tight
-Sortino Ratio,-1.62,-0.61,Tight
-Max Drawdown,-4.2%,-0.9%,Tight
-Max DD Duration (days),195,131,Loose
-Calmar Ratio,-1.06,-1.14,Loose
+Annualized Vol,0.0%,0.0%,Tie
+Sharpe Ratio,0.00,0.00,Tie
+Sortino Ratio,0.00,0.00,Tie
+Max Drawdown,0.0%,0.0%,Tie
+Max DD Duration (days),0,0,Tie
+Calmar Ratio,0.00,0.00,Tie
 ────────────────────────────,,,
-Total Trades,31,4,
-Win Rate,25.8%,0.0%,Loose
-Avg Win,0.7%,0.0%,Loose
-Avg Loss,-2.3%,-2.7%,Loose
-Profit Factor,0.11,0.00,Loose
-Avg PnL %,-1.54%,-2.72%,Loose
-Expectancy ($),"-1,266","-2,248",Loose
-Avg Holding Days,2.3,4.0,
+Total Trades,0,0,
+Win Rate,0.0%,0.0%,Tie
+Avg Win,0.0%,0.0%,Tie
+Avg Loss,0.0%,0.0%,Tie
+Profit Factor,0.00,0.00,Tie
+Avg PnL %,0.00%,0.00%,Tie
+Expectancy ($),0,0,Tie
+Avg Holding Days,0.0,0.0,
 ────────────────────────────,,,
-Best Trade,2.1%,-0.8%,Loose
-Worst Trade,-8.6%,-4.6%,Tight
-Avg Positions,0.2,0.1,
-Buy Signals,36,5,
-Sell Signals,11708,11793,
+Best Trade,0.0%,0.0%,Tie
+Worst Trade,0.0%,0.0%,Tie
+Avg Positions,0.0,0.0,
+Buy Signals,0,0,
+Sell Signals,0,0,
+────────────────────────────,,,
+Benchmark Return,-0.9%,-0.9%,
+Benchmark Ann. Return,-1.0%,-1.0%,
+Benchmark Sharpe,-0.08,-0.08,
+Benchmark Max DD,-14.8%,-14.8%,
+────────────────────────────,,,
+Alpha (Jensen),0.00%,0.00%,Tie
+Beta,0.00,0.00,
+Tracking Error,12.3%,12.3%,Tie
+Information Ratio,0.08,0.08,Tie

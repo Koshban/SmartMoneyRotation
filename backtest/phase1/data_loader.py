@@ -5,7 +5,7 @@ Download, cache, and serve historical OHLCV data for backtesting.
 
 Enhanced:
   - Region-aware universe building from common.universe
-  - --universe us|hk|india derives market, tickers, benchmark
+  - --universe us|hk|in derives market, tickers, benchmark
   - Suffix-based ticker routing (.HK → Hong Kong, .NS/.BO → India)
   - Batched downloads for large universes (100+ tickers)
   - Separate cache files per (market, scope) pair

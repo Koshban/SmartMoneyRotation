@@ -54,12 +54,12 @@ SIGNALPARAMS_V2 = {
         "volatile": 0.04,
         "chaotic": 0.12,
     },
-    "breadth_entry_adjustment": {
-        "strong": -0.01,
-        "neutral": 0.02,
-        "weak": 0.08,
-        "critical": 0.14,
-        "unknown": 0.03,
+    "breadth_entry_adjustment": { 
+        "strong": -0.02,
+        "neutral": 0.00,
+        "weak": 0.03,
+        "critical": 0.08,
+        "unknown": 0.00,
     },
     "size_multipliers": {
         "calm": 1.00,

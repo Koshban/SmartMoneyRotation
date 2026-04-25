@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 common/universe.py
 Full investable universe for Smart Money Rotation.
@@ -20,10 +18,27 @@ Ticker conventions:
 
 ingest.py must parse suffixes to set the correct IBKR contract params.
 """
+from __future__ import annotations
 
-# ═════════════════════════════════════════════════════════════════
-#  TIER 1 :  ETF UNIVERSE  (core US rotation engine)
-# ═════════════════════════════════════════════════════════════════
+"""
+Full investable universe for Smart Money Rotation.
+
+Three tiers:
+  1.  ETF Universe     — used by the core US rotation engine (scoring, signals, orders)
+  1b. HK Universe      — scored by the bottom-up engine vs 2800.HK benchmark
+  1c. India Universe   — scored by the bottom-up engine vs NIFTYBEES.NS benchmark
+  2.  Single Names     — organized by theme, for future stock-picking layer
+
+Both tiers get ingested into daily_prices so we always have data ready.
+
+Ticker conventions:
+  Hong Kong  — "XXXX.HK"   (exchange SEHK, currency HKD)
+  India NSE  — "SYMBOL.NS"  (exchange NSE,  currency INR)
+  India BSE  — "SYMBOL.BO"  (exchange BSE,  currency INR)
+  US         — plain symbol  (exchange SMART, currency USD)
+
+ingest.py must parse suffixes to set the correct IBKR contract params.
+"""
 
 BROAD_MARKET = ["SPY", "QQQ", "IWM", "DIA", "MDY"]
 
@@ -72,53 +87,53 @@ ETF_UNIVERSE = (
     + COMMODITIES
 )
 
-
-# ═════════════════════════════════════════════════════════════════
-#  TIER 1b :  HK SCORING UNIVERSE
-# ═════════════════════════════════════════════════════════════════
-
 HK_SINGLE_NAMES = [
-    "0700.HK", "9988.HK", "3690.HK", "9618.HK", "9888.HK",
-    "1810.HK", "9999.HK", "9626.HK", "1024.HK", "0992.HK",
-    "1299.HK", "0005.HK", "0388.HK", "2318.HK", "0939.HK",
-    "1398.HK", "3988.HK",
-    "0001.HK", "1113.HK", "0016.HK", "0823.HK", "1109.HK",
-    "0883.HK", "0857.HK", "0002.HK", "0003.HK", "0386.HK", "0836.HK",
-    "1211.HK", "2015.HK", "9868.HK", "0175.HK",
-    "9633.HK", "2020.HK",
-    "0941.HK", "0762.HK",
-    "1177.HK", "2269.HK", "3692.HK",
-    "9866.HK", "9961.HK",
+    "0285.HK", "0700.HK", "0881.HK", "0981.HK", "0992.HK", "1024.HK",
+    "1157.HK", "1177.HK", "1211.HK", "1299.HK", "1317.HK", "1398.HK",
+    "1428.HK", "1475.HK", "1585.HK", "1810.HK", "1833.HK", "1910.HK",
+    "2015.HK", "2020.HK", "2269.HK", "2318.HK", "2333.HK",
+    "2801.HK", "2823.HK", "2834.HK", "3074.HK",
+    "3690.HK", "3692.HK", "3759.HK", "3988.HK", "6186.HK",
+    "7226.HK", "9618.HK", "9626.HK", "9633.HK", "9866.HK", "9868.HK",
+    "9888.HK", "9961.HK", "9988.HK", "0001.HK", "0002.HK", "0003.HK",
+    "0005.HK", "0016.HK", "0175.HK", "0386.HK", "0388.HK", "0762.HK",
+    "0823.HK", "0836.HK", "0857.HK", "0883.HK", "0939.HK", "0941.HK",
+    "1109.HK", "1113.HK",
 ]
 
 HK_UNIVERSE = sorted(set(HK_ETFS + HK_SINGLE_NAMES))
 
-
-# ═════════════════════════════════════════════════════════════════
-#  TIER 1c :  INDIA SCORING UNIVERSE
-# ═════════════════════════════════════════════════════════════════
-
 INDIA_LARGE_CAPS = [
-    "TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS", "LTIM.NS",
-    "PERSISTENT.NS", "MPHASIS.NS", "COFORGE.NS",
-    "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS", "AXISBANK.NS",
-    "BAJFINANCE.NS", "BAJAJFINSV.NS", "INDUSINDBK.NS",
-    "RELIANCE.NS", "ONGC.NS", "NTPC.NS", "POWERGRID.NS", "ADANIGREEN.NS", "COALINDIA.NS",
-    "HINDUNILVR.NS", "ITC.NS", "ASIANPAINT.NS", "TITAN.NS", "NESTLEIND.NS", "BRITANNIA.NS", "MARUTI.NS",
-    "LT.NS", "ADANIENT.NS", "ADANIPORTS.NS", "ULTRACEMCO.NS", "GRASIM.NS", "TATASTEEL.NS",
-    "JSWSTEEL.NS", "HINDALCO.NS", "ABB.NS", "SIEMENS.NS", "BHEL.NS", "CGPOWER.NS",
-    "SUNPHARMA.NS", "DRREDDY.NS", "CIPLA.NS", "APOLLOHOSP.NS", "DIVISLAB.NS", "SYNGENE.NS",
-    "BHARTIARTL.NS",
-    "TMPV.NS", "M&M.NS", "EICHERMOT.NS", "BAJAJ-AUTO.NS", "HEROMOTOCO.NS",
+    "ABB.NS", "AARTIIND.NS", "ADANIENT.NS", "ADANIGREEN.NS", "ADANIPORTS.NS",
+    "ALLCARGO.NS", "AMBER.NS", "ANDHRSUGAR.NS", "APOLLOHOSP.NS", "ARE&M.NS",
+    "ASAHISONG.NS", "ASHIANA.NS", "ASHOKLEY.NS", "ASIANPAINT.NS", "AXISBANK.NS",
+    "BAJAJ-AUTO.NS", "BAJAJFINSV.NS", "BAJFINANCE.NS", "BDL.NS", "BEL.NS",
+    "BHARATFORG.NS", "BHARTIARTL.NS", "BHAGERIA.NS", "BHEL.NS", "BIOCON.NS",
+    "BORORENEW.NS", "BRITANNIA.NS", "CAPLIPOINT.NS", "CENTURYTEX.NS", "CGPOWER.NS",
+    "CIPLA.NS", "COALINDIA.NS", "COCHINSHIP.NS", "COFORGE.NS", "CONTROLPR.NS",
+    "CRAFTSMAN.NS", "CYIENTDLM.NS", "DABUR.NS", "DATAPATTNS.NS", "DBREALTY.NS",
+    "DECCANCE.NS", "DIXON.NS", "DIVISLAB.NS", "DRREDDY.NS", "EICHERMOT.NS",
+    "FIEMIND.NS", "FSL.NS", "GABRIEL.NS", "GALAXYSURF.NS", "GESHIP.NS",
+    "GRASIM.NS", "GRSE.NS", "HCLTECH.NS", "HDFCBANK.NS", "HEIDELBERG.NS",
+    "HEROMOTOCO.NS", "HGINFRA.NS", "HIKAL.NS", "HINDALCO.NS", "HINDUNILVR.NS",
+    "ICICIBANK.NS", "ICICIPRULI.NS", "IDEAFORGE.NS", "INDUSINDBK.NS", "INFY.NS",
+    "INSECTICID.NS", "INTELLECT.NS", "ITC.NS", "JSWSTEEL.NS", "JUBLFOOD.NS",
+    "JYOTHYLAB.NS", "KALYANIFRG.NS", "KAYNES.NS", "KEI.NS", "KOTAKBANK.NS",
+    "LAOPALA.NS", "LTF.NS", "LT.NS", "LTIM.NS", "MANAPPURAM.NS", "MARICO.NS",
+    "MARUTI.NS", "MEGH.NS", "METROBRAND.NS", "MINDACORP.NS", "MINDAIND.NS",
+    "MPHASIS.NS", "MTARTECH.NS", "MUTHOOTFIN.NS", "NAZARA.NS", "NCC.NS",
+    "NESTLEIND.NS", "NAVINFLUOR.NS", "NMDC.NS", "NRBBEARING.NS", "NTPC.NS",
+    "ONGC.NS", "PAYTM.NS", "PCBL.NS", "PERSISTENT.NS", "PIIND.NS",
+    "POLYCAB.NS", "POWERGRID.NS", "PRESTIGE.NS", "RELIANCE.NS", "SAMHI.NS",
+    "SBIN.NS", "SHAILY.NS", "SIEMENS.NS", "SIRCA.NS", "SJS.NS",
+    "SKYGOLD.NS", "SONACOMS.NS", "STLTECH.NS", "SUNPHARMA.NS", "SWSOLAR.NS",
+    "SYNGENE.NS", "SYRMA.NS", "TATAPOWER.NS", "TATASTEEL.NS", "TCS.NS",
+    "TECHM.NS", "TITAN.NS", "TRITURBINE.NS", "ULTRACEMCO.NS", "WABAG.NS",
+    "WEBELSOLAR.NS", "WIPRO.NS",
 ]
 
 INDIA_BENCHMARKS = ["NIFTYBEES.NS"]
 INDIA_UNIVERSE = sorted(set(INDIA_LARGE_CAPS + INDIA_BENCHMARKS))
-
-
-# ═════════════════════════════════════════════════════════════════
-#  TIER 2 :  SINGLE NAMES  (future stock-picking layer)
-# ═════════════════════════════════════════════════════════════════
 
 SINGLE_NAMES = {
     "ai_infrastructure": {
@@ -249,87 +264,95 @@ SINGLE_NAMES = {
         "name": "India",
         "etf_proxy": "INDA",
         "tickers": [
-            "AMBER.NS", "ARE&M.NS", "AXISBANK.NS", "BDL.NS", "BEL.NS", "BHARATFORG.NS",
-            "BORORENEW.NS", "COCHINSHIP.NS", "CONTROLPR.NS", "CRAFTSMAN.NS", "CYIENTDLM.NS",
-            "DATAPATTNS.NS", "DBREALTY.NS", "DECCANCE.NS", "DIXON.NS", "EICHERMOT.NS",
-            "FIEMIND.NS", "FSL.NS", "GABRIEL.NS", "GALAXYSURF.NS", "GESHIP.NS", "GRSE.NS",
-            "HDFCBANK.NS", "HGINFRA.NS", "ICICIBANK.NS", "IDEAFORGE.NS", "INTELLECT.NS",
-            "KAYNES.NS", "KEI.NS", "KOTAKBANK.NS", "LT.NS", "LTIM.NS", "METROBRAND.NS",
-            "MTARTECH.NS", "NAVINFLUOR.NS", "NAZARA.NS", "NCC.NS", "PAYTM.NS", "PCBL.NS",
-            "PIIND.NS", "POLYCAB.NS", "PRESTIGE.NS", "RELIANCE.NS", "SAMHI.NS", "SHAILY.NS",
-            "SIRCA.NS", "SJS.NS", "SKYGOLD.NS", "SONACOMS.NS", "STLTECH.NS", "SWSOLAR.NS",
-            "SYNGENE.NS", "SYRMA.NS", "TATAPOWER.NS", "TRITURBINE.NS", "WABAG.NS", "WEBELSOLAR.NS",
+            "AARTIIND.NS", "ALLCARGO.NS", "AMBER.NS", "ANDHRSUGAR.NS", "ARE&M.NS",
+            "ASAHISONG.NS", "ASHIANA.NS", "ASHOKLEY.NS", "AXISBANK.NS", "BAJAJFINSV.NS",
+            "BDL.NS", "BEL.NS", "BHAGERIA.NS", "BHARATFORG.NS", "BIOCON.NS",
+            "BORORENEW.NS", "CAPLIPOINT.NS", "CENTURYTEX.NS", "COALINDIA.NS", "COCHINSHIP.NS",
+            "CONTROLPR.NS", "CRAFTSMAN.NS", "CYIENTDLM.NS", "DABUR.NS", "DATAPATTNS.NS",
+            "DBREALTY.NS", "DECCANCE.NS", "DIXON.NS", "EICHERMOT.NS", "FIEMIND.NS",
+            "FSL.NS", "GABRIEL.NS", "GALAXYSURF.NS", "GESHIP.NS", "GRSE.NS",
+            "HDFCBANK.NS", "HEIDELBERG.NS", "HGINFRA.NS", "HIKAL.NS", "ICICIBANK.NS",
+            "ICICIPRULI.NS", "IDEAFORGE.NS", "INDUSINDBK.NS", "INSECTICID.NS", "INTELLECT.NS",
+            "ITC.NS", "JUBLFOOD.NS", "JYOTHYLAB.NS", "KALYANIFRG.NS", "KAYNES.NS",
+            "KEI.NS", "KOTAKBANK.NS", "LAOPALA.NS", "LTF.NS", "LT.NS",
+            "LTIM.NS", "MANAPPURAM.NS", "MARICO.NS", "MEGH.NS", "METROBRAND.NS",
+            "MINDACORP.NS", "MINDAIND.NS", "MTARTECH.NS", "MUTHOOTFIN.NS", "NAVINFLUOR.NS",
+            "NAZARA.NS", "NCC.NS", "PAYTM.NS", "PCBL.NS", "PIIND.NS",
+            "POLYCAB.NS", "PRESTIGE.NS", "RELIANCE.NS", "SAMHI.NS", "SHAILY.NS",
+            "SIRCA.NS", "SJS.NS", "SKYGOLD.NS", "SONACOMS.NS", "STLTECH.NS",
+            "SWSOLAR.NS", "SYNGENE.NS", "SYRMA.NS", "TATAPOWER.NS", "TRITURBINE.NS",
+            "WABAG.NS", "WEBELSOLAR.NS",
         ],
     },
 }
 
 
 def is_hk_ticker(symbol: str) -> bool:
-    return symbol.upper().endswith(".HK")
+    return symbol.upper().endswith('.HK')
 
 
 def parse_hk_symbol(symbol: str) -> tuple[str, str]:
-    code = symbol.replace(".HK", "")
-    return code, "SEHK"
+    code = symbol.replace('.HK', '')
+    return code, 'SEHK'
 
 
 def is_india_ticker(symbol: str) -> bool:
     s = symbol.upper()
-    return s.endswith(".NS") or s.endswith(".BO")
+    return s.endswith('.NS') or s.endswith('.BO')
 
 
 def parse_india_symbol(symbol: str) -> tuple[str, str]:
-    if symbol.endswith(".NS"):
-        return symbol.replace(".NS", ""), "NSE"
-    elif symbol.endswith(".BO"):
-        return symbol.replace(".BO", ""), "BSE"
-    raise ValueError(f"Not an India ticker: {symbol}")
+    if symbol.endswith('.NS'):
+        return symbol.replace('.NS', ''), 'NSE'
+    elif symbol.endswith('.BO'):
+        return symbol.replace('.BO', ''), 'BSE'
+    raise ValueError(f'Not an India ticker: {symbol}')
 
 
 def detect_market(symbol: str) -> str:
     if is_hk_ticker(symbol):
-        return "HK"
+        return 'HK'
     if is_india_ticker(symbol):
-        return "IN"
-    return "US"
+        return 'IN'
+    return 'US'
 
 
 CATEGORY_MAP: dict[str, str] = {}
 for _sym in BROAD_MARKET:
-    CATEGORY_MAP[_sym] = "Broad Market"
+    CATEGORY_MAP[_sym] = 'Broad Market'
 for _sym in SECTORS:
-    CATEGORY_MAP[_sym] = "Sector"
+    CATEGORY_MAP[_sym] = 'Sector'
 for _sym in THEMATIC_ETFS:
-    CATEGORY_MAP[_sym] = "Thematic"
+    CATEGORY_MAP[_sym] = 'Thematic'
 for _sym in INTERNATIONAL:
-    CATEGORY_MAP[_sym] = "International"
+    CATEGORY_MAP[_sym] = 'International'
 for _sym in HK_ETFS:
-    CATEGORY_MAP[_sym] = "HK ETF"
+    CATEGORY_MAP[_sym] = 'HK ETF'
 for _sym in FIXED_INCOME:
-    CATEGORY_MAP[_sym] = "Fixed Income"
+    CATEGORY_MAP[_sym] = 'Fixed Income'
 for _sym in COMMODITIES:
-    CATEGORY_MAP[_sym] = "Commodities"
+    CATEGORY_MAP[_sym] = 'Commodities'
 for _sym in HK_SINGLE_NAMES:
-    CATEGORY_MAP.setdefault(_sym, "HK Single Name")
+    CATEGORY_MAP.setdefault(_sym, 'HK Single Name')
 for _sym in INDIA_LARGE_CAPS:
-    CATEGORY_MAP.setdefault(_sym, "India Large Cap")
+    CATEGORY_MAP.setdefault(_sym, 'India Large Cap')
 for _sym in INDIA_BENCHMARKS:
-    CATEGORY_MAP.setdefault(_sym, "India Benchmark")
+    CATEGORY_MAP.setdefault(_sym, 'India Benchmark')
 
 
 def get_all_single_names() -> list[str]:
     all_t: set[str] = set()
     for theme in SINGLE_NAMES.values():
-        all_t.update(theme["tickers"])
+        all_t.update(theme['tickers'])
     return sorted(all_t)
 
 
 def get_theme_etf_proxies() -> list[str]:
-    return sorted({t["etf_proxy"] for t in SINGLE_NAMES.values()})
+    return sorted({t['etf_proxy'] for t in SINGLE_NAMES.values()})
 
 
 def get_themes_for_ticker(ticker: str) -> list[str]:
-    return [key for key, theme in SINGLE_NAMES.items() if ticker in theme["tickers"]]
+    return [key for key, theme in SINGLE_NAMES.items() if ticker in theme['tickers']]
 
 
 def get_us_only_etfs() -> list[str]:
@@ -339,14 +362,14 @@ def get_us_only_etfs() -> list[str]:
 def get_hk_only() -> list[str]:
     hk: set[str] = set(HK_UNIVERSE)
     for theme in SINGLE_NAMES.values():
-        hk.update(s for s in theme["tickers"] if is_hk_ticker(s))
+        hk.update(s for s in theme['tickers'] if is_hk_ticker(s))
     return sorted(hk)
 
 
 def get_india_only() -> list[str]:
     india: set[str] = set(INDIA_UNIVERSE)
     for theme in SINGLE_NAMES.values():
-        india.update(s for s in theme["tickers"] if is_india_ticker(s))
+        india.update(s for s in theme['tickers'] if is_india_ticker(s))
     return sorted(india)
 
 
@@ -360,11 +383,11 @@ def get_full_universe() -> list[str]:
 
 
 def get_universe_for_market(market: str) -> list[str]:
-    if market == "US":
+    if market == 'US':
         return list(ETF_UNIVERSE)
-    elif market == "HK":
+    elif market == 'HK':
         return list(HK_UNIVERSE)
-    elif market == "IN":
+    elif market == 'IN':
         return list(INDIA_UNIVERSE)
     else:
         raise ValueError(f"Unknown market: {market!r}  (expected 'US', 'HK', or 'IN')")
@@ -375,13 +398,13 @@ def print_universe():
     print(f"  TIER 1 : ETF UNIVERSE  ({len(ETF_UNIVERSE)} symbols)")
     print(f"{'='*65}")
     etf_groups = [
-        ("Broad Market", BROAD_MARKET),
-        ("Sectors", SECTORS),
-        ("Thematic ETFs", THEMATIC_ETFS),
-        ("International", INTERNATIONAL),
-        ("HK ETFs", HK_ETFS),
-        ("Fixed Income", FIXED_INCOME),
-        ("Commodities", COMMODITIES),
+        ('Broad Market', BROAD_MARKET),
+        ('Sectors', SECTORS),
+        ('Thematic ETFs', THEMATIC_ETFS),
+        ('International', INTERNATIONAL),
+        ('HK ETFs', HK_ETFS),
+        ('Fixed Income', FIXED_INCOME),
+        ('Commodities', COMMODITIES),
     ]
     for name, syms in etf_groups:
         print(f"  {name:16s} ({len(syms):2d}): {', '.join(syms)}")
@@ -391,13 +414,13 @@ def print_universe():
     print(f"{'='*65}")
     print(f"  ETFs         ({len(HK_ETFS):2d}): {', '.join(HK_ETFS)}")
     print(f"  Single Names ({len(HK_SINGLE_NAMES):2d}): {', '.join(HK_SINGLE_NAMES[:10])}...")
-    print(f"  Benchmark       : 2800.HK (Tracker Fund)")
+    print('  Benchmark       : 2800.HK (Tracker Fund)')
 
     print(f"\n{'='*65}")
     print(f"  TIER 1c : INDIA SCORING UNIVERSE  ({len(INDIA_UNIVERSE)} symbols)")
     print(f"{'='*65}")
     print(f"  Large Caps   ({len(INDIA_LARGE_CAPS):2d}): {', '.join(INDIA_LARGE_CAPS[:8])}...")
-    print(f"  Benchmark       : NIFTYBEES.NS (Nifty BeES)")
+    print('  Benchmark       : NIFTYBEES.NS (Nifty BeES)')
 
     singles = get_all_single_names()
     print(f"\n{'='*65}")
@@ -437,5 +460,5 @@ def print_universe():
     print(f"{'='*65}\n")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     print_universe()

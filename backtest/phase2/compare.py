@@ -1,6 +1,7 @@
 """
 backtest/phase2/compare.py
-Run two configs side-by-side and print a comparison table.
+Run two configs side-by-side and print a comparison table,
+including benchmark performance.
 """
 from __future__ import annotations
 
@@ -101,6 +102,17 @@ _ROWS = [
     ("Avg Positions",          "avg_positions",        ".1f",  None),
     ("Buy Signals",            "total_buy_signals",    "d",    None),
     ("Sell Signals",           "total_sell_signals",   "d",    None),
+    ("SEP", None, None, None),
+    # ── Benchmark & relative metrics ──────────────────────────────
+    ("Benchmark Return",       "benchmark_total_return", ".1%", None),
+    ("Benchmark Ann. Return",  "benchmark_ann_return", ".1%",  None),
+    ("Benchmark Sharpe",       "benchmark_sharpe",     ".2f",  None),
+    ("Benchmark Max DD",       "benchmark_max_dd",     ".1%",  None),
+    ("SEP", None, None, None),
+    ("Alpha (Jensen)",         "alpha",                ".2%",  False),
+    ("Beta",                   "beta",                 ".2f",  None),
+    ("Tracking Error",         "tracking_error",       ".1%",  True),
+    ("Information Ratio",      "information_ratio",    ".2f",  False),
 ]
 
 
@@ -119,7 +131,6 @@ def _comparison_df(
         if lower_better is None:
             better = ""
         elif lower_better:
-            # for drawdown / vol: less negative is better
             better = name_a if va > vb else name_b if vb > va else "Tie"
         else:
             better = name_a if va > vb else name_b if vb > va else "Tie"

@@ -36,7 +36,7 @@ smartmoneyrotation/
 ├── data/
 │   ├── us_cash.parquet
 │   ├── hk_cash.parquet
-│   ├── india_cash.parquet
+│   ├── in_cash.parquet
 │   ├── universe_cash.parquet
 │   ├── staging.json
 │   └── options/

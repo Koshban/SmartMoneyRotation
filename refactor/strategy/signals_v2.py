@@ -75,7 +75,9 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     )
 
     out["sig_setup_continuation"] = continuation_shape
-    out["sig_setup_pullback"] = pullback_shape & volreg.isin(["volatile", "chaotic"])
+    #out["sig_setup_pullback"] = pullback_shape & volreg.isin(["volatile", "chaotic"])
+    # For volatile market. During calm markets use the above one
+    out["sig_setup_pullback"] = pullback_shape
     out["sig_setup_any"] = out["sig_setup_continuation"] | out["sig_setup_pullback"]
 
     base_ok = out["sig_vol_ok"] & out["sig_breadth_ok"] & out["sig_rs_ok"] & out["sig_sector_ok"] & out["sig_setup_any"]
@@ -85,10 +87,15 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     raw_size = 0.04 + 0.08 * ((out["scorecomposite_v2"] - p["base_entry_threshold"]) / max(1 - p["base_entry_threshold"], 1e-9))
     out["sigpositionpct_v2"] = np.where(out["sigconfirmed_v2"].eq(1), np.clip(raw_size, 0.0, 0.12) * size_mult, 0.0)
 
+    # volreg is a Series; extract the scalar (it's market-wide, same for all rows)
+    vol_regime = volreg.iloc[0] if hasattr(volreg, 'iloc') else volreg
+
+    exit_thresh = p["base_exit_threshold"]
+    if vol_regime == "chaotic":
+        exit_thresh = exit_thresh + 0.15
+
     out["sigexit_v2"] = (
-        (out["scorecomposite_v2"] <= p["base_exit_threshold"])
-        | (volreg == "chaotic")
-        | (sectreg == "lagging")
+        out["scorecomposite_v2"] <= exit_thresh
     ).astype(int)
 
     logger.info(
@@ -101,6 +108,18 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
         int(out["sigconfirmed_v2"].sum()),
         int(out["sigexit_v2"].sum()),
     )
+    total = len(out)
+    if total > 0:
+        logger.info(
+            "Filter pass rates: vol_ok=%.1f%% breadth_ok=%.1f%% rs_ok=%.1f%% "
+            "sector_ok=%.1f%% setup_any=%.1f%% score_ok=%.1f%%",
+            100 * out["sig_vol_ok"].mean(),
+            100 * out["sig_breadth_ok"].mean(),
+            100 * out["sig_rs_ok"].mean(),
+            100 * out["sig_sector_ok"].mean(),
+            100 * out["sig_setup_any"].mean(),
+            100 * (out["scorecomposite_v2"] >= out["sigeffectiveentrymin_v2"]).mean(),
+        )
     logger.info(
         "Signal setup counts: continuation=%d pullback=%d any=%d",
         int(out["sig_setup_continuation"].sum()),

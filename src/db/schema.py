@@ -49,7 +49,7 @@ def get_conn():
 #  CASH TABLE DDL  (unchanged from your current schema)
 # ═══════════════════════════════════════════════════════════════
 
-CASH_REGIONS = ["us", "hk", "india", "others"]
+CASH_REGIONS = ["us", "hk", "in", "others"]
 
 def _cash_ddl(region: str) -> str:
     """

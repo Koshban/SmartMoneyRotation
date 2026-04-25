@@ -302,7 +302,7 @@ def load_status():
 #  CLI
 # ═══════════════════════════════════════════════════════════════
 
-MARKET_CHOICES = ["us", "hk", "india", "others", "all"]
+MARKET_CHOICES = ["us", "hk", "in", "others", "all"]
 TYPE_CHOICES = ["cash", "options", "all"]
 
 def main():
