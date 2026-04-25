@@ -2434,7 +2434,7 @@ import pandas as pd
 
 # ── Convergence ───────────────────────────────────────────────
 # ── Convergence ───────────────────────────────────────────────
-from strategy.convergence import (
+from strategy_phase1.convergence import (
     run_convergence,
     build_price_matrix,
     enrich_snapshots,
@@ -2442,7 +2442,7 @@ from strategy.convergence import (
     convergence_report,
     MarketSignalResult,
 )
-from strategy.rotation import (
+from strategy_phase1.rotation import (
     run_rotation,
     RotationConfig,
     RotationResult,
@@ -2484,7 +2484,7 @@ from output.rankings import compute_all_rankings
 from output.signals import compute_all_signals
 
 # ── Strategy ──────────────────────────────────────────────────
-from strategy.portfolio import build_portfolio
+from strategy_phase1.portfolio import build_portfolio
 
 # ── Portfolio ─────────────────────────────────────────────────
 from portfolio.backtest import run_backtest, BacktestConfig
@@ -3924,7 +3924,7 @@ from compute.indicators import compute_all_indicators
 from compute.relative_strength import compute_all_rs
 from compute.scoring import compute_composite_score
 from compute.sector_rs import merge_sector_context
-from strategy.signals import generate_signals
+from strategy_phase1.signals import generate_signals
 
 logger = logging.getLogger(__name__)
 
@@ -5869,7 +5869,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── Project imports ───────────────────────────────────────────
-from strategy.bounce import (
+from strategy_phase1.bounce import (
     scan_bounce_candidates,
     bounce_report,
     BounceScanResult,
@@ -6188,19 +6188,19 @@ from pipeline.orchestrator import (
     run_full_pipeline,
     run_multi_market_pipeline,
 )
-from strategy.rotation import (
+from strategy_phase1.rotation import (
     RotationConfig,
     RotationResult,
     composite_rs_all,
     run_rotation,
     print_result as print_rotation_result,
 )
-from strategy.rotation_filters import QualityConfig
+from strategy_phase1.rotation_filters import QualityConfig
 from common.config import MARKET_CONFIG, ACTIVE_MARKETS
 
 # Optional: convergence module for price matrix building
 try:
-    from strategy.convergence import build_price_matrix as _conv_build_prices
+    from strategy_phase1.convergence import build_price_matrix as _conv_build_prices
 except ImportError:
     _conv_build_prices = None
 
@@ -7136,7 +7136,7 @@ for _p in (str(_ROOT), str(_SRC)):
         sys.path.insert(0, _p)
 
 from pipeline.orchestrator import run_full_pipeline
-from strategy.convergence import convergence_report
+from strategy_phase1.convergence import convergence_report
 from reports.html_report import generate_html_report
 from common.config import MARKET_CONFIG
 
@@ -7398,7 +7398,7 @@ import html as _html
 from datetime import datetime
 from typing import Any
 
-from strategy.convergence import (
+from strategy_phase1.convergence import (
     MarketSignalResult,
     ConvergedSignal,
     STRONG_BUY,

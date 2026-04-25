@@ -59,7 +59,7 @@ from compute.indicators import compute_all_indicators
 from compute.relative_strength import compute_all_rs
 from compute.scoring import compute_composite_score
 from compute.sector_rs import merge_sector_context
-from strategy.signals import generate_signals
+from strategy_phase1.signals import generate_signals
 
 logger = logging.getLogger(__name__)
 

@@ -27,7 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── Project imports ───────────────────────────────────────────
-from strategy.bounce import (
+from strategy_phase1.bounce import (
     scan_bounce_candidates,
     bounce_report,
     BounceScanResult,

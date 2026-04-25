@@ -23,7 +23,7 @@ import html as _html
 from datetime import datetime
 from typing import Any
 
-from strategy.convergence import (
+from strategy_phase1.convergence import (
     MarketSignalResult,
     ConvergedSignal,
     STRONG_BUY,

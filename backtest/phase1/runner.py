@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from backtest.data_loader import (
+from backtest.phase1.data_loader import (
     ensure_history,
     data_summary,
     get_universe_tickers,
@@ -44,14 +44,14 @@ from backtest.data_loader import (
     VALID_UNIVERSES,
     _MARKET_CORE,
 )
-from backtest.engine import run_backtest_period, StrategyConfig
-from backtest.strategies import (
+from backtest.phase1.engine import run_backtest_period, StrategyConfig
+from backtest.phase1.strategies import (
     ALL_STRATEGIES,
     get_strategy,
     list_strategies,
 )
-from backtest.comparison import compare_strategies
-from backtest.metrics import metrics_report
+from backtest.phase1.comparison import compare_strategies
+from backtest.phase1.metrics import metrics_report
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ def _resolve_market_and_scope(args) -> tuple[str, str]:
     """
     if args.tickers:
         # Auto-detect market from first non-US-looking ticker
-        from backtest.data_loader import _ticker_market
+        from backtest.phase1.data_loader import _ticker_market
         tickers = [t.upper() for t in args.tickers]
         markets = {_ticker_market(t) for t in tickers}
         markets.discard("US")

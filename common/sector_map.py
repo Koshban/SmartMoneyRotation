@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 common/sector_map.py
 --------------------
@@ -13,21 +15,23 @@ income, commodities, broad-market) are excluded from sector rotation
 but tracked under their asset class.
 
 Design decisions & edge cases:
-  - Crypto miners (MARA, RIOT, CLSK, HIVE, MSTR) → Technology
-    per GICS (software / IT services).  COIN → Financials (exchange).
-  - Nuclear reactor builders (SMR, NNE) → Industrials (pre-revenue
-    equipment makers).  Nuclear utilities (CEG, VST, TLN, OKLO) → Utilities.
-    Uranium miners (CCJ, UEC, LEU) → Energy.
-  - Solar hardware (FSLR, ENPH, SEDG) → Technology per GICS
+  - Crypto miners (MARA, RIOT, CLSK, HIVE, MSTR) -> Technology
+    per GICS (software / IT services). COIN -> Financials (exchange).
+  - Nuclear reactor builders (SMR, NNE) -> Industrials (pre-revenue
+    equipment makers). Nuclear utilities (CEG, VST, TLN, OKLO) -> Utilities.
+    Uranium miners (CCJ, UEC, LEU) -> Energy.
+  - Solar hardware (FSLR, ENPH, SEDG) -> Technology per GICS
     (semiconductor equipment / electronic components).
-  - UBER → Industrials (GICS reclassified to Ground Transportation 2023).
+  - UBER -> Industrials (GICS reclassified to Ground Transportation 2023).
   - Each ticker gets exactly one sector, even if it appears in
     multiple themes in universe.py.
-  - Consumer Staples has no single names currently.  Add PG, KO,
+  - Consumer Staples has no single names currently. Add PG, KO,
     PEP, COST, WMT etc. if you want stock picks when XLP leads.
-"""
 
-from __future__ import annotations
+This file keeps strict GICS sector mapping for rotation, while theme
+classification is handled separately so AI infra / neo-cloud names
+can be grouped without contaminating sector rankings.
+"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -54,7 +58,6 @@ SECTOR_ETFS: dict[str, str] = {
 # ═══════════════════════════════════════════════════════════════
 
 _SECTOR_TICKERS: dict[str, list[str]] = {
-
     # ── Technology ─────────────────────────────────────────────
     "Technology": [
         # Mega / large cap
@@ -187,58 +190,82 @@ _SECTOR_TICKERS: dict[str, list[str]] = {
 
     # ── Consumer Staples ───────────────────────────────────────
     "Consumer Staples": [
-        # No single names in current universe.
-        # Consider adding: PG, KO, PEP, COST, WMT, PM, MO, CL, KMB
     ],
 }
 
 
 # ═══════════════════════════════════════════════════════════════
-#  THEMATIC ETF → PARENT GICS SECTOR
+#  THEMATIC CLASSIFICATION — separate from GICS sectors
 # ═══════════════════════════════════════════════════════════════
-# Thematic ETFs can optionally be included as "tickers" inside
-# their parent sector for RS ranking.
 
-THEMATIC_ETF_SECTOR: dict[str, str] = {
-    # Semiconductors
-    "SOXX": "Technology",
-    "SMH":  "Technology",
-    # Biotech
-    "XBI":  "Healthcare",
-    "IBB":  "Healthcare",
-    # Software / Cloud
-    "IGV":  "Technology",
-    "SKYY": "Technology",
-    # Cybersecurity
-    "HACK": "Technology",
-    "CIBR": "Technology",
-    # AI / Robotics
-    "BOTZ": "Technology",
-    "AIQ":  "Technology",
+THEME_MAP: dict[str, str] = {
+    # AI infrastructure / neo-cloud
+    "CRWV": "AI Infrastructure / Neo-Cloud",
+    "NBIS": "AI Infrastructure / Neo-Cloud",
+    "VRT": "AI Infrastructure / Neo-Cloud",
+    "ANET": "AI Infrastructure / Neo-Cloud",
+    "DLR": "AI Infrastructure / Neo-Cloud",
+    "EQIX": "AI Infrastructure / Neo-Cloud",
+    "AMT": "AI Infrastructure / Neo-Cloud",
+    "CLS": "AI Infrastructure / Neo-Cloud",
+    "NVT": "AI Infrastructure / Neo-Cloud",
+    "SMCI": "AI Infrastructure / Neo-Cloud",
+
+    # AI platform / software
+    "MSFT": "AI Platform / Software",
+    "GOOGL": "AI Platform / Software",
+    "META": "AI Platform / Software",
+    "NOW": "AI Platform / Software",
+    "SNOW": "AI Platform / Software",
+    "DDOG": "AI Platform / Software",
+    "PATH": "AI Platform / Software",
+    "TWLO": "AI Platform / Software",
+    "PLTR": "AI Platform / Software",
+    "APP": "AI Platform / Software",
+
+    # High momentum beta
+    "CRWD": "High Momentum Beta",
+    "PANW": "High Momentum Beta",
+    "CEG": "High Momentum Beta",
+    "VST": "High Momentum Beta",
+    "AXON": "High Momentum Beta",
+    "DECK": "High Momentum Beta",
+    "UBER": "High Momentum Beta",
+    "ROKU": "High Momentum Beta",
+    "TTD": "High Momentum Beta",
+    "HOOD": "High Momentum Beta",
+    "SOUN": "High Momentum Beta",
+    "UPST": "High Momentum Beta",
+    "SOFI": "High Momentum Beta",
+    "TOST": "High Momentum Beta",
+    "GLBE": "High Momentum Beta",
+    "GENI": "High Momentum Beta",
+
     # Quantum
-    "QTUM": "Technology",
-    # Fintech
-    "FINX": "Financials",
-    # Clean Energy / Solar
-    "TAN":  "Utilities",
-    "ICLN": "Utilities",
-    # EV / Lithium
-    "LIT":  "Materials",
-    "DRIV": "Consumer Discretionary",
-    # Nuclear / Uranium
-    "URA":  "Energy",
-    "URNM": "Energy",
-    "NLR":  "Utilities",
-    # Bitcoin / Blockchain
-    "IBIT": "Financials",
-    "BLOK": "Financials",
-    # Defense
-    "ITA":  "Industrials",
-    # Innovation
-    "ARKK": "Technology",
-    "ARKG": "Healthcare",
-    # China Internet
-    "KWEB": "Communication Services",
+    "IONQ": "Quantum",
+    "QBTS": "Quantum",
+    "RGTI": "Quantum",
+    "QUBT": "Quantum",
+    "ARQQ": "Quantum",
+
+    # Bitcoin / digital assets
+    "MSTR": "Bitcoin / Digital Assets",
+    "COIN": "Bitcoin / Digital Assets",
+    "MARA": "Bitcoin / Digital Assets",
+    "RIOT": "Bitcoin / Digital Assets",
+    "CLSK": "Bitcoin / Digital Assets",
+    "HIVE": "Bitcoin / Digital Assets",
+    "CRCL": "Bitcoin / Digital Assets",
+
+    # China / HK tech
+    "BABA": "HK / China Tech",
+    "JD": "HK / China Tech",
+    "PDD": "HK / China Tech",
+    "BIDU": "HK / China Tech",
+    "NIO": "HK / China Tech",
+    "XPEV": "HK / China Tech",
+    "LI": "HK / China Tech",
+    "TCOM": "HK / China Tech",
 }
 
 
@@ -247,28 +274,28 @@ THEMATIC_ETF_SECTOR: dict[str, str] = {
 # ═══════════════════════════════════════════════════════════════
 
 NON_SECTOR_ASSETS: dict[str, str] = {
-    # Broad Market (benchmark / reference)
-    "SPY":  "Broad Market",
-    "QQQ":  "Broad Market",
-    "IWM":  "Broad Market",
-    "DIA":  "Broad Market",
-    "MDY":  "Broad Market",
-    # Momentum factor
+    # Broad Market
+    "SPY": "Broad Market",
+    "QQQ": "Broad Market",
+    "IWM": "Broad Market",
+    "DIA": "Broad Market",
+    "MDY": "Broad Market",
+    # Factor
     "MTUM": "Factor",
     # International
-    "EEM":     "International",
-    "EFA":     "International",
-    "VWO":     "International",
-    "FXI":     "International",
-    "EWJ":     "International",
-    "EWZ":     "International",
-    "INDA":    "International",
-    "EWG":     "International",
-    "EWT":     "International",
-    "EWY":     "International",
-    "2800.HK": "International",  # Tracker Fund HK
-    "2828.HK": "International",  # Hang Seng H-Share ETF
-    "7226.HK": "International",  # HSI Leveraged
+    "EEM": "International",
+    "EFA": "International",
+    "VWO": "International",
+    "FXI": "International",
+    "EWJ": "International",
+    "EWZ": "International",
+    "INDA": "International",
+    "EWG": "International",
+    "EWT": "International",
+    "EWY": "International",
+    "2800.HK": "International",
+    "2828.HK": "International",
+    "7226.HK": "International",
     # Fixed Income
     "TLT": "Fixed Income",
     "IEF": "Fixed Income",
@@ -287,22 +314,16 @@ NON_SECTOR_ASSETS: dict[str, str] = {
 
 
 # ═══════════════════════════════════════════════════════════════
-#  COMPILED FLAT MAP  (ticker → sector)
+#  COMPILED FLAT MAPS
 # ═══════════════════════════════════════════════════════════════
 
 TICKER_SECTOR_MAP: dict[str, str] = {}
-
-# 1. Sector ETFs themselves
 for _sector, _etf in SECTOR_ETFS.items():
     TICKER_SECTOR_MAP[_etf] = _sector
 
-# 2. All single-name tickers
 for _sector, _tickers in _SECTOR_TICKERS.items():
     for _t in _tickers:
         TICKER_SECTOR_MAP[_t] = _sector
-
-# 3. Thematic ETFs
-TICKER_SECTOR_MAP.update(THEMATIC_ETF_SECTOR)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -310,11 +331,13 @@ TICKER_SECTOR_MAP.update(THEMATIC_ETF_SECTOR)
 # ═══════════════════════════════════════════════════════════════
 
 def get_sector(ticker: str) -> str | None:
-    """
-    Return GICS sector for a ticker, or None if it doesn't map
-    to any of the 11 sectors (e.g. international, fixed income).
-    """
+    """Return GICS sector for a ticker, or None if it doesn't map to any of the 11 sectors."""
     return TICKER_SECTOR_MAP.get(ticker)
+
+
+def get_theme(ticker: str) -> str | None:
+    """Return theme classification for a ticker, if any."""
+    return THEME_MAP.get(ticker)
 
 
 def get_asset_class(ticker: str) -> str | None:
@@ -323,21 +346,18 @@ def get_asset_class(ticker: str) -> str | None:
 
 
 def get_sector_or_class(ticker: str) -> str:
-    """Return sector if available, else asset class, else 'Unknown'."""
+    """Return sector if available, else asset class, else theme, else 'Unknown'."""
     return (
         TICKER_SECTOR_MAP.get(ticker)
         or NON_SECTOR_ASSETS.get(ticker)
+        or THEME_MAP.get(ticker)
         or "Unknown"
     )
 
 
 def get_tickers_for_sector(sector: str) -> list[str]:
-    """
-    All tickers (single names + thematic ETFs) in a GICS sector.
-    Excludes the sector ETF itself (that's the benchmark).
-    """
-    return [t for t, s in TICKER_SECTOR_MAP.items()
-            if s == sector and t not in SECTOR_ETFS.values()]
+    """All tickers (single names + thematic ETFs) in a GICS sector, excluding the sector ETF itself."""
+    return [t for t, s in TICKER_SECTOR_MAP.items() if s == sector and t not in SECTOR_ETFS.values()]
 
 
 def get_us_tickers_for_sector(sector: str) -> list[str]:
@@ -353,28 +373,24 @@ def get_us_tickers_for_sector(sector: str) -> list[str]:
 
 def get_india_tickers_for_sector(sector: str) -> list[str]:
     """Return only .NS tickers for a given sector."""
-    return [
-        t for t, s in TICKER_SECTOR_MAP.items()
-        if s == sector and t.endswith(".NS")
-    ]
+    return [t for t, s in TICKER_SECTOR_MAP.items() if s == sector and t.endswith(".NS")]
 
 
 def get_hk_tickers_for_sector(sector: str) -> list[str]:
     """Return only .HK tickers for a given sector."""
-    return [
-        t for t, s in TICKER_SECTOR_MAP.items()
-        if s == sector and t.endswith(".HK")
-    ]
+    return [t for t, s in TICKER_SECTOR_MAP.items() if s == sector and t.endswith(".HK")]
+
+
+def get_theme_tickers(theme: str) -> list[str]:
+    """Return all tickers mapped to a given theme string."""
+    return sorted([t for t, th in THEME_MAP.items() if th == theme])
 
 
 def validate_universe_coverage():
-    """
-    Cross-check against universe.py to find any unmapped tickers.
-    Call this during startup or testing.
-    """
+    """Cross-check against universe.py to find any unmapped tickers."""
     from common.universe import get_full_universe
 
-    all_known = set(TICKER_SECTOR_MAP.keys()) | set(NON_SECTOR_ASSETS.keys())
+    all_known = set(TICKER_SECTOR_MAP.keys()) | set(NON_SECTOR_ASSETS.keys()) | set(THEME_MAP.keys())
     full = set(get_full_universe())
 
     unmapped = full - all_known
@@ -399,8 +415,7 @@ def print_sector_map():
     for sector in sorted(SECTOR_ETFS.keys()):
         etf = SECTOR_ETFS[sector]
         tickers = get_tickers_for_sector(sector)
-        us = sorted(t for t in tickers
-                     if not t.endswith('.HK') and not t.endswith('.NS'))
+        us = sorted(t for t in tickers if not t.endswith('.HK') and not t.endswith('.NS'))
         hk = sorted(t for t in tickers if t.endswith('.HK'))
         india = sorted(t for t in tickers if t.endswith('.NS'))
 
@@ -420,6 +435,15 @@ def print_sector_map():
         by_class.setdefault(c, []).append(t)
     for cls, tickers in sorted(by_class.items()):
         print(f"    {cls:16s}: {', '.join(sorted(tickers))}")
+
+    print(f"\n{'='*70}")
+    print(f"  THEMES  ({len(set(THEME_MAP.values()))} themes)")
+    print(f"{'='*70}")
+    by_theme: dict[str, list[str]] = {}
+    for t, th in THEME_MAP.items():
+        by_theme.setdefault(th, []).append(t)
+    for th, tickers in sorted(by_theme.items()):
+        print(f"    {th:26s}: {', '.join(sorted(tickers))}")
 
     print(f"\n{'='*70}\n")
 

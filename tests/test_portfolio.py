@@ -17,8 +17,8 @@ from compute.sector_rs import (
     merge_sector_context,
 )
 from compute.breadth import compute_all_breadth, breadth_report
-from strategy.signals import generate_signals
-from strategy.portfolio import (
+from strategy_phase1.signals import generate_signals
+from strategy_phase1.portfolio import (
     build_portfolio,
     portfolio_report,
 )

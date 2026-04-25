@@ -97,7 +97,7 @@ def get_symbols_for_market(market: str) -> list[str]:
     elif market == "hk":
         return get_hk_only()
 
-    elif market == "india":
+    elif market == "in":
         return get_india_only()
 
     else:
@@ -204,7 +204,7 @@ def make_ibkr_contract(symbol: str, market: str):
     if market == "hk":
         ibkr_sym = clean_hk_symbol(symbol)
         return Stock(ibkr_sym, "SEHK", "HKD")
-    elif market == "india":
+    elif market == "in":
         ibkr_sym = symbol.replace(".NS", "").replace(".BO", "")
         return Stock(ibkr_sym, "NSE", "INR")
     else:
@@ -541,7 +541,7 @@ examples:
     )
     parser.add_argument(
         "--market",
-        choices=["us", "hk", "india", "all"],
+        choices=["us", "hk", "in", "all"],
         default="all",
         help="Which market(s) to download (default: all)",
     )
@@ -582,7 +582,7 @@ examples:
         args.days = None       # --backfill wins over --days
 
     if args.market == "all":
-        markets = ["us", "hk", "india"]
+        markets = ["us", "hk", "in"]
     else:
         markets = [args.market]
 

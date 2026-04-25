@@ -29,8 +29,8 @@ CLI
     python -m backtest.runner --market IN              # India
 """
 
-from backtest.engine import run_backtest_period, BacktestRun, StrategyConfig
-from backtest.metrics import (
+from backtest.phase1.engine import run_backtest_period, BacktestRun, StrategyConfig
+from backtest.phase1.metrics import (
     compute_cagr,
     compute_full_metrics,
     cagr_from_equity,
@@ -38,8 +38,8 @@ from backtest.metrics import (
     compute_monthly_returns_heatmap,
     compute_regime_metrics,
 )
-from backtest.comparison import compare_strategies
-from backtest.data_loader import ensure_history, load_cached_history
+from backtest.phase1.comparison import compare_strategies
+from backtest.phase1.data_loader import ensure_history, load_cached_history
 
 __all__ = [
     "run_backtest_period",

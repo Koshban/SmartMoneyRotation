@@ -2396,7 +2396,7 @@ from common.sector_map import (
     get_sector_or_class,
     get_us_tickers_for_sector,
 )
-from strategy.rotation_filters import (
+from strategy_phase1.rotation_filters import (
     QualityConfig,
     GateResult,
     quality_gate,

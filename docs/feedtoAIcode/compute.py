@@ -5188,14 +5188,14 @@ import numpy as np
 import pandas as pd
 
 # ── Convergence ───────────────────────────────────────────────
-from strategy.convergence import (
+from strategy_phase1.convergence import (
     run_convergence,
     build_price_matrix,
     enrich_snapshots,
     convergence_report,
     MarketSignalResult,
 )
-from strategy.rotation import (
+from strategy_phase1.rotation import (
     run_rotation,
     RotationConfig,
     RotationResult,
@@ -5237,7 +5237,7 @@ from output.rankings import compute_all_rankings
 from output.signals import compute_all_signals
 
 # ── Strategy ──────────────────────────────────────────────────
-from strategy.portfolio import build_portfolio
+from strategy_phase1.portfolio import build_portfolio
 
 # ── Portfolio ─────────────────────────────────────────────────
 from portfolio.backtest import run_backtest, BacktestConfig

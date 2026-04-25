@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 """
 common/universe.py
 -----------
@@ -233,7 +231,7 @@ INDIA_LARGE_CAPS = [
     "KOTAKBANK.NS",   # Kotak Mahindra Bank
     "AXISBANK.NS",    # Axis Bank
     "BAJFINANCE.NS",  # Bajaj Finance
-    "BAJFINSV.NS",    # Bajaj Finserv
+    "BAJAJFINSV.NS",    # Bajaj Finserv
     "INDUSINDBK.NS",  # IndusInd Bank
 
     # ── Energy / Conglomerate ──────────────────────────────
@@ -314,7 +312,7 @@ SINGLE_NAMES = {
         "tickers": [
             "NVDA", "AMD", "AVGO", "MRVL", "QCOM",
             "INTC", "MU", "LRCX", "KLAC", "AMAT",
-            "TSM", "ASML", "ARM", "SMCI", "MBLY",
+            "TSM", "ASML", "ARM", "SMCI", "MBLY", "SIMO", "MU", "SNDK"
         ],
     },
 
@@ -656,3 +654,86 @@ def get_universe_for_market(market: str) -> list[str]:
         return list(INDIA_UNIVERSE)
     else:
         raise ValueError(f"Unknown market: {market!r}  (expected 'US', 'HK', or 'IN')")
+
+
+# ═════════════════════════════════════════════════════════════════
+#  PRETTY PRINT
+# ═════════════════════════════════════════════════════════════════
+
+def print_universe():
+    """Pretty-print all tiers for verification."""
+
+    # ── Tier 1: ETFs ───────────────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  TIER 1 : ETF UNIVERSE  ({len(ETF_UNIVERSE)} symbols)")
+    print(f"{'='*65}")
+    etf_groups = [
+        ("Broad Market", BROAD_MARKET),
+        ("Sectors", SECTORS),
+        ("Thematic ETFs", THEMATIC_ETFS),
+        ("International", INTERNATIONAL),
+        ("HK ETFs", HK_ETFS),
+        ("Fixed Income", FIXED_INCOME),
+        ("Commodities", COMMODITIES),
+    ]
+    for name, syms in etf_groups:
+        print(f"  {name:16s} ({len(syms):2d}): {', '.join(syms)}")
+
+    # ── Tier 1b: HK Universe ──────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  TIER 1b : HK SCORING UNIVERSE  ({len(HK_UNIVERSE)} symbols)")
+    print(f"{'='*65}")
+    print(f"  ETFs         ({len(HK_ETFS):2d}): {', '.join(HK_ETFS)}")
+    print(f"  Single Names ({len(HK_SINGLE_NAMES):2d}): {', '.join(HK_SINGLE_NAMES[:10])}...")
+    print(f"  Benchmark       : 2800.HK (Tracker Fund)")
+
+    # ── Tier 1c: India Universe ────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  TIER 1c : INDIA SCORING UNIVERSE  ({len(INDIA_UNIVERSE)} symbols)")
+    print(f"{'='*65}")
+    print(f"  Large Caps   ({len(INDIA_LARGE_CAPS):2d}): {', '.join(INDIA_LARGE_CAPS[:8])}...")
+    print(f"  Benchmark       : NIFTYBEES.NS (Nifty BeES)")
+
+    # ── Tier 2: Single Names ───────────────────────────────────
+    singles = get_all_single_names()
+    print(f"\n{'='*65}")
+    print(f"  TIER 2 : SINGLE NAMES  ({len(singles)} unique across "
+          f"{len(SINGLE_NAMES)} themes)")
+    print(f"{'='*65}")
+    for key, theme in SINGLE_NAMES.items():
+        print(f"  {theme['name']:30s} ({len(theme['tickers']):2d})"
+              f"  proxy: {theme['etf_proxy']:5s}"
+              f"  | {', '.join(theme['tickers'][:8])}"
+              f"{'...' if len(theme['tickers']) > 8 else ''}")
+
+    # ── HK Tickers (all sources) ──────────────────────────────
+    hk_all = get_hk_only()
+    print(f"\n{'='*65}")
+    print(f"  ALL HK TICKERS  ({len(hk_all)} symbols — need SEHK/HKD)")
+    print(f"{'='*65}")
+    for i in range(0, len(hk_all), 8):
+        print(f"  {', '.join(hk_all[i:i+8])}")
+
+    # ── India Tickers (all sources) ───────────────────────────
+    india_all = get_india_only()
+    print(f"\n{'='*65}")
+    print(f"  ALL INDIA TICKERS  ({len(india_all)} symbols — need NSE/BSE)")
+    print(f"{'='*65}")
+    for i in range(0, len(india_all), 6):
+        print(f"  {', '.join(india_all[i:i+6])}")
+
+    # ── Combined ───────────────────────────────────────────────
+    full = get_full_universe()
+    us_etfs = get_us_only_etfs()
+    print(f"\n{'='*65}")
+    print(f"  FULL UNIVERSE    : {len(full)} unique symbols")
+    print(f"  US ETFs only     : {len(us_etfs)} symbols")
+    print(f"  HK universe      : {len(HK_UNIVERSE)} symbols (scoring)")
+    print(f"  HK all sources   : {len(hk_all)} symbols (incl. themes)")
+    print(f"  India universe   : {len(INDIA_UNIVERSE)} symbols (scoring)")
+    print(f"  India all sources: {len(india_all)} symbols (incl. themes)")
+    print(f"{'='*65}\n")
+
+
+if __name__ == "__main__":
+    print_universe()

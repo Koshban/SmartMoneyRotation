@@ -45,12 +45,12 @@ UNIVERSE_MAP: dict[str, tuple[str, str]] = {
     # Full universes (from common.universe)
     "us":           ("US", "full"),
     "hk":           ("HK", "full"),
-    "india":        ("IN", "full"),
+    "in":        ("IN", "full"),
     "in":           ("IN", "full"),
     # Core universes (hardcoded sets — backward compatible)
     "us_core":      ("US", "core"),
     "hk_core":      ("HK", "core"),
-    "india_core":   ("IN", "core"),
+    "in_core":   ("IN", "core"),
     "in_core":      ("IN", "core"),
     # Legacy aliases
     "core":         ("US", "core"),

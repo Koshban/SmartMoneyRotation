@@ -1,12 +1,15 @@
 from __future__ import annotations
-import numpy as np, pandas as pd
-from common.config_refactor import SCORINGWEIGHTS_V2, SCORINGPARAMS_V2
+import numpy as np
+import pandas as pd
+from refactor.common.config_refactor import SCORINGWEIGHTS_V2, SCORINGPARAMS_V2
 
 def _s(x, lo, hi): return pd.Series(np.clip((x-lo)/(hi-lo), 0.0, 1.0), index=x.index)
 def _inv(x, lo, hi): return 1.0 - _s(x, lo, hi)
 
-def compute_composite_v2(df: pd.DataFrame) -> pd.DataFrame:
-    p = SCORINGPARAMS_V2; w = SCORINGWEIGHTS_V2; out = df.copy()
+def compute_composite_v2(df: pd.DataFrame, weights=None, params=None) -> pd.DataFrame:
+    p = params if params is not None else SCORINGPARAMS_V2
+    w = weights if weights is not None else SCORINGWEIGHTS_V2
+    out = df.copy()
     stock_rs = _s(out['rszscore'].fillna(0), -1.0, 2.0); sector_rs = _s(out.get('sectrszscore', pd.Series(0,index=out.index)).fillna(0), -1.0, 2.0); rs_accel = _s(out.get('rsaccel20', pd.Series(0,index=out.index)).fillna(0), -0.10, 0.15); trend_confirm = _s(out.get('closevsema30pct', pd.Series(0,index=out.index)).fillna(0), -0.03, 0.10)
     out['scoretrend'] = (p['trend']['w_stock_rs']*stock_rs + p['trend']['w_sector_rs']*sector_rs + p['trend']['w_rs_accel']*rs_accel + p['trend']['w_trend_confirm']*trend_confirm).clip(0,1)
     rvol = _s(out.get('relativevolume', pd.Series(1,index=out.index)).fillna(1), 0.8, 2.2); obv = _s(out.get('obvslope10d', pd.Series(0,index=out.index)).fillna(0), -0.05, 0.12); adl = _s(out.get('adlineslope10d', pd.Series(0,index=out.index)).fillna(0), -0.05, 0.12); dvol = _s(np.log1p(out.get('dollarvolume20d', pd.Series(0,index=out.index)).fillna(0)), 10, 18)

@@ -39,7 +39,7 @@ for _p in (str(_ROOT), str(_SRC)):
         sys.path.insert(0, _p)
 
 from pipeline.orchestrator import run_full_pipeline
-from strategy.convergence import convergence_report
+from strategy_phase1.convergence import convergence_report
 from reports.html_report import generate_html_report
 from common.config import MARKET_CONFIG
 

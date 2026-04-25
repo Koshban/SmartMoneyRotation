@@ -8,13 +8,14 @@ smartmoneyrotation/
 │   ├── strategies.py
 │   ├── comparison.py
 │   ├── runner.py
-│   └── phase2/
-│       ├── __init__.py
-│       ├── README.md
-│       ├── signal_study.py
-│       ├── portfolio_sim.py
-│       ├── reversal_study.py
-│       └── run_backtests.py
+    ├── phase2/
+        ├── __init__.py
+        ├── data_source.py        # Date-aware data wrapper
+        ├── engine.py             # Day-by-day replay loop
+        ├── tracker.py            # Virtual portfolio
+        ├── metrics.py            # Performance calculations
+        ├── compare.py            # Side-by-side comparison + Rich output
+        └── run_backtest.py       # CLI entry point
 │
 ├── common/
 │   ├── __init__.py
@@ -52,26 +53,22 @@ smartmoneyrotation/
 │   ├── risk.py
 │   └── sizing.py
 │
-├── refactor/
-│   ├── __init__.py
-│   ├── common/
-│   │   ├── __init__.py
-│   │   ├── config_refactor.py
-│   │   ├── market_config_v2.py
-│   │   └── universe_loader_v2.py
-│   ├── strategy/
-│   │   ├── __init__.py
-│   │   ├── adapters_v2.py
-│   │   ├── portfolio_v2.py
-│   │   ├── regime_v2.py
-│   │   ├── scoring_v2.py
-│   │   └── signals_v2.py
+refactor/
+├── pipeline_v2.py
+├── report_v2.py 
+└── runner_v2.py         
+└── strategy/
+    ├── __init__.py
+    ├── adapters_v2.py
+    ├── breadth_v2.py
+    ├── portfolio_v2.py
+    ├── regime_v2.py
+    ├── rotation_v2.py
+    ├── rs_v2.py
+    ├── scoring_v2.py
+    └── signals_v2.py
 │   ├── tests/
 │   │   └── test_refactor_smoke.py
-│   ├── demo_runner.py
-│   ├── pipeline_v2.py
-│   ├── report_v2.py
-│   └── runner_v2.py
 │
 ├── reports/
 │   ├── __init__.py

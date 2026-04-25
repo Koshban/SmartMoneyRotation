@@ -1,7 +1,7 @@
 import pandas as pd
-from strategy.regime_v2 import classify_volatility_regime
-from strategy.scoring_v2 import compute_composite_v2
-from strategy.signals_v2 import apply_signals_v2, apply_convergence_v2
+from strategy_phase1.regime_v2 import classify_volatility_regime
+from strategy_phase1.scoring_v2 import compute_composite_v2
+from strategy_phase1.signals_v2 import apply_signals_v2, apply_convergence_v2
 
 idx = pd.date_range('2025-01-01', periods=5, freq='D')
 bench = pd.DataFrame({

@@ -18,7 +18,7 @@ New beat-the-benchmark strategies target specific baseline weaknesses:
 
 from __future__ import annotations
 
-from backtest.engine import StrategyConfig
+from backtest.phase1.engine import StrategyConfig
 from common.universe import SECTORS, BROAD_MARKET, FIXED_INCOME, COMMODITIES
 
 

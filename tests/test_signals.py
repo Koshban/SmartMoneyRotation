@@ -12,7 +12,7 @@ from compute.indicators import compute_all_indicators
 from compute.relative_strength import compute_all_rs
 from compute.scoring import compute_composite_score
 from compute.breadth import compute_all_breadth, breadth_to_pillar_scores
-from strategy.signals import generate_signals as generate_ticker_signals
+from strategy_phase1.signals import generate_signals as generate_ticker_signals
 from output.rankings import compute_all_rankings
 from output.signals import (
     SignalConfig,
