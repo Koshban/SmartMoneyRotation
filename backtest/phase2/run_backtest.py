@@ -18,6 +18,8 @@ from rich.console import Console
 
 from backtest.phase2.data_source import BacktestDataSource
 from backtest.phase2.compare import build_config_dict, run_comparison, print_comparison
+from copy import deepcopy
+from refactor.common.config_refactor import ACTIONPARAMS_V2
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -157,6 +159,31 @@ def load_data(
 # ══════════════════════════════════════════════════════════════════
 #  TWO CONFIGS TO COMPARE
 # ══════════════════════════════════════════════════════════════════
+# ── India-specific action_params (shared base, two tightness levels) ──────────
+
+def _india_action_params(loose: bool = True) -> dict:
+    """
+    Build an action_params dict starting from the canonical defaults,
+    then applying India-specific overrides.  Returns a *new* dict —
+    never mutates the global.
+    """
+    ap = deepcopy(ACTIONPARAMS_V2)
+
+    # ── common India overrides (both loose and tight) ─────────────────────
+    ap["buy"]["min_percentile"]              = 0.50
+    ap["buy"]["min_score"]                   = 0.55
+    ap["decent_momentum"]["min_rsi"]         = 40
+    ap["decent_momentum"]["min_adx"]         = 14
+    ap["weak_context"]["sector_regimes"]     = []     # stop killing lagging sectors
+
+    if not loose:
+        # ── tighter variant: raise the bar slightly ───────────────────────
+        ap["buy"]["min_percentile"]          = 0.55
+        ap["buy"]["min_score"]               = 0.58
+        ap["decent_momentum"]["min_rsi"]     = 42
+        ap["decent_momentum"]["min_adx"]     = 16
+
+    return ap
 
 _VOL_COMMON = {
     "atrp_window": 14, "realized_vol_window": 20,
@@ -192,6 +219,12 @@ CONFIG_LOOSE = build_config_dict(
         "continuation_min_trend": 0.62, "pullback_min_trend": 0.68,
         "pullback_max_short_extension": 0.04, "pullback_rsi_max": 58.0,
         "cooldown_days": 4,
+        "rs_fail_penalty": 0.08,
+        "breadth_fail_penalty": 0.03,
+        "min_rank_pct": 0.80,
+        "relative_setup_rank_pct": 0.75,
+        "exit_rank_floor": 0.20,
+        "chaotic_exit_bump": 0.08,
         "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10},
         "breadth_entry_adjustment": {"strong": -0.02, "neutral": 0.00, "weak": 0.03, "critical": 0.08, "unknown": 0.00},
         "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35},
@@ -200,6 +233,7 @@ CONFIG_LOOSE = build_config_dict(
         "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
         "adjustments": {"calm": 0.04, "volatile": 0.02, "chaotic": 0.00},
     },
+    action_params=_india_action_params(loose=True),                            # ← ADD
 )
 
 CONFIG_TIGHT = build_config_dict(
@@ -225,6 +259,12 @@ CONFIG_TIGHT = build_config_dict(
         "continuation_min_trend": 0.64, "pullback_min_trend": 0.70,
         "pullback_max_short_extension": 0.06, "pullback_rsi_max": 62.0,
         "cooldown_days": 4,
+        "rs_fail_penalty": 0.12,
+        "breadth_fail_penalty": 0.06,
+        "min_rank_pct": 0.88,
+        "relative_setup_rank_pct": 0.82,
+        "exit_rank_floor": 0.30,
+        "chaotic_exit_bump": 0.12,
         "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.04, "chaotic": 0.12},
         "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.08, "critical": 0.14, "unknown": 0.03},
         "size_multipliers": {"calm": 1.00, "volatile": 0.65, "chaotic": 0.30},
@@ -233,8 +273,8 @@ CONFIG_TIGHT = build_config_dict(
         "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
         "adjustments": {"calm": 0.04, "volatile": 0.01, "chaotic": 0.00},
     },
+    action_params=_india_action_params(loose=False),                           # ← ADD
 )
-
 
 # ══════════════════════════════════════════════════════════════════
 #  MAIN

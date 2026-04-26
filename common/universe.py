@@ -172,7 +172,7 @@ SINGLE_NAMES = {
     "megacap": {
         "name": "Mega Cap Tech",
         "etf_proxy": "QQQ",
-        "tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO", "BRK.B", "LLY"],
+        "tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO", "LLY", "JPM", "WMT", "HD", "XOM", "ORCL"],
     },
     "data_centers": {
         "name": "Data Centers / Infrastructure",

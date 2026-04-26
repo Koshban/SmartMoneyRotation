@@ -17,21 +17,26 @@ from backtest.phase2.metrics import compute_metrics
 
 
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
 def build_config_dict(
     vol_regime_params: dict,
     scoring_weights: dict,
     scoring_params: dict,
     signal_params: dict,
     convergence_params: dict,
+    action_params: dict | None = None,                     # ← ADD
 ) -> Dict[str, Any]:
-    """Bundle the five config blocks into one dict for the engine."""
-    return {
+    """Bundle config blocks into one dict for the engine."""
+    cfg = {
         "VOLREGIMEPARAMS": vol_regime_params,
         "SCORINGWEIGHTS_V2": scoring_weights,
         "SCORINGPARAMS_V2": scoring_params,
         "SIGNALPARAMS_V2": signal_params,
         "CONVERGENCEPARAMS_V2": convergence_params,
     }
+    if action_params is not None:
+        cfg["ACTIONPARAMS_V2"] = action_params             # ← ADD
+    return cfg
 
 
 # ------------------------------------------------------------------

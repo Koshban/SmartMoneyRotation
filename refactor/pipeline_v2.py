@@ -19,6 +19,7 @@ from .strategy.rotation_v2 import compute_sector_rotation                   # �
 from .strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
 from .strategy.scoring_v2 import compute_composite_v2
 from .strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
+from refactor.common.config_refactor import ACTIONPARAMS_V2
 
 logger = logging.getLogger(__name__)
 
@@ -330,10 +331,23 @@ def _add_score_percentiles(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _log_action_diagnostics(out: pd.DataFrame) -> None:
+def _log_action_diagnostics(out: pd.DataFrame, params: dict) -> None:
+    """Log detailed diagnostics for the action decision. All thresholds
+    are read from *params* so diagnostics always match the actual logic."""
     if out.empty:
         logger.info("Action diagnostics skipped because input frame is empty")
         return
+
+    sb = params["strong_buy"]
+    bu = params["buy"]
+    ho = params["hold"]
+    se = params["sell"]
+    sc = params["strong_context"]
+    wc = params["weak_context"]
+    hm = params["healthy_momentum"]
+    dm = params["decent_momentum"]
+    oe = params["overextended"]
+
     score = out.get("scoreadjusted_v2", out.get("scorecomposite_v2", pd.Series(0.0, index=out.index))).fillna(0.0)
     pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
     entry = out.get("sigeffectiveentrymin_v2", pd.Series(0.60, index=out.index)).fillna(0.60)
@@ -359,47 +373,115 @@ def _log_action_diagnostics(out: pd.DataFrame) -> None:
     }
 
     for i in out.index:
-        s = float(score.loc[i]); p = float(pct.loc[i]); e = float(entry.loc[i]); c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
-        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i]); r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
-        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i]); ext = float(short_ext.loc[i])
+        s = float(score.loc[i]); pv = float(pct.loc[i]); e = float(entry.loc[i])
+        c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
+        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i])
+        r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
+        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i])
+        ext = float(short_ext.loc[i])
         ticker = out.loc[i, "ticker"] if "ticker" in out.columns else str(i)
 
-        strong_context = (b == "strong" and v == "calm") or l >= 0.60
-        weak_context = b in {"weak", "critical"} or v == "chaotic" or sr == "lagging"
-        healthy_momentum = r in {"leading", "improving"} and sr != "lagging" and ri >= 52 and ax >= 22
-        decent_momentum = r in {"leading", "improving"} and ri >= 45 and ax >= 16
-        overextended = ext >= 0.045 or ri >= 74
+        strong_context = (
+            (b in sc["breadth_regimes"] and v in sc["vol_regimes"])
+            or l >= sc["min_leadership"]
+        )
+        weak_ctx = (
+            b in wc["breadth_regimes"]
+            or v in wc["vol_regimes"]
+            or sr in wc["sector_regimes"]
+        )
+        healthy_mom = (
+            r in hm["allowed_rs"]
+            and sr not in hm.get("blocked_sector", [])
+            and ri >= hm["min_rsi"]
+            and ax >= hm["min_adx"]
+        )
+        decent_mom = (
+            r in dm["allowed_rs"]
+            and ri >= dm["min_rsi"]
+            and ax >= dm["min_adx"]
+        )
+        overext = ext >= oe["max_ema_pct"] or ri >= oe["max_rsi"]
 
-        strong_buy_ready = c == 1 and p >= 0.90 and s >= max(0.76, e + 0.08) and strong_context and healthy_momentum and rv >= 1.10 and not overextended
-        buy_ready = c == 1 and p >= 0.65 and s >= max(0.62, e + 0.02) and decent_momentum and not weak_context
-        hold_ready = p >= 0.35 and s >= max(0.54, e - 0.06) and not weak_context
+        sb_score_floor = max(sb["min_score"], e + sb["score_above_entry"])
+        bu_score_floor = max(bu["min_score"], e + bu["score_above_entry"])
+        ho_score_floor = max(ho["min_score"], e - ho["score_below_entry"])
+
+        strong_buy_ready = (
+            (not sb["requires_confirmation"] or c == 1)
+            and pv >= sb["min_percentile"]
+            and s >= sb_score_floor
+            and (not sb["requires_strong_context"] or strong_context)
+            and healthy_mom
+            and rv >= sb["min_rvol"]
+            and (not sb["blocks_overextended"] or not overext)
+        )
+        buy_ready = (
+            (not bu["requires_confirmation"] or c == 1)
+            and pv >= bu["min_percentile"]
+            and s >= bu_score_floor
+            and (not bu["requires_decent_momentum"] or decent_mom)
+            and (not bu["blocks_weak_context"] or not weak_ctx)
+        )
+        hold_ready = (
+            pv >= ho["min_percentile"]
+            and s >= ho_score_floor
+            and (not ho["blocks_weak_context"] or not weak_ctx)
+        )
 
         reasons = []
-        if x == 1 and (s < max(0.50, e - 0.05) or p <= 0.20 or weak_context):
-            fail_counts["exit_or_weak"] += 1; reasons.append("exit_signal_path")
-        if s < 0.50 or p <= 0.15:
-            fail_counts["below_sell_floor"] += 1; reasons.append("below_sell_floor")
+        if x == 1 and (
+            s < max(se["floor_score"], e - se["exit_score_below_entry"])
+            or pv <= se["exit_percentile_floor"]
+            or weak_ctx
+        ):
+            fail_counts["exit_or_weak"] += 1
+            reasons.append("exit_signal_path")
+        if s < se["floor_score"] or pv <= se["floor_percentile"]:
+            fail_counts["below_sell_floor"] += 1
+            reasons.append("below_sell_floor")
         if not strong_buy_ready:
             fail_counts["strong_buy_not_met"] += 1
-            if c != 1: fail_counts["not_confirmed"] += 1; reasons.append("strong_buy:no_confirmation")
-            if p < 0.90: reasons.append(f"strong_buy:pct<{0.90:.2f}")
-            if s < max(0.76, e + 0.08): reasons.append(f"strong_buy:score<{max(0.76, e + 0.08):.3f}")
-            if not strong_context: reasons.append("strong_buy:context_not_strong")
-            if not healthy_momentum: fail_counts["momentum_not_healthy"] += 1; reasons.append("strong_buy:momentum_not_healthy")
-            if rv < 1.10: fail_counts["relvol_below_strong_buy"] += 1; reasons.append("strong_buy:rvol<1.10")
-            if overextended: fail_counts["overextended"] += 1; reasons.append("strong_buy:overextended")
+            if sb["requires_confirmation"] and c != 1:
+                fail_counts["not_confirmed"] += 1
+                reasons.append("strong_buy:no_confirmation")
+            if pv < sb["min_percentile"]:
+                reasons.append(f"strong_buy:pct<{sb['min_percentile']:.2f}")
+            if s < sb_score_floor:
+                reasons.append(f"strong_buy:score<{sb_score_floor:.3f}")
+            if sb["requires_strong_context"] and not strong_context:
+                reasons.append("strong_buy:context_not_strong")
+            if not healthy_mom:
+                fail_counts["momentum_not_healthy"] += 1
+                reasons.append("strong_buy:momentum_not_healthy")
+            if rv < sb["min_rvol"]:
+                fail_counts["relvol_below_strong_buy"] += 1
+                reasons.append(f"strong_buy:rvol<{sb['min_rvol']:.2f}")
+            if sb["blocks_overextended"] and overext:
+                fail_counts["overextended"] += 1
+                reasons.append("strong_buy:overextended")
         if not buy_ready:
             fail_counts["buy_not_met"] += 1
-            if c != 1: reasons.append("buy:no_confirmation")
-            if p < 0.65: fail_counts["pct_below_buy"] += 1; reasons.append("buy:pct<0.65")
-            if s < max(0.62, e + 0.02): fail_counts["score_below_buy"] += 1; reasons.append(f"buy:score<{max(0.62, e + 0.02):.3f}")
-            if not decent_momentum: fail_counts["momentum_not_decent"] += 1; reasons.append("buy:momentum_not_decent")
-            if weak_context: fail_counts["weak_context"] += 1; reasons.append("buy:weak_context")
+            if bu["requires_confirmation"] and c != 1:
+                reasons.append("buy:no_confirmation")
+            if pv < bu["min_percentile"]:
+                fail_counts["pct_below_buy"] += 1
+                reasons.append(f"buy:pct<{bu['min_percentile']:.2f}")
+            if s < bu_score_floor:
+                fail_counts["score_below_buy"] += 1
+                reasons.append(f"buy:score<{bu_score_floor:.3f}")
+            if bu["requires_decent_momentum"] and not decent_mom:
+                fail_counts["momentum_not_decent"] += 1
+                reasons.append("buy:momentum_not_decent")
+            if bu["blocks_weak_context"] and weak_ctx:
+                fail_counts["weak_context"] += 1
+                reasons.append("buy:weak_context")
         if not hold_ready:
-            fail_counts["hold_not_met"] += 1; reasons.append("hold:not_met")
+            fail_counts["hold_not_met"] += 1
+            reasons.append("hold:not_met")
 
         diag_rows.append({
-            "ticker": ticker, "score": round(s, 4), "pct": round(p, 4),
+            "ticker": ticker, "score": round(s, 4), "pct": round(pv, 4),
             "entry": round(e, 4), "confirmed": c, "exit_sig": x,
             "breadth": b, "vol": v, "lead": round(l, 3),
             "rs": r, "sectrs": sr, "rsi14": round(ri, 2), "adx14": round(ax, 2),
@@ -421,6 +503,11 @@ def _log_action_diagnostics(out: pd.DataFrame) -> None:
 
 
 def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
+    """Translate scored/signaled rows into actionable recommendations.
+    Every threshold is read from *params* (falling back to ACTIONPARAMS_V2)
+    so the caller can tune behaviour entirely from config_refactor."""
+    ap = params if params is not None else ACTIONPARAMS_V2
+
     out = _add_score_percentiles(df.copy())
     if out.empty:
         out["action_v2"] = pd.Series(dtype=object)
@@ -429,6 +516,32 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         out["action_sort_key_v2"] = pd.Series(dtype=float)
         return out
 
+    # ── unpack config tiers ──────────────────────────────────────────
+    sb = ap["strong_buy"]
+    bu = ap["buy"]
+    ho = ap["hold"]
+    se = ap["sell"]
+    sc = ap["strong_context"]
+    wc = ap["weak_context"]
+    hm = ap["healthy_momentum"]
+    dm = ap["decent_momentum"]
+    oe = ap["overextended"]
+    cv = ap["conviction"]
+
+    logger.info(
+        "Action params: sb_pct=%.2f sb_score=%.2f bu_pct=%.2f bu_score=%.2f "
+        "ho_pct=%.2f ho_score=%.2f sell_floor=%.2f sell_pct=%.2f "
+        "weak_ctx_breadth=%s weak_ctx_vol=%s weak_ctx_sector=%s "
+        "dm_rs=%s dm_rsi=%.0f dm_adx=%.0f",
+        sb["min_percentile"], sb["min_score"],
+        bu["min_percentile"], bu["min_score"],
+        ho["min_percentile"], ho["min_score"],
+        se["floor_score"], se["floor_percentile"],
+        wc["breadth_regimes"], wc["vol_regimes"], wc["sector_regimes"],
+        dm["allowed_rs"], dm["min_rsi"], dm["min_adx"],
+    )
+
+    # ── extract series ───────────────────────────────────────────────
     score = out.get("scoreadjusted_v2", out.get("scorecomposite_v2", pd.Series(0.0, index=out.index))).fillna(0.0)
     pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
     entry = out.get("sigeffectiveentrymin_v2", pd.Series(0.60, index=out.index)).fillna(0.60)
@@ -448,40 +561,105 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     action_rank = {"STRONG_BUY": 4, "BUY": 3, "HOLD": 2, "SELL": 1}
 
     for i in out.index:
-        s = float(score.loc[i]); p = float(pct.loc[i]); e = float(entry.loc[i]); c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
-        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i]); r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
-        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i]); ext = float(short_ext.loc[i])
+        s = float(score.loc[i]); pv = float(pct.loc[i]); e = float(entry.loc[i])
+        c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
+        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i])
+        r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
+        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i])
+        ext = float(short_ext.loc[i])
 
-        strong_context = (b == "strong" and v == "calm") or l >= 0.60
-        weak_context = b in {"weak", "critical"} or v == "chaotic" or sr == "lagging"
-        healthy_momentum = r in {"leading", "improving"} and sr != "lagging" and ri >= 52 and ax >= 22
-        decent_momentum = r in {"leading", "improving"} and ri >= 45 and ax >= 16
-        overextended = ext >= 0.045 or ri >= 74
+        # ── context evaluation (all from config) ─────────────────────
+        strong_context = (
+            (b in sc["breadth_regimes"] and v in sc["vol_regimes"])
+            or l >= sc["min_leadership"]
+        )
+        weak_ctx = (
+            b in wc["breadth_regimes"]
+            or v in wc["vol_regimes"]
+            or sr in wc["sector_regimes"]
+        )
+        healthy_mom = (
+            r in hm["allowed_rs"]
+            and sr not in hm.get("blocked_sector", [])
+            and ri >= hm["min_rsi"]
+            and ax >= hm["min_adx"]
+        )
+        decent_mom = (
+            r in dm["allowed_rs"]
+            and ri >= dm["min_rsi"]
+            and ax >= dm["min_adx"]
+        )
+        overext = ext >= oe["max_ema_pct"] or ri >= oe["max_rsi"]
 
-        if x == 1 and (s < max(0.50, e - 0.05) or p <= 0.20 or weak_context):
-            action = "SELL"; reason = "Exit condition active with weak relative rank or hostile regime"
-        elif s < 0.50 or p <= 0.15:
-            action = "SELL"; reason = "Bottom-ranked score in the current market set"
-        elif c == 1 and p >= 0.90 and s >= max(0.76, e + 0.08) and strong_context and healthy_momentum and rv >= 1.10 and not overextended:
-            action = "STRONG_BUY"; reason = "Top-decile score with confirmation, momentum, and supportive regime"
-        elif c == 1 and p >= 0.65 and s >= max(0.62, e + 0.02) and decent_momentum and not weak_context:
-            action = "BUY"; reason = "Upper-tier score with confirmation and acceptable momentum"
-        elif p >= 0.35 and s >= max(0.54, e - 0.06) and not weak_context:
-            action = "HOLD"; reason = "Mid-ranked score worth monitoring but not strong enough to buy"
+        # ── action decision tree (all thresholds from config) ────────
+        if x == 1 and (
+            s < max(se["floor_score"], e - se["exit_score_below_entry"])
+            or pv <= se["exit_percentile_floor"]
+            or weak_ctx
+        ):
+            action = "SELL"
+            reason = "Exit condition active with weak relative rank or hostile regime"
+
+        elif s < se["floor_score"] or pv <= se["floor_percentile"]:
+            action = "SELL"
+            reason = "Bottom-ranked score in the current market set"
+
+        elif (
+            (not sb["requires_confirmation"] or c == 1)
+            and pv >= sb["min_percentile"]
+            and s >= max(sb["min_score"], e + sb["score_above_entry"])
+            and (not sb["requires_strong_context"] or strong_context)
+            and healthy_mom
+            and rv >= sb["min_rvol"]
+            and (not sb["blocks_overextended"] or not overext)
+        ):
+            action = "STRONG_BUY"
+            reason = "Top-decile score with confirmation, momentum, and supportive regime"
+
+        elif (
+            (not bu["requires_confirmation"] or c == 1)
+            and pv >= bu["min_percentile"]
+            and s >= max(bu["min_score"], e + bu["score_above_entry"])
+            and (not bu["requires_decent_momentum"] or decent_mom)
+            and (not bu["blocks_weak_context"] or not weak_ctx)
+        ):
+            action = "BUY"
+            reason = "Upper-tier score with confirmation and acceptable momentum"
+
+        elif (
+            pv >= ho["min_percentile"]
+            and s >= max(ho["min_score"], e - ho["score_below_entry"])
+            and (not ho["blocks_weak_context"] or not weak_ctx)
+        ):
+            action = "HOLD"
+            reason = "Mid-ranked score worth monitoring but not strong enough to buy"
+
         else:
-            action = "SELL"; reason = "Below hold band after percentile and regime adjustment"
+            action = "SELL"
+            reason = "Below hold band after percentile and regime adjustment"
 
-        conviction = "high" if (p >= 0.90 or s >= 0.84) else ("medium" if (p >= 0.60 or s >= 0.68) else "low")
-        actions.append(action); reasons.append(reason); convictions.append(conviction)
-        sort_keys.append(action_rank[action] * 10 + p + s / 10.0)
+        conviction = (
+            "high" if (pv >= cv["high_pct"] or s >= cv["high_score"])
+            else "medium" if (pv >= cv["medium_pct"] or s >= cv["medium_score"])
+            else "low"
+        )
+
+        actions.append(action)
+        reasons.append(reason)
+        convictions.append(conviction)
+        sort_keys.append(action_rank[action] * 10 + pv + s / 10.0)
 
     out["action_v2"] = actions
     out["conviction_v2"] = convictions
     out["action_reason_v2"] = reasons
     out["action_sort_key_v2"] = sort_keys
-    _log_action_diagnostics(out)
+
+    _log_action_diagnostics(out, params=ap)
+
     sort_score_col = "scoreadjusted_v2" if "scoreadjusted_v2" in out.columns else "scorecomposite_v2"
-    return out.sort_values(["action_sort_key_v2", sort_score_col], ascending=[False, False]).reset_index(drop=True)
+    return out.sort_values(
+        ["action_sort_key_v2", sort_score_col], ascending=[False, False]
+    ).reset_index(drop=True)
 
 
 def _build_review_table(action_table: pd.DataFrame) -> pd.DataFrame:
@@ -665,11 +843,11 @@ def run_pipeline_v2(
         raise ValueError("bench_df is required and cannot be empty")
     
     config = config or {}
-    scoring_weights = config.get("scoring_weights", None)
-    scoring_params = config.get("scoring_params", None)
-    signal_params = config.get("signal_params", None)
-    convergence_params = config.get("convergence_params", None)
-    action_params = config.get("action_params", None)
+    scoring_weights   = config.get("scoring_weights")   or config.get("SCORINGWEIGHTS_V2", None)
+    scoring_params    = config.get("scoring_params")     or config.get("SCORINGPARAMS_V2", None)
+    signal_params     = config.get("signal_params")      or config.get("SIGNALPARAMS_V2", None)
+    convergence_params = config.get("convergence_params") or config.get("CONVERGENCEPARAMS_V2", None)
+    action_params     = config.get("action_params")      or config.get("ACTIONPARAMS_V2", None)
 
     logger.info(
         "run_pipeline_v2 start: market=%s tradable=%d leadership=%d",
@@ -739,7 +917,7 @@ def run_pipeline_v2(
         if k in all_symbol_frames
     }
 
-    # ── D2. SECTOR ROTATION ──────────────────────────────────────────────────  # ← NEW
+    # ── D2. SECTOR ROTATION ──────────────────────────────────────────────────
     rotation_result = compute_sector_rotation(all_symbol_frames, bench_df)
     sector_regimes = rotation_result["sector_regimes"]
     ticker_regimes = rotation_result["ticker_regimes"]
@@ -752,7 +930,7 @@ def run_pipeline_v2(
 
     last_vol = regime_df.iloc[-1]
 
-    # ── regime context logging (expanded) ─────────────────────────────────────  # ← CHANGED
+    # ── regime context logging (expanded) ─────────────────────────────────────
     leading_sectors = (
         sector_summary.loc[sector_summary["regime"] == "leading", "sector"].tolist()
         if not sector_summary.empty else []
@@ -771,6 +949,14 @@ def run_pipeline_v2(
         leading_sectors or ["none"],
         lagging_sectors or ["none"],
     )
+
+    # ── rotation recommendation mapping (used per-row below) ──────────────────  # ← FIX 4
+    _sect_to_rec = {
+        "leading":    "STRONGBUY",
+        "improving":  "BUY",
+        "weakening":  "SELL",
+        "lagging":    "SELL",
+    }
 
     # ── F. per-symbol preparation loop ────────────────────────────────────────
     latest_rows = []
@@ -810,15 +996,26 @@ def run_pipeline_v2(
         if _row_d is None or (isinstance(_row_d, float) and math.isnan(_row_d)):
             row["dispersion"] = breadth_info.get("dispersion")
 
-        # ── sector from sector_map ────────────────────────────────────────────  # ← NEW
+        # ── sector from sector_map ────────────────────────────────────────────
         if not row.get("sector") or row["sector"] == "Unknown":
             row["sector"] = get_sector_or_class(ticker)
         row["sector"] = row.get("sector") or "Unknown"
 
-        # ── sector rotation regime ────────────────────────────────────────────  # ← NEW
+        # ── sector rotation regime ────────────────────────────────────────────
         _row_sr = row.get("sectrsregime")
         if _row_sr is None or str(_row_sr).lower() in ("unknown", "nan", ""):
             row["sectrsregime"] = ticker_regimes.get(ticker, "unknown")
+
+        # ── rotation recommendation from sector regime ────────────────────────  # ← FIX 4
+        # Translate the sector rotation regime into a discrete recommendation
+        # that apply_convergence_v2 reads from the "rotationrec" column.
+        # Without this, rotationrec defaults to "HOLD" everywhere and the
+        # convergence module's aligned/avoid/mixed logic is dead code.
+        _row_rr = row.get("rotationrec")
+        if _row_rr is None or str(_row_rr).lower() in ("unknown", "nan", ""):
+            row["rotationrec"] = _sect_to_rec.get(
+                str(row.get("sectrsregime", "unknown")).lower(), "HOLD"
+            )
 
         row["theme"] = row.get("theme") or "Unknown"
 
@@ -834,7 +1031,8 @@ def run_pipeline_v2(
                 "scoreability_reason_v2": row.get("scoreability_reason_v2", "missing critical inputs"),
                 "breadthregime": row.get("breadthregime", "unknown"),
                 "volregime": row.get("volregime", "unknown"),
-                "sectrsregime": row.get("sectrsregime", "unknown"),              # ← NEW
+                "sectrsregime": row.get("sectrsregime", "unknown"),
+                "rotationrec": row.get("rotationrec", "HOLD"),               # ← FIX 4
                 "sector": row.get("sector", "Unknown"),
                 "theme": row.get("theme", "Unknown"),
             })
@@ -851,7 +1049,7 @@ def run_pipeline_v2(
             logger.debug(
                 "Prepared %s last-row snapshot: close=%.4f rsi14=%.2f adx14=%.2f "
                 "atr14pct=%.4f rvol=%.2f rszscore=%s rsregime=%s sectrsregime=%s "
-                "breadth=%s vol=%s dispersion20=%s sector=%s",                   # ← CHANGED
+                "rotationrec=%s breadth=%s vol=%s dispersion20=%s sector=%s",     # ← FIX 4
                 ticker,
                 float(row.get("close", 0.0) or 0.0),
                 float(row.get("rsi14", 50.0) or 50.0),
@@ -861,6 +1059,7 @@ def run_pipeline_v2(
                 row.get("rszscore", "missing"),
                 row.get("rsregime", "unknown"),
                 row.get("sectrsregime", "unknown"),
+                row.get("rotationrec", "HOLD"),                                   # ← FIX 4
                 row.get("breadthregime", "unknown"),
                 row.get("volregime", "unknown"),
                 row.get("dispersion20", "missing"),
@@ -887,7 +1086,12 @@ def run_pipeline_v2(
             breadth_info.get("breadth_regime", "unknown"),
         )
 
-        # ── sector rotation distribution within scoreable set ─────────────────  # ← NEW
+        # ── rotation rec distribution within scoreable set ────────────────────  # ← FIX 4
+        if "rotationrec" in latest.columns:
+            rr_dist = latest["rotationrec"].value_counts().to_dict()
+            logger.info("Scoreable set rotationrec distribution: %s", rr_dist)
+
+        # ── sector rotation distribution within scoreable set ─────────────────
         if "sectrsregime" in latest.columns:
             sr_dist = latest["sectrsregime"].value_counts().to_dict()
             logger.info("Scoreable set sectrsregime distribution: %s", sr_dist)
@@ -895,21 +1099,24 @@ def run_pipeline_v2(
         if logger.isEnabledFor(logging.DEBUG):
             cols = [c for c in [
                 "ticker", "close", "rsi14", "adx14", "atr14pct", "relativevolume",
-                "rszscore", "rsregime", "sectrsregime",
+                "rszscore", "rsregime", "sectrsregime", "rotationrec",            # ← FIX 4
                 "leadership_strength", "breadthregime", "breadthscore",
                 "volregime", "realizedvol20d", "gaprate20", "dispersion20",
                 "scoreable_v2", "missing_critical_fields_v2", "sector", "theme",
             ] if c in latest.columns]
             logger.debug("Latest snapshot preview:\n%s", latest[cols].head(30).to_string(index=False))
 
-    import inspect
-    logger.info("compute_composite_v2 sig: %s", inspect.signature(compute_composite_v2))
-    logger.info("compute_composite_v2 file: %s", inspect.getfile(compute_composite_v2))
-    
+  
     scored = compute_composite_v2(latest, weights=scoring_weights, params=scoring_params) if not latest.empty else pd.DataFrame()
     logger.info("Scored rows=%d", len(scored))
     if not scored.empty:
-        scored["scorecomposite_v2"] = (scored["scorecomposite_v2"] + 0.10 * scored.get("leadership_strength", 0.0)).clip(0, 1)
+        # ── AFTER (config-driven) ─────────────────────────────────────────
+        _ap = action_params if action_params is not None else ACTIONPARAMS_V2
+        _lead_w = _ap.get("leadership_boost_weight", 0.10)
+        scored["scorecomposite_v2"] = (
+            scored["scorecomposite_v2"]
+            + _lead_w * scored.get("leadership_strength", 0.0)
+        ).clip(0, 1)
         logger.info(
             "Score diagnostics: min=%.4f median=%.4f max=%.4f >=0.62=%d >=0.50=%d",
             float(scored["scorecomposite_v2"].min()),
@@ -930,16 +1137,21 @@ def run_pipeline_v2(
 
     converged = apply_convergence_v2(signaled, params=convergence_params) if not signaled.empty else pd.DataFrame()
     logger.info("Converged rows=%d", len(converged))
-    if not converged.empty and logger.isEnabledFor(logging.DEBUG):
-        cols = [c for c in ["ticker", "scorecomposite_v2", "scoreadjusted_v2", "sigeffectiveentrymin_v2", "sigconfirmed_v2", "sigexit_v2", "rsi14", "adx14", "relativevolume"] if c in converged.columns]
-        logger.debug("Converged preview:\n%s", converged.sort_values(cols[1] if len(cols) > 1 else converged.columns[0], ascending=False)[cols].head(30).to_string(index=False))
+    if not converged.empty:
+        # ── convergence label distribution ────────────────────────────────────  # ← FIX 4
+        if "convergence_label_v2" in converged.columns:
+            cl_dist = converged["convergence_label_v2"].value_counts().to_dict()
+            logger.info("Convergence label distribution: %s", cl_dist)
+        if logger.isEnabledFor(logging.DEBUG):
+            cols = [c for c in ["ticker", "scorecomposite_v2", "scoreadjusted_v2", "sigeffectiveentrymin_v2", "sigconfirmed_v2", "sigexit_v2", "convergence_label_v2", "rotationrec", "rsi14", "adx14", "relativevolume"] if c in converged.columns]
+            logger.debug("Converged preview:\n%s", converged.sort_values(cols[1] if len(cols) > 1 else converged.columns[0], ascending=False)[cols].head(30).to_string(index=False))
 
     action_table = _generate_actions(converged, params=action_params) if not converged.empty else pd.DataFrame()
     logger.info("Action table rows=%d", len(action_table))
     if not action_table.empty:
         logger.info("Action counts=%s", action_table["action_v2"].value_counts().to_dict())
         if logger.isEnabledFor(logging.DEBUG):
-            cols = [c for c in ["ticker", "action_v2", "conviction_v2", "scorecomposite_v2", "scoreadjusted_v2", "score_percentile_v2", "rsi14", "adx14", "relativevolume", "sectrsregime", "action_reason_v2"] if c in action_table.columns]
+            cols = [c for c in ["ticker", "action_v2", "conviction_v2", "scorecomposite_v2", "scoreadjusted_v2", "score_percentile_v2", "rsi14", "adx14", "relativevolume", "sectrsregime", "rotationrec", "convergence_label_v2", "action_reason_v2"] if c in action_table.columns]
             logger.debug("Action table preview:\n%s", action_table[cols].head(50).to_string(index=False))
 
     review_table = _build_review_table(action_table) if not action_table.empty else pd.DataFrame()
@@ -992,7 +1204,7 @@ def run_pipeline_v2(
         "regime_df": regime_df,
         "breadth_info": breadth_info,
         "breadth_df": breadth_computed_df,
-        "sector_summary": sector_summary,                                    # ← NEW
-        "sector_regimes": sector_regimes,                                    # ← NEW
+        "sector_summary": sector_summary,
+        "sector_regimes": sector_regimes,
         "leadership_snapshot": leadership_snapshot,
     }

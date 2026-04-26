@@ -5,14 +5,21 @@ from __future__ import annotations
 #VOLREGIMEPARAMS = {"atrp_window": 14, "realized_vol_window": 20, "dispersion_window": 20, "gap_window": 20, "calm_atrp_max": 0.035, "volatile_atrp_max": 0.060, "calm_rvol_max": 0.28, "volatile_rvol_max": 0.42, "volatile_gap_rate": 0.18, "chaotic_gap_rate": 0.28, "calm_dispersion_max": 0.022, "volatile_dispersion_max": 0.040, "score_weights": {"atrp": 0.35, "realized_vol": 0.35, "gap_rate": 0.15, "dispersion": 0.15}}
 #SCORINGWEIGHTS_V2 = {"trend": 0.38, "participation": 0.22, "risk": 0.25, "regime": 0.15}
 #SCORINGPARAMS_V2 = {"trend": {"w_stock_rs": 0.45, "w_sector_rs": 0.25, "w_rs_accel": 0.15, "w_trend_confirm": 0.15}, "participation": {"w_rvol": 0.35, "w_obv": 0.30, "w_adline": 0.20, "w_dollar_volume": 0.15}, "risk": {"w_vol_penalty": 0.35, "w_liquidity_penalty": 0.25, "w_gap_penalty": 0.20, "w_extension_penalty": 0.20}, "regime": {"w_breadth": 0.60, "w_vol_regime": 0.40}, "penalties": {"rsi_soft_low": 38.0, "rsi_soft_high": 78.0, "adx_soft_min": 16.0, "atrp_high": 0.07, "extension_warn": 0.12, "extension_bad": 0.22, "illiquidity_bad": 0.015}}
-#SIGNALPARAMS_V2 = {"base_entry_threshold": 0.58, "base_exit_threshold": 0.42, "allowed_rs_regimes": ("leading", "improving"), "blocked_sector_regimes": ("lagging",), "hard_block_breadth_regimes": ("critical",), "hard_block_vol_regimes": ("chaotic",), "continuation_min_trend": 0.62, "pullback_min_trend": 0.68, "pullback_max_short_extension": 0.04, "pullback_rsi_max": 58.0, "cooldown_days": 4, "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10}, "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.07, "critical": 0.12, "unknown": 0.00}, "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35}}
+#SIGNALPARAMS_V2 = {"base_entry_threshold": 0.58, "base_exit_threshold": 0.42, "allowed_rs_regimes": ("leading", "improving"), "blocked_sector_regimes": ("lagging",), "hard_block_breadth_regimes": ("critical",), "hard_block_vol_regimes": ("chaotic",), "continuation_min_trend": 0.62, "pullback_min_trend": 0.68, "pullback_max_short_extension": 0.04, "pullback_rsi_max": 58.0, "cooldown_days": 4, "rs_fail_penalty": 0.08, "breadth_fail_penalty": 0.03, "min_rank_pct": 0.80, "relative_setup_rank_pct": 0.75, "exit_rank_floor": 0.20, "chaotic_exit_bump": 0.08, "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10}, "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.07, "critical": 0.12, "unknown": 0.00}, "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35}}
 #CONVERGENCEPARAMS_V2 = {"tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0}, "adjustments": {"calm": 0.04, "volatile": 0.02, "chaotic": 0.00}}
 
 
-# Tighter generates fewer BUY signals, exits positions sooner, takes smaller positions in rough markets, and penalizes chasing, low liquidity, and overbought conditions more aggressively.
-VOLREGIMEPARAMS = {"atrp_window": 14, "realized_vol_window": 20, "dispersion_window": 20, "gap_window": 20, "calm_atrp_max": 0.035, "volatile_atrp_max": 0.060, 
-                   "calm_rvol_max": 0.28, "volatile_rvol_max": 0.42, "volatile_gap_rate": 0.18, "chaotic_gap_rate": 0.28, "calm_dispersion_max": 0.022, 
-                   "volatile_dispersion_max": 0.040, "score_weights": {"atrp": 0.35, "realized_vol": 0.35, "gap_rate": 0.15, "dispersion": 0.15}}
+# Tighter generates fewer BUY signals, exits positions sooner, takes smaller
+# positions in rough markets, and penalizes chasing, low liquidity, and
+# overbought conditions more aggressively.
+VOLREGIMEPARAMS = {
+    "atrp_window": 14, "realized_vol_window": 20, "dispersion_window": 20,
+    "gap_window": 20, "calm_atrp_max": 0.035, "volatile_atrp_max": 0.060,
+    "calm_rvol_max": 0.28, "volatile_rvol_max": 0.42,
+    "volatile_gap_rate": 0.18, "chaotic_gap_rate": 0.28,
+    "calm_dispersion_max": 0.022, "volatile_dispersion_max": 0.040,
+    "score_weights": {"atrp": 0.35, "realized_vol": 0.35, "gap_rate": 0.15, "dispersion": 0.15},
+}
 SCORINGWEIGHTS_V2 = {"trend": 0.36, "participation": 0.18, "risk": 0.26, "regime": 0.20}
 SCORINGPARAMS_V2 = {
     "trend": {
@@ -59,6 +66,13 @@ SIGNALPARAMS_V2 = {
     "pullback_max_short_extension": 0.06,
     "pullback_rsi_max": 62.0,
     "cooldown_days": 4,
+    # ── soft-penalty & rank gates (tight) ──
+    "rs_fail_penalty": 0.12,
+    "breadth_fail_penalty": 0.06,
+    "min_rank_pct": 0.88,
+    "relative_setup_rank_pct": 0.82,
+    "exit_rank_floor": 0.30,
+    "chaotic_exit_bump": 0.12,
     "regime_entry_adjustment": {
         "calm": 0.00,
         "volatile": 0.04,
@@ -91,3 +105,77 @@ CONVERGENCEPARAMS_V2 = {
         "chaotic": 0.00,
     },
 }
+
+ACTIONPARAMS_V2 = {
+    # ── STRONG_BUY tier ──────────────────────────────────────
+    "strong_buy": {
+        "min_percentile": 0.90,
+        "min_score": 0.76,
+        "score_above_entry": 0.08,       # score must be >= entry + this
+        "min_rvol": 1.10,
+        "requires_confirmation": True,
+        "requires_strong_context": True,
+        "blocks_overextended": True,
+    },
+    # ── BUY tier ─────────────────────────────────────────────
+    "buy": {
+        "min_percentile": 0.65,
+        "min_score": 0.62,
+        "score_above_entry": 0.02,
+        "requires_confirmation": True,
+        "requires_decent_momentum": True,
+        "blocks_weak_context": True,
+    },
+    # ── HOLD tier ────────────────────────────────────────────
+    "hold": {
+        "min_percentile": 0.35,
+        "min_score": 0.54,
+        "score_below_entry": 0.06,       # score must be >= entry - this
+        "blocks_weak_context": True,
+    },
+    # ── SELL triggers ────────────────────────────────────────
+    "sell": {
+        "floor_score": 0.50,
+        "floor_percentile": 0.15,
+        "exit_score_below_entry": 0.05,  # with exit signal: sell if score < entry - this
+        "exit_percentile_floor": 0.20,
+    },
+    # ── Context definitions ──────────────────────────────────
+    "strong_context": {
+        "breadth_regimes": ["strong"],
+        "vol_regimes": ["calm"],
+        "min_leadership": 0.60,
+    },
+    "weak_context": {
+        "breadth_regimes": ["weak", "critical"],
+        "vol_regimes": ["chaotic"],
+        "sector_regimes": ["lagging"],
+    },
+    # ── Momentum definitions ─────────────────────────────────
+    "healthy_momentum": {
+        "allowed_rs": ["leading", "improving"],
+        "blocked_sector": ["lagging"],
+        "min_rsi": 52,
+        "min_adx": 22,
+    },
+    "decent_momentum": {
+        "allowed_rs": ["leading", "improving"],
+        "min_rsi": 45,
+        "min_adx": 16,
+    },
+    # ── Overextension ────────────────────────────────────────
+    "overextended": {
+        "max_ema_pct": 0.045,
+        "max_rsi": 74,
+    },
+    # ── Conviction thresholds ────────────────────────────────
+    "conviction": {
+        "high_pct": 0.90,
+        "high_score": 0.84,
+        "medium_pct": 0.60,
+        "medium_score": 0.68,
+    },
+    # ── Leadership ───────────────────────────────────────────
+    "leadership_boost_weight": 0.10,
+}
+
