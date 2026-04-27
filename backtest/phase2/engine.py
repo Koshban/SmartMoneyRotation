@@ -212,6 +212,11 @@ class BacktestEngine:
         """
         Translate engine state into the arguments run_pipeline_v2
         actually expects.
+
+        Config keys are lowercase throughout (vol_regime_params,
+        scoring_weights, scoring_params, signal_params,
+        convergence_params, action_params).  build_config_dict()
+        in compare.py produces the same keys.
         """
         from refactor.pipeline_v2 import run_pipeline_v2
 
@@ -225,7 +230,7 @@ class BacktestEngine:
         # 2 — benchmark DataFrame via dedicated accessor
         bench_df = self.data_source.fetch_benchmark()
         if bench_df is None or bench_df.empty:
-            bench_ticker = self.config.get("BENCH_TICKER", "SPY")
+            bench_ticker = self.config.get("bench_ticker", "SPY")
             bench_df = self.data_source.fetch(bench_ticker)
         if bench_df is None or bench_df.empty:
             raise ValueError(
@@ -239,7 +244,7 @@ class BacktestEngine:
 
         # 4 — leadership frames (optional)
         leadership_frames = None
-        leadership_tickers = self.config.get("LEADERSHIP_TICKERS", None)
+        leadership_tickers = self.config.get("leadership_tickers", None)
         if leadership_tickers:
             leadership_frames = {}
             for t in leadership_tickers:
@@ -247,17 +252,19 @@ class BacktestEngine:
                 if not df.empty:
                     leadership_frames[t] = df
 
-        # 5 — pack config the way run_pipeline_v2 unpacks it
+        # 5 — pass config straight through; keys already match
+        #     what run_pipeline_v2 reads via config.get(...)
         pipeline_config = {
-            "scoring_weights": self.config.get("SCORINGWEIGHTS_V2"),
-            "scoring_params": self.config.get("SCORINGPARAMS_V2"),
-            "signal_params": self.config.get("SIGNALPARAMS_V2"),
-            "convergence_params": self.config.get("CONVERGENCEPARAMS_V2"),
-            "action_params": self.config.get("ACTIONPARAMS_V2"),
+            "vol_regime_params":  self.config.get("vol_regime_params"),
+            "scoring_weights":    self.config.get("scoring_weights"),
+            "scoring_params":     self.config.get("scoring_params"),
+            "signal_params":      self.config.get("signal_params"),
+            "convergence_params": self.config.get("convergence_params"),
+            "action_params":      self.config.get("action_params"),
         }
 
         # 6 — portfolio params (optional)
-        portfolio_params = self.config.get("PORTFOLIO_PARAMS", None)
+        portfolio_params = self.config.get("portfolio_params", None)
 
         return run_pipeline_v2(
             tradable_frames=tradable_frames,

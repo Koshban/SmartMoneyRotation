@@ -19,7 +19,16 @@ from rich.console import Console
 from backtest.phase2.data_source import BacktestDataSource
 from backtest.phase2.compare import build_config_dict, run_comparison, print_comparison
 from copy import deepcopy
-from refactor.common.config_refactor import ACTIONPARAMS_V2
+from refactor.common.config_refactor import (
+    VOLREGIMEPARAMS,
+    SCORINGWEIGHTS_V2,
+    SCORINGPARAMS_V2,
+    SIGNALPARAMS_V2,
+    CONVERGENCEPARAMS_V2,
+    ACTIONPARAMS_V2,
+    BREADTHPARAMS,          # ← NEW
+    ROTATIONPARAMS,         # ← NEW
+)
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -159,32 +168,51 @@ def load_data(
 # ══════════════════════════════════════════════════════════════════
 #  TWO CONFIGS TO COMPARE
 # ══════════════════════════════════════════════════════════════════
-# ── India-specific action_params (shared base, two tightness levels) ──────────
 
-def _india_action_params(loose: bool = True) -> dict:
-    """
-    Build an action_params dict starting from the canonical defaults,
-    then applying India-specific overrides.  Returns a *new* dict —
-    never mutates the global.
-    """
-    ap = deepcopy(ACTIONPARAMS_V2)
+from copy import deepcopy
 
-    # ── common India overrides (both loose and tight) ─────────────────────
-    ap["buy"]["min_percentile"]              = 0.50
-    ap["buy"]["min_score"]                   = 0.55
-    ap["decent_momentum"]["min_rsi"]         = 40
-    ap["decent_momentum"]["min_adx"]         = 14
-    ap["weak_context"]["sector_regimes"]     = []     # stop killing lagging sectors
-
-    if not loose:
-        # ── tighter variant: raise the bar slightly ───────────────────────
-        ap["buy"]["min_percentile"]          = 0.55
-        ap["buy"]["min_score"]               = 0.58
-        ap["decent_momentum"]["min_rsi"]     = 42
-        ap["decent_momentum"]["min_adx"]     = 16
-
-    return ap
-
+_ACTION_COMMON = {
+    "strong_buy": {
+        "min_percentile": 0.90, "min_score": 0.76, "score_above_entry": 0.08,
+        "min_rvol": 1.10, "requires_confirmation": True,
+        "requires_strong_context": True, "blocks_overextended": True,
+    },
+    "buy": {
+        "min_percentile": 0.65, "min_score": 0.62, "score_above_entry": 0.02,
+        "requires_confirmation": True, "requires_decent_momentum": True,
+        "blocks_weak_context": True,
+    },
+    "hold": {
+        "min_percentile": 0.35, "min_score": 0.54, "score_below_entry": 0.06,
+        "blocks_weak_context": True,
+    },
+    "sell": {
+        "floor_score": 0.50, "floor_percentile": 0.15,
+        "exit_score_below_entry": 0.05, "exit_percentile_floor": 0.20,
+    },
+    "strong_context": {
+        "breadth_regimes": ["strong"], "vol_regimes": ["calm"],
+        "min_leadership": 0.60,
+    },
+    "weak_context": {
+        "breadth_regimes": ["weak", "critical"], "vol_regimes": ["chaotic"],
+        "sector_regimes": ["lagging"],
+    },
+    "healthy_momentum": {
+        "allowed_rs": ["leading", "improving"], "blocked_sector": ["lagging"],
+        "min_rsi": 52, "min_adx": 22,
+    },
+    "decent_momentum": {
+        "allowed_rs": ["leading", "improving"],
+        "min_rsi": 45, "min_adx": 16,
+    },
+    "overextended": {"max_ema_pct": 0.045, "max_rsi": 74},
+    "conviction": {
+        "high_pct": 0.90, "high_score": 0.84,
+        "medium_pct": 0.60, "medium_score": 0.68,
+    },
+    "leadership_boost_weight": 0.10,
+}
 _VOL_COMMON = {
     "atrp_window": 14, "realized_vol_window": 20,
     "dispersion_window": 20, "gap_window": 20,
@@ -196,8 +224,16 @@ _VOL_COMMON = {
                       "gap_rate": 0.15, "dispersion": 0.15},
 }
 
+_VOL_LOOSE = {**_VOL_COMMON, "chaotic_threshold": 0.75, "volatile_threshold": 0.35}
+_VOL_TIGHT = {**_VOL_COMMON, "chaotic_threshold": 0.70, "volatile_threshold": 0.30}
+_ROTATION_COMMON = {
+    "rs_sma_period": 50,
+    "rs_momentum_period": 20,
+    "smooth_span": 10,
+    "min_history": 60,
+}
 CONFIG_LOOSE = build_config_dict(
-    vol_regime_params=_VOL_COMMON,
+    vol_regime_params=_VOL_LOOSE,
     scoring_weights={"trend": 0.38, "participation": 0.22, "risk": 0.25, "regime": 0.15},
     scoring_params={
         "trend": {"w_stock_rs": 0.45, "w_sector_rs": 0.25, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
@@ -228,16 +264,39 @@ CONFIG_LOOSE = build_config_dict(
         "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10},
         "breadth_entry_adjustment": {"strong": -0.02, "neutral": 0.00, "weak": 0.03, "critical": 0.08, "unknown": 0.00},
         "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35},
+        # ── position sizing (loose — larger positions) ──
+        "position_base_pct": 0.04,
+        "position_range_pct": 0.08,
+        "position_max_pct": 0.12,
+        # ── pullback lower bound (loose — allows more stretched-down names) ──
+        "pullback_min_short_extension": -0.06,
+        # ── continuation participation floor (loose — lower bar) ──
+        "continuation_min_participation": 0.45,
     },
     convergence_params={
         "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
         "adjustments": {"calm": 0.04, "volatile": 0.02, "chaotic": 0.00},
+        # ── rotation recommendation mapping (loose — weakening = HOLD) ──
+        "rotation_rec_map": {
+            "leading": "STRONGBUY", "improving": "BUY",
+            "weakening": "HOLD", "lagging": "SELL",
+        },
+        "rotation_rec_default": "HOLD",
     },
-    action_params=_india_action_params(loose=True),                            # ← ADD
+    action_params=deepcopy(_ACTION_COMMON),
+    breadth_params={
+        "min_symbols": 5, "min_history": 55, "ema_span": 5,
+        "regime_strong": 0.62, "regime_moderate": 0.42, "regime_weak": 0.22,
+        "composite_weights": {
+            "pct_above_sma50": 0.30, "pct_above_sma200": 0.20,
+            "pct_above_sma20": 0.15, "pct_advancing": 0.15,
+            "net_new_highs": 0.20,
+        },
+    },
+    rotation_params=_ROTATION_COMMON,
 )
-
 CONFIG_TIGHT = build_config_dict(
-    vol_regime_params=_VOL_COMMON,
+    vol_regime_params=_VOL_TIGHT,
     scoring_weights={"trend": 0.36, "participation": 0.18, "risk": 0.26, "regime": 0.20},
     scoring_params={
         "trend": {"w_stock_rs": 0.42, "w_sector_rs": 0.28, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
@@ -268,12 +327,36 @@ CONFIG_TIGHT = build_config_dict(
         "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.04, "chaotic": 0.12},
         "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.08, "critical": 0.14, "unknown": 0.03},
         "size_multipliers": {"calm": 1.00, "volatile": 0.65, "chaotic": 0.30},
+        # ── position sizing (tight — smaller positions, lower cap) ──
+        "position_base_pct": 0.03,
+        "position_range_pct": 0.07,
+        "position_max_pct": 0.10,
+        # ── pullback lower bound (tight — narrower acceptable range) ──
+        "pullback_min_short_extension": -0.04,
+        # ── continuation participation floor (tight — higher bar) ──
+        "continuation_min_participation": 0.55,
     },
     convergence_params={
         "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
         "adjustments": {"calm": 0.04, "volatile": 0.01, "chaotic": 0.00},
+        # ── rotation recommendation mapping (tight — weakening = SELL) ──
+        "rotation_rec_map": {
+            "leading": "STRONGBUY", "improving": "BUY",
+            "weakening": "SELL", "lagging": "SELL",
+        },
+        "rotation_rec_default": "HOLD",
     },
-    action_params=_india_action_params(loose=False),                           # ← ADD
+    action_params=deepcopy(_ACTION_COMMON),
+    breadth_params={
+        "min_symbols": 5, "min_history": 55, "ema_span": 5,
+        "regime_strong": 0.68, "regime_moderate": 0.48, "regime_weak": 0.28,
+        "composite_weights": {
+            "pct_above_sma50": 0.30, "pct_above_sma200": 0.20,
+            "pct_above_sma20": 0.15, "pct_advancing": 0.15,
+            "net_new_highs": 0.20,
+        },
+    },
+    rotation_params=_ROTATION_COMMON,
 )
 
 # ══════════════════════════════════════════════════════════════════

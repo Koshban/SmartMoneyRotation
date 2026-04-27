@@ -17,21 +17,20 @@ IN) and classifies each stock directly into a rotation quadrant.
 
 Quadrants (classic clockwise RRG rotation)
 ------------------------------------------
-    leading    – RS above its trend AND accelerating
-    improving  – RS below its trend BUT accelerating
-    weakening  – RS above its trend BUT decelerating
-    lagging    – RS below its trend AND decelerating
+    leading    - RS above its trend AND accelerating
+    improving  - RS below its trend BUT accelerating
+    weakening  - RS above its trend BUT decelerating
+    lagging    - RS below its trend AND decelerating
 
 Output
 ------
 ``compute_sector_rotation`` returns a dict with:
 
-    sector_summary  – DataFrame with rotation metrics and regime.
-                      One row per sector (US) or per stock (HK / IN).
-    sector_regimes  – dict[str, str]  sector → regime
-                      (populated in sector-ETF mode only).
-    ticker_regimes  – dict[str, str]  ticker → regime
-                      (always populated).
+    sector_summary  - DataFrame with rotation metrics and regime.
+    sector_regimes  - dict[str, str]  sector -> regime
+    ticker_regimes  - dict[str, str]  ticker -> regime
+
+All RS computation parameters are configurable via params dict.
 """
 from __future__ import annotations
 
@@ -55,8 +54,6 @@ except ImportError:
         "common.sector_map not available; US sector-ETF rotation disabled"
     )
 
-# Per-market sector ETF definitions.
-# Empty dict ⇒ no sector ETFs ⇒ per-stock rotation mode.
 MARKET_SECTOR_ETFS: dict[str, dict[str, str]] = {
     "US": dict(_US_SECTOR_ETFS) if _US_SECTOR_ETFS else {},
     "HK": {},
@@ -69,7 +66,7 @@ MARKET_TICKER_SECTOR_MAP: dict[str, dict[str, str]] = {
     "IN": {},
 }
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
+# ── Module-level defaults (used when no params dict is supplied) ──────────────
 RS_SMA_PERIOD = 50
 RS_MOMENTUM_PERIOD = 20
 RS_SMOOTH_SPAN = 10
@@ -103,24 +100,42 @@ def _detect_market(symbol_frames: dict[str, pd.DataFrame]) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Public API
+# Public API  (FIX 9: accepts params dict)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def compute_sector_rotation(
     symbol_frames: dict[str, pd.DataFrame],
     bench_df: pd.DataFrame,
     market: str | None = None,
-    rs_sma_period: int = RS_SMA_PERIOD,
-    rs_momentum_period: int = RS_MOMENTUM_PERIOD,
-    smooth_span: int = RS_SMOOTH_SPAN,
-    min_history: int = MIN_HISTORY,
+    params: dict | None = None,
 ) -> dict:
     """
     Compute rotation quadrants.
 
-    For US: sector-ETF rotation (11 GICS sectors vs SPY).
-    For HK / IN: per-stock rotation (every ticker vs market benchmark).
+    Parameters
+    ----------
+    symbol_frames : dict
+        Ticker -> OHLCV DataFrame.
+    bench_df : DataFrame
+        Benchmark OHLCV data.
+    market : str, optional
+        Market code ("US", "HK", "IN").  Auto-detected if None.
+    params : dict, optional
+        Configuration overrides.  Recognised keys:
+            rs_sma_period, rs_momentum_period, smooth_span, min_history
     """
+    # ── unpack config ─────────────────────────────────────────────────────
+    p = params or {}
+    rs_sma_period = p.get("rs_sma_period", RS_SMA_PERIOD)
+    rs_momentum_period = p.get("rs_momentum_period", RS_MOMENTUM_PERIOD)
+    smooth_span = p.get("smooth_span", RS_SMOOTH_SPAN)
+    min_history = p.get("min_history", MIN_HISTORY)
+
+    logger.info(
+        "compute_sector_rotation params: rs_sma=%d rs_mom=%d smooth=%d min_hist=%d",
+        rs_sma_period, rs_momentum_period, smooth_span, min_history,
+    )
+
     if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
         logger.warning("compute_sector_rotation: benchmark missing or empty")
         return _empty_result()
@@ -209,10 +224,6 @@ def _compute_rs_for_one(
     smooth_span: int,
     min_history: int,
 ) -> dict | None:
-    """
-    Compute RRG-style RS metrics for a single close series vs benchmark.
-    Returns a dict of scalar metrics, or ``None`` if data is insufficient.
-    """
     combined = pd.DataFrame(
         {"target": target_close, "bench": bench_close},
     ).dropna()
@@ -264,7 +275,6 @@ def _compute_rs_for_one(
 
 
 def _classify_and_rank(summary: pd.DataFrame) -> pd.DataFrame:
-    """Apply quadrant classification and cross-sectional ranks."""
     summary["regime"] = np.select(
         [
             (summary["rs_level"] > 0) & (summary["rs_momentum"] > 0),
@@ -294,7 +304,6 @@ def _log_regime_distribution(
     label_col: str,
     max_display: int = 20,
 ) -> None:
-    """Log regime counts and per-regime members — all at DEBUG level."""
     regime_dist = summary["regime"].value_counts().to_dict()
     logger.debug("Rotation regime distribution: %s", regime_dist)
 
@@ -341,7 +350,6 @@ def _compute_sector_etf_rotation(
     smooth_span: int,
     min_history: int,
 ) -> dict:
-    """One RS computation per GICS sector ETF; tickers inherit parent regime."""
     rows: list[dict] = []
     skipped_missing = 0
     skipped_short = 0
@@ -404,9 +412,6 @@ def _compute_per_stock_rotation(
     smooth_span: int,
     min_history: int,
 ) -> dict:
-    """
-    One RS computation per universe ticker vs the market benchmark.
-    """
     rows: list[dict] = []
     skipped = 0
 
@@ -460,7 +465,6 @@ def _compute_per_stock_rotation(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _empty_result() -> dict:
-    """Return a well-typed empty result when rotation cannot be computed."""
     return {
         "sector_summary": pd.DataFrame(),
         "sector_regimes": {},

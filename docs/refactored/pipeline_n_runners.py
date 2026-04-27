@@ -1,20 +1,43 @@
-""" refactor/pipeline_v2.py """
+"""refactor/pipeline_v2.py"""
 from __future__ import annotations
 
 import logging
 import math
+
+import numpy as np
 import pandas as pd
 
 from compute.indicators import compute_all_indicators
 
+from common.sector_map import get_sector_or_class
+
 from .strategy.adapters_v2 import ensure_columns
-from .strategy.portfolio_v2 import build_portfolio_v2
+from .strategy.breadth_v2 import compute_breadth
+from .strategy.portfolio_v2 import (
+    build_portfolio_v2,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_MAX_SECTOR_WEIGHT,
+    DEFAULT_MAX_THEME_NAMES,
+    DEFAULT_MAX_SINGLE_WEIGHT,
+    DEFAULT_MIN_WEIGHT,
+)
 from .strategy.regime_v2 import classify_volatility_regime
+from .strategy.rotation_v2 import compute_sector_rotation
+from .strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
 from .strategy.scoring_v2 import compute_composite_v2
 from .strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
+from refactor.common.config_refactor import (
+    VOLREGIMEPARAMS,
+    SCORINGWEIGHTS_V2,
+    SCORINGPARAMS_V2,
+    SIGNALPARAMS_V2,
+    CONVERGENCEPARAMS_V2,
+    ACTIONPARAMS_V2,
+    BREADTHPARAMS,          # ← NEW
+    ROTATIONPARAMS,         # ← NEW
+)
 
 logger = logging.getLogger(__name__)
-
 
 CRITICAL_SCORE_COLUMNS_V2 = (
     "rszscore",
@@ -43,11 +66,23 @@ def _is_missing_value(value) -> bool:
 
 def _classify_breadth_regime(breadth_df: pd.DataFrame | None) -> dict:
     if breadth_df is None or breadth_df.empty:
-        return {"breadth_regime": "unknown", "breadthscore": None}
+        return {
+            "breadth_regime": "unknown",
+            "breadthscore": None,
+            "dispersion20": None,
+            "dispersion": None,
+        }
     row = breadth_df.iloc[-1]
     regime = row.get("breadthregime", row.get("breadth_regime", "unknown"))
     score = row.get("breadthscore", row.get("breadth_score", None))
-    return {"breadth_regime": regime, "breadthscore": score}
+    disp20 = row.get("dispersion20", None)
+    disp = row.get("dispersion_daily", row.get("dispersion", None))
+    return {
+        "breadth_regime": regime,
+        "breadthscore": score,
+        "dispersion20": disp20,
+        "dispersion": disp,
+    }
 
 
 def _canonicalize_indicator_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -81,6 +116,50 @@ def _canonicalize_indicator_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _fill_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    close = (
+        pd.to_numeric(out["close"], errors="coerce")
+        if "close" in out.columns
+        else None
+    )
+    if close is None or int(close.notna().sum()) < 20:
+        return out
+
+    if "realizedvol20d" not in out.columns:
+        log_ret = np.log(close / close.shift(1))
+        out["realizedvol20d"] = (
+            log_ret.rolling(20, min_periods=15).std() * np.sqrt(252)
+        )
+
+    if "gaprate20" not in out.columns and "open" in out.columns:
+        open_ = pd.to_numeric(out["open"], errors="coerce")
+        gap_pct = (open_ / close.shift(1) - 1.0).abs()
+        out["gaprate20"] = (
+            (gap_pct > 0.005).astype(float).rolling(20, min_periods=15).mean()
+        )
+
+    if "atr14pct" not in out.columns and all(
+        c in out.columns for c in ("high", "low")
+    ):
+        high = pd.to_numeric(out["high"], errors="coerce")
+        low = pd.to_numeric(out["low"], errors="coerce")
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+            axis=1,
+        ).max(axis=1)
+        atr14 = tr.ewm(span=14, min_periods=10).mean()
+        out["atr14pct"] = atr14 / close
+        if "atr14" not in out.columns:
+            out["atr14"] = atr14
+
+    return out
+
+
+_dispersion_warned: set[tuple[str, ...]] = set()
+
+
 def annotate_scoreability(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
@@ -94,6 +173,20 @@ def annotate_scoreability(df: pd.DataFrame) -> pd.DataFrame:
     required_cols = [c for c in CRITICAL_SCORE_COLUMNS_V2 if c in out.columns]
     unavailable_required = [c for c in CRITICAL_SCORE_COLUMNS_V2 if c not in out.columns]
 
+    if available_optional:
+        all_optional_nan = all(out[c].isna().all() for c in available_optional)
+        if all_optional_nan:
+            key = tuple(available_optional)
+            if key not in _dispersion_warned:
+                _dispersion_warned.add(key)
+                logger.warning(
+                    "annotate_scoreability: all optional dispersion columns "
+                    "are NaN (%s). Scoring will use neutral default for "
+                    "dispersion. This is expected if breadth context has not "
+                    "been stamped yet.",
+                    available_optional,
+                )
+
     missing_counts = []
     missing_fields = []
     reasons = []
@@ -102,12 +195,6 @@ def annotate_scoreability(df: pd.DataFrame) -> pd.DataFrame:
     for _, row in out.iterrows():
         row_missing = [c for c in required_cols if _is_missing_value(row.get(c))]
         row_missing.extend(unavailable_required)
-
-        if available_optional:
-            optional_missing = [c for c in available_optional if _is_missing_value(row.get(c))]
-            if len(optional_missing) == len(available_optional):
-                row_missing.append("dispersion_proxy_missing")
-
         row_missing = list(dict.fromkeys(row_missing))
         is_scoreable = len(row_missing) == 0
 
@@ -126,6 +213,7 @@ def annotate_scoreability(df: pd.DataFrame) -> pd.DataFrame:
 def _prepare_frame(df: pd.DataFrame) -> pd.DataFrame:
     enriched = compute_all_indicators(df.copy())
     enriched = _canonicalize_indicator_columns(enriched)
+    enriched = _fill_missing_indicators(enriched)
     enriched = ensure_columns(enriched)
     enriched = annotate_scoreability(enriched)
     return enriched
@@ -139,6 +227,9 @@ def _build_leadership_snapshot(leadership_frames: dict[str, pd.DataFrame]) -> pd
         prepared = _prepare_frame(df)
         row = prepared.iloc[-1].to_dict()
         row["ticker"] = ticker
+        if not row.get("sector") or row["sector"] == "Unknown":
+            row["sector"] = get_sector_or_class(ticker)
+        row["sector"] = row.get("sector") or "Unknown"
         rows.append(row)
     snap = pd.DataFrame(rows)
     if snap.empty:
@@ -158,11 +249,30 @@ def _normalize_leadership(snapshot: pd.DataFrame) -> pd.DataFrame:
         return snapshot
     out = snapshot.copy()
     if "rszscore" in out.columns:
-        mn = float(out["rszscore"].min())
-        mx = float(out["rszscore"].max())
-        denom = max(mx - mn, 1e-9)
-        out["leadership_strength"] = (out["rszscore"] - mn) / denom
-        logger.info("Leadership normalization applied: rszscore min=%.4f max=%.4f", mn, mx)
+        rs = pd.to_numeric(out["rszscore"], errors="coerce")
+        valid = rs.dropna()
+        if valid.empty:
+            out["leadership_strength"] = 0.0
+            logger.warning(
+                "Leadership normalization: rszscore has no finite values; "
+                "leadership_strength set to 0.0"
+            )
+        elif np.isclose(float(valid.min()), float(valid.max()), atol=1e-9):
+            out["leadership_strength"] = 0.5
+            logger.warning(
+                "Leadership normalization: rszscore is degenerate "
+                "(min ≈ max = %.4f); leadership_strength set to 0.5",
+                float(valid.min()),
+            )
+        else:
+            mn = float(valid.min())
+            mx = float(valid.max())
+            denom = mx - mn
+            out["leadership_strength"] = ((rs - mn) / denom).fillna(0.0).clip(0, 1)
+            logger.info(
+                "Leadership normalization applied: rszscore min=%.4f max=%.4f spread=%.4f",
+                mn, mx, denom,
+            )
     else:
         out["leadership_strength"] = 0.0
         logger.warning("Leadership snapshot missing rszscore; leadership_strength set to 0.0")
@@ -180,6 +290,7 @@ def _instrument_type(ticker: str) -> str:
     }
     return "etf" if ticker in etf_like else "stock"
 
+
 def _lookup_group_strength(row: pd.Series, leadership_snapshot: pd.DataFrame) -> float:
     if leadership_snapshot.empty:
         return 0.0
@@ -189,21 +300,25 @@ def _lookup_group_strength(row: pd.Series, leadership_snapshot: pd.DataFrame) ->
 
     direct = leadership_snapshot[leadership_snapshot["ticker"].eq(ticker)]
     if not direct.empty:
-        return float(direct["leadership_strength"].max())
+        val = direct["leadership_strength"].max()
+        return float(val) if pd.notna(val) else 0.0
 
     theme_col = leadership_snapshot["theme"] if "theme" in leadership_snapshot.columns else pd.Series(index=leadership_snapshot.index, dtype=object)
     theme_match = leadership_snapshot[theme_col.eq(theme)]
     if not theme_match.empty:
-        return float(theme_match["leadership_strength"].max())
+        val = theme_match["leadership_strength"].max()
+        return float(val) if pd.notna(val) else 0.0
 
     sector_col = leadership_snapshot["sector"] if "sector" in leadership_snapshot.columns else pd.Series(index=leadership_snapshot.index, dtype=object)
     sector_match = leadership_snapshot[sector_col.eq(sector)]
     if not sector_match.empty:
-        return float(sector_match["leadership_strength"].max())
+        val = sector_match["leadership_strength"].max()
+        return float(val) if pd.notna(val) else 0.0
 
     broad = leadership_snapshot[leadership_snapshot["ticker"].isin(["SPY", "QQQ", "IWM"])]
     if not broad.empty:
-        return float(broad["leadership_strength"].mean())
+        val = broad["leadership_strength"].mean()
+        return float(val) if pd.notna(val) else 0.0
 
     return 0.0
 
@@ -218,10 +333,21 @@ def _add_score_percentiles(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _log_action_diagnostics(out: pd.DataFrame) -> None:
+def _log_action_diagnostics(out: pd.DataFrame, params: dict) -> None:
     if out.empty:
         logger.info("Action diagnostics skipped because input frame is empty")
         return
+
+    sb = params["strong_buy"]
+    bu = params["buy"]
+    ho = params["hold"]
+    se = params["sell"]
+    sc = params["strong_context"]
+    wc = params["weak_context"]
+    hm = params["healthy_momentum"]
+    dm = params["decent_momentum"]
+    oe = params["overextended"]
+
     score = out.get("scoreadjusted_v2", out.get("scorecomposite_v2", pd.Series(0.0, index=out.index))).fillna(0.0)
     pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
     entry = out.get("sigeffectiveentrymin_v2", pd.Series(0.60, index=out.index)).fillna(0.60)
@@ -239,104 +365,131 @@ def _log_action_diagnostics(out: pd.DataFrame) -> None:
 
     diag_rows = []
     fail_counts = {
-        "exit_or_weak": 0,
-        "below_sell_floor": 0,
-        "strong_buy_not_met": 0,
-        "buy_not_met": 0,
-        "hold_not_met": 0,
-        "weak_context": 0,
-        "not_confirmed": 0,
-        "pct_below_buy": 0,
-        "score_below_buy": 0,
-        "momentum_not_decent": 0,
-        "momentum_not_healthy": 0,
-        "overextended": 0,
-        "relvol_below_strong_buy": 0,
+        "exit_or_weak": 0, "below_sell_floor": 0, "strong_buy_not_met": 0,
+        "buy_not_met": 0, "hold_not_met": 0, "weak_context": 0,
+        "not_confirmed": 0, "pct_below_buy": 0, "score_below_buy": 0,
+        "momentum_not_decent": 0, "momentum_not_healthy": 0,
+        "overextended": 0, "relvol_below_strong_buy": 0,
     }
 
     for i in out.index:
-        s = float(score.loc[i]); p = float(pct.loc[i]); e = float(entry.loc[i]); c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
-        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i]); r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
-        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i]); ext = float(short_ext.loc[i])
+        s = float(score.loc[i]); pv = float(pct.loc[i]); e = float(entry.loc[i])
+        c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
+        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i])
+        r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
+        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i])
+        ext = float(short_ext.loc[i])
         ticker = out.loc[i, "ticker"] if "ticker" in out.columns else str(i)
 
-        strong_context = (b == "strong" and v == "calm") or l >= 0.60
-        weak_context = b in {"weak", "critical"} or v == "chaotic" or sr == "lagging"
-        healthy_momentum = r in {"leading", "improving"} and sr != "lagging" and ri >= 52 and ax >= 22
-        decent_momentum = r in {"leading", "improving"} and ri >= 45 and ax >= 16
-        overextended = ext >= 0.045 or ri >= 74
+        strong_context = (
+            (b in sc["breadth_regimes"] and v in sc["vol_regimes"])
+            or l >= sc["min_leadership"]
+        )
+        weak_ctx = (
+            b in wc["breadth_regimes"]
+            or v in wc["vol_regimes"]
+            or sr in wc["sector_regimes"]
+        )
+        healthy_mom = (
+            r in hm["allowed_rs"]
+            and sr not in hm.get("blocked_sector", [])
+            and ri >= hm["min_rsi"]
+            and ax >= hm["min_adx"]
+        )
+        decent_mom = (
+            r in dm["allowed_rs"]
+            and ri >= dm["min_rsi"]
+            and ax >= dm["min_adx"]
+        )
+        overext = ext >= oe["max_ema_pct"] or ri >= oe["max_rsi"]
 
-        strong_buy_ready = c == 1 and p >= 0.90 and s >= max(0.76, e + 0.08) and strong_context and healthy_momentum and rv >= 1.10 and not overextended
-        buy_ready = c == 1 and p >= 0.65 and s >= max(0.62, e + 0.02) and decent_momentum and not weak_context
-        hold_ready = p >= 0.35 and s >= max(0.54, e - 0.06) and not weak_context
+        sb_score_floor = max(sb["min_score"], e + sb["score_above_entry"])
+        bu_score_floor = max(bu["min_score"], e + bu["score_above_entry"])
+        ho_score_floor = max(ho["min_score"], e - ho["score_below_entry"])
+
+        strong_buy_ready = (
+            (not sb["requires_confirmation"] or c == 1)
+            and pv >= sb["min_percentile"]
+            and s >= sb_score_floor
+            and (not sb["requires_strong_context"] or strong_context)
+            and healthy_mom
+            and rv >= sb["min_rvol"]
+            and (not sb["blocks_overextended"] or not overext)
+        )
+        buy_ready = (
+            (not bu["requires_confirmation"] or c == 1)
+            and pv >= bu["min_percentile"]
+            and s >= bu_score_floor
+            and (not bu["requires_decent_momentum"] or decent_mom)
+            and (not bu["blocks_weak_context"] or not weak_ctx)
+        )
+        hold_ready = (
+            pv >= ho["min_percentile"]
+            and s >= ho_score_floor
+            and (not ho["blocks_weak_context"] or not weak_ctx)
+        )
 
         reasons = []
-        if x == 1 and (s < max(0.50, e - 0.05) or p <= 0.20 or weak_context):
+        if x == 1 and (
+            s < max(se["floor_score"], e - se["exit_score_below_entry"])
+            or pv <= se["exit_percentile_floor"]
+            or weak_ctx
+        ):
             fail_counts["exit_or_weak"] += 1
             reasons.append("exit_signal_path")
-        if s < 0.50 or p <= 0.15:
+        if s < se["floor_score"] or pv <= se["floor_percentile"]:
             fail_counts["below_sell_floor"] += 1
             reasons.append("below_sell_floor")
         if not strong_buy_ready:
             fail_counts["strong_buy_not_met"] += 1
-            if c != 1:
+            if sb["requires_confirmation"] and c != 1:
                 fail_counts["not_confirmed"] += 1
                 reasons.append("strong_buy:no_confirmation")
-            if p < 0.90:
-                reasons.append(f"strong_buy:pct<{0.90:.2f}")
-            if s < max(0.76, e + 0.08):
-                reasons.append(f"strong_buy:score<{max(0.76, e + 0.08):.3f}")
-            if not strong_context:
+            if pv < sb["min_percentile"]:
+                reasons.append(f"strong_buy:pct<{sb['min_percentile']:.2f}")
+            if s < sb_score_floor:
+                reasons.append(f"strong_buy:score<{sb_score_floor:.3f}")
+            if sb["requires_strong_context"] and not strong_context:
                 reasons.append("strong_buy:context_not_strong")
-            if not healthy_momentum:
+            if not healthy_mom:
                 fail_counts["momentum_not_healthy"] += 1
                 reasons.append("strong_buy:momentum_not_healthy")
-            if rv < 1.10:
+            if rv < sb["min_rvol"]:
                 fail_counts["relvol_below_strong_buy"] += 1
-                reasons.append("strong_buy:rvol<1.10")
-            if overextended:
+                reasons.append(f"strong_buy:rvol<{sb['min_rvol']:.2f}")
+            if sb["blocks_overextended"] and overext:
                 fail_counts["overextended"] += 1
                 reasons.append("strong_buy:overextended")
         if not buy_ready:
             fail_counts["buy_not_met"] += 1
-            if c != 1:
+            if bu["requires_confirmation"] and c != 1:
                 reasons.append("buy:no_confirmation")
-            if p < 0.65:
+            if pv < bu["min_percentile"]:
                 fail_counts["pct_below_buy"] += 1
-                reasons.append("buy:pct<0.65")
-            if s < max(0.62, e + 0.02):
+                reasons.append(f"buy:pct<{bu['min_percentile']:.2f}")
+            if s < bu_score_floor:
                 fail_counts["score_below_buy"] += 1
-                reasons.append(f"buy:score<{max(0.62, e + 0.02):.3f}")
-            if not decent_momentum:
+                reasons.append(f"buy:score<{bu_score_floor:.3f}")
+            if bu["requires_decent_momentum"] and not decent_mom:
                 fail_counts["momentum_not_decent"] += 1
                 reasons.append("buy:momentum_not_decent")
-            if weak_context:
+            if bu["blocks_weak_context"] and weak_ctx:
                 fail_counts["weak_context"] += 1
                 reasons.append("buy:weak_context")
         if not hold_ready:
             fail_counts["hold_not_met"] += 1
             reasons.append("hold:not_met")
+
         diag_rows.append({
-            "ticker": ticker,
-            "score": round(s, 4),
-            "pct": round(p, 4),
-            "entry": round(e, 4),
-            "confirmed": c,
-            "exit_sig": x,
-            "breadth": b,
-            "vol": v,
-            "lead": round(l, 3),
-            "rs": r,
-            "sectrs": sr,
-            "rsi14": round(ri, 2),
-            "adx14": round(ax, 2),
-            "rvol": round(rv, 2),
-            "ema30ext": round(ext, 4),
-            "strong_buy_ready": strong_buy_ready,
-            "buy_ready": buy_ready,
-            "hold_ready": hold_ready,
-            "reasons": "; ".join(reasons[:8]),
+            "ticker": ticker, "score": round(s, 4), "pct": round(pv, 4),
+            "entry": round(e, 4), "confirmed": c, "exit_sig": x,
+            "breadth": b, "vol": v, "lead": round(l, 3),
+            "rs": r, "sectrs": sr, "rsi14": round(ri, 2), "adx14": round(ax, 2),
+            "rvol": round(rv, 2), "ema30ext": round(ext, 4),
+            "strong_buy_ready": strong_buy_ready, "buy_ready": buy_ready,
+            "hold_ready": hold_ready, "reasons": "; ".join(reasons[:8]),
         })
+
     diag_df = pd.DataFrame(diag_rows)
     action_counts = out["action_v2"].value_counts(dropna=False).to_dict() if "action_v2" in out.columns else {}
     logger.info("Action diagnostics summary: actions=%s fail_counts=%s", action_counts, fail_counts)
@@ -349,7 +502,9 @@ def _log_action_diagnostics(out: pd.DataFrame) -> None:
             logger.debug("Near-buy names that failed BUY gate:\n%s", near_buys.to_string(index=False))
 
 
-def _generate_actions(df: pd.DataFrame) -> pd.DataFrame:
+def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
+    ap = params if params is not None else ACTIONPARAMS_V2
+
     out = _add_score_percentiles(df.copy())
     if out.empty:
         out["action_v2"] = pd.Series(dtype=object)
@@ -357,6 +512,30 @@ def _generate_actions(df: pd.DataFrame) -> pd.DataFrame:
         out["action_reason_v2"] = pd.Series(dtype=object)
         out["action_sort_key_v2"] = pd.Series(dtype=float)
         return out
+
+    sb = ap["strong_buy"]
+    bu = ap["buy"]
+    ho = ap["hold"]
+    se = ap["sell"]
+    sc = ap["strong_context"]
+    wc = ap["weak_context"]
+    hm = ap["healthy_momentum"]
+    dm = ap["decent_momentum"]
+    oe = ap["overextended"]
+    cv = ap["conviction"]
+
+    logger.info(
+        "Action params: sb_pct=%.2f sb_score=%.2f bu_pct=%.2f bu_score=%.2f "
+        "ho_pct=%.2f ho_score=%.2f sell_floor=%.2f sell_pct=%.2f "
+        "weak_ctx_breadth=%s weak_ctx_vol=%s weak_ctx_sector=%s "
+        "dm_rs=%s dm_rsi=%.0f dm_adx=%.0f",
+        sb["min_percentile"], sb["min_score"],
+        bu["min_percentile"], bu["min_score"],
+        ho["min_percentile"], ho["min_score"],
+        se["floor_score"], se["floor_percentile"],
+        wc["breadth_regimes"], wc["vol_regimes"], wc["sector_regimes"],
+        dm["allowed_rs"], dm["min_rsi"], dm["min_adx"],
+    )
 
     score = out.get("scoreadjusted_v2", out.get("scorecomposite_v2", pd.Series(0.0, index=out.index))).fillna(0.0)
     pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
@@ -377,47 +556,112 @@ def _generate_actions(df: pd.DataFrame) -> pd.DataFrame:
     action_rank = {"STRONG_BUY": 4, "BUY": 3, "HOLD": 2, "SELL": 1}
 
     for i in out.index:
-        s = float(score.loc[i]); p = float(pct.loc[i]); e = float(entry.loc[i]); c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
-        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i]); r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
-        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i]); ext = float(short_ext.loc[i])
+        s = float(score.loc[i]); pv = float(pct.loc[i]); e = float(entry.loc[i])
+        c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
+        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i])
+        r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
+        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i])
+        ext = float(short_ext.loc[i])
 
-        strong_context = (b == "strong" and v == "calm") or l >= 0.60
-        weak_context = b in {"weak", "critical"} or v == "chaotic" or sr == "lagging"
-        healthy_momentum = r in {"leading", "improving"} and sr != "lagging" and ri >= 52 and ax >= 22
-        decent_momentum = r in {"leading", "improving"} and ri >= 45 and ax >= 16
-        overextended = ext >= 0.045 or ri >= 74
+        strong_context = (
+            (b in sc["breadth_regimes"] and v in sc["vol_regimes"])
+            or l >= sc["min_leadership"]
+        )
+        weak_ctx = (
+            b in wc["breadth_regimes"]
+            or v in wc["vol_regimes"]
+            or sr in wc["sector_regimes"]
+        )
+        healthy_mom = (
+            r in hm["allowed_rs"]
+            and sr not in hm.get("blocked_sector", [])
+            and ri >= hm["min_rsi"]
+            and ax >= hm["min_adx"]
+        )
+        decent_mom = (
+            r in dm["allowed_rs"]
+            and ri >= dm["min_rsi"]
+            and ax >= dm["min_adx"]
+        )
+        overext = ext >= oe["max_ema_pct"] or ri >= oe["max_rsi"]
 
-        if x == 1 and (s < max(0.50, e - 0.05) or p <= 0.20 or weak_context):
-            action = "SELL"; reason = "Exit condition active with weak relative rank or hostile regime"
-        elif s < 0.50 or p <= 0.15:
-            action = "SELL"; reason = "Bottom-ranked score in the current market set"
-        elif c == 1 and p >= 0.90 and s >= max(0.76, e + 0.08) and strong_context and healthy_momentum and rv >= 1.10 and not overextended:
-            action = "STRONG_BUY"; reason = "Top-decile score with confirmation, momentum, and supportive regime"
-        elif c == 1 and p >= 0.65 and s >= max(0.62, e + 0.02) and decent_momentum and not weak_context:
-            action = "BUY"; reason = "Upper-tier score with confirmation and acceptable momentum"
-        elif p >= 0.35 and s >= max(0.54, e - 0.06) and not weak_context:
-            action = "HOLD"; reason = "Mid-ranked score worth monitoring but not strong enough to buy"
+        if x == 1 and (
+            s < max(se["floor_score"], e - se["exit_score_below_entry"])
+            or pv <= se["exit_percentile_floor"]
+            or weak_ctx
+        ):
+            action = "SELL"
+            reason = "Exit condition active with weak relative rank or hostile regime"
+
+        elif s < se["floor_score"] or pv <= se["floor_percentile"]:
+            action = "SELL"
+            reason = "Bottom-ranked score in the current market set"
+
+        elif (
+            (not sb["requires_confirmation"] or c == 1)
+            and pv >= sb["min_percentile"]
+            and s >= max(sb["min_score"], e + sb["score_above_entry"])
+            and (not sb["requires_strong_context"] or strong_context)
+            and healthy_mom
+            and rv >= sb["min_rvol"]
+            and (not sb["blocks_overextended"] or not overext)
+        ):
+            action = "STRONG_BUY"
+            reason = "Top-decile score with confirmation, momentum, and supportive regime"
+
+        elif (
+            (not bu["requires_confirmation"] or c == 1)
+            and pv >= bu["min_percentile"]
+            and s >= max(bu["min_score"], e + bu["score_above_entry"])
+            and (not bu["requires_decent_momentum"] or decent_mom)
+            and (not bu["blocks_weak_context"] or not weak_ctx)
+        ):
+            action = "BUY"
+            reason = "Upper-tier score with confirmation and acceptable momentum"
+
+        elif (
+            pv >= ho["min_percentile"]
+            and s >= max(ho["min_score"], e - ho["score_below_entry"])
+            and (not ho["blocks_weak_context"] or not weak_ctx)
+        ):
+            action = "HOLD"
+            reason = "Mid-ranked score worth monitoring but not strong enough to buy"
+
         else:
-            action = "SELL"; reason = "Below hold band after percentile and regime adjustment"
+            action = "SELL"
+            reason = "Below hold band after percentile and regime adjustment"
 
-        conviction = "high" if (p >= 0.90 or s >= 0.84) else ("medium" if (p >= 0.60 or s >= 0.68) else "low")
+        conviction = (
+            "high" if (pv >= cv["high_pct"] or s >= cv["high_score"])
+            else "medium" if (pv >= cv["medium_pct"] or s >= cv["medium_score"])
+            else "low"
+        )
+
         actions.append(action)
         reasons.append(reason)
         convictions.append(conviction)
-        sort_keys.append(action_rank[action] * 10 + p + s / 10.0)
+        sort_keys.append(action_rank[action] * 10 + pv + s / 10.0)
 
     out["action_v2"] = actions
     out["conviction_v2"] = convictions
     out["action_reason_v2"] = reasons
     out["action_sort_key_v2"] = sort_keys
-    _log_action_diagnostics(out)
+
+    _log_action_diagnostics(out, params=ap)
+
     sort_score_col = "scoreadjusted_v2" if "scoreadjusted_v2" in out.columns else "scorecomposite_v2"
-    return out.sort_values(["action_sort_key_v2", sort_score_col], ascending=[False, False]).reset_index(drop=True)
+    return out.sort_values(
+        ["action_sort_key_v2", sort_score_col], ascending=[False, False]
+    ).reset_index(drop=True)
 
 
-def _build_review_table(action_table: pd.DataFrame) -> pd.DataFrame:
+def _build_review_table(action_table: pd.DataFrame, action_params: dict | None = None) -> pd.DataFrame:
+    """FIX 3 (critical): overextended thresholds from config, not hardcoded."""
     if action_table.empty:
         return pd.DataFrame()
+
+    ap = action_params if action_params is not None else ACTIONPARAMS_V2
+    oe = ap["overextended"]
 
     review = action_table.rename(columns={
         "action_v2": "recommendation",
@@ -434,8 +678,8 @@ def _build_review_table(action_table: pd.DataFrame) -> pd.DataFrame:
     }).copy()
 
     review["overextended_flag"] = (
-        (review.get("price_vs_ema30_pct", pd.Series(0.0, index=review.index)).fillna(0) >= 0.045) |
-        (review.get("rsi_14", pd.Series(50.0, index=review.index)).fillna(50) >= 74)
+        (review.get("price_vs_ema30_pct", pd.Series(0.0, index=review.index)).fillna(0) >= oe["max_ema_pct"]) |
+        (review.get("rsi_14", pd.Series(50.0, index=review.index)).fillna(50) >= oe["max_rsi"])
     ).map({True: "YES", False: "NO"})
 
     def why(row):
@@ -538,30 +782,23 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
             quality = "TOO_EARLY"
 
         rows.append({
-            "ticker": ticker,
-            "instrument_type": _instrument_type(ticker),
-            "status": setup,
-            "quality_label": quality,
+            "ticker": ticker, "instrument_type": _instrument_type(ticker),
+            "status": setup, "quality_label": quality,
             "selling_exhaustion_score": exhaustion_score,
             "reversal_trigger_score": trigger_score,
-            "rsi_14": last_rsi,
-            "rsi_down_streak_3d": rsi_down_streak,
+            "rsi_14": last_rsi, "rsi_down_streak_3d": rsi_down_streak,
             "rsi_turn_up_1d": "YES" if rsi_turn_up else "NO",
             "close_down_streak_3d": down_streak,
             "bullish_close_1d": "YES" if bullish_close else "NO",
             "close_above_prior_high": "YES" if close_above_prior_high else "NO",
-            "relative_volume": last_vol,
-            "volume_down_streak_3d": vol_down_streak,
+            "relative_volume": last_vol, "volume_down_streak_3d": vol_down_streak,
             "volume_reexpansion_1d": "YES" if volume_reexpansion else "NO",
             "adx_14": last_adx,
             "adx_stabilizing_1d": "YES" if adx_stabilizing else "NO",
             "price_5d_change": price_5d_change,
-            "price_vs_ema30_pct": last_ext,
-            "atr_14_pct": last_atr,
-            "gap_rate_20": last_gap,
-            "leadership_strength": leadership,
-            "breadthregime": breadth_regime,
-            "volregime": vol_regime,
+            "price_vs_ema30_pct": last_ext, "atr_14_pct": last_atr,
+            "gap_rate_20": last_gap, "leadership_strength": leadership,
+            "breadthregime": breadth_regime, "volregime": vol_regime,
             "sector": tail.iloc[-1].get("sector", "Unknown"),
             "theme": tail.iloc[-1].get("theme", "Unknown"),
             "decision_hint": "Use only with confirmation; stronger when RSI turns up, price firms, and volume re-expands",
@@ -573,6 +810,7 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
         return out
     logger.info("Selling exhaustion table built: rows=%d", len(out))
     return out.sort_values(["reversal_trigger_score", "selling_exhaustion_score", "rsi_14", "price_5d_change"], ascending=[False, False, True, True]).reset_index(drop=True)
+
 
 def _build_skipped_table(skipped_rows: list[dict]) -> pd.DataFrame:
     if not skipped_rows:
@@ -586,6 +824,10 @@ def _build_skipped_table(skipped_rows: list[dict]) -> pd.DataFrame:
     return out.sort_values(sort_cols, ascending=[False, True]).reset_index(drop=True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main pipeline entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def run_pipeline_v2(
     tradable_frames: dict[str, pd.DataFrame],
     bench_df: pd.DataFrame,
@@ -593,28 +835,148 @@ def run_pipeline_v2(
     market: str = "US",
     leadership_frames: dict[str, pd.DataFrame] | None = None,
     portfolio_params: dict | None = None,
+    config: dict | None = None,
 ) -> dict:
     if bench_df is None or bench_df.empty:
         raise ValueError("bench_df is required and cannot be empty")
 
-    logger.info("run_pipeline_v2 start: market=%s tradable=%d leadership=%d", market, len(tradable_frames), len(leadership_frames or {}))
-    regime_df = classify_volatility_regime(bench_df)
-    breadth_info = _classify_breadth_regime(breadth_df)
-    leadership_snapshot = _normalize_leadership(_build_leadership_snapshot(leadership_frames or {}))
-    last_vol = regime_df.iloc[-1]
+    config = config or {}
+
+    # ── unpack ALL config blocks (critical fix 1 + moderate fixes 7–9) ────────
+    vol_regime_params  = config.get("vol_regime_params")   or config.get("VOLREGIMEPARAMS", None)
+    scoring_weights    = config.get("scoring_weights")     or config.get("SCORINGWEIGHTS_V2", None)
+    scoring_params     = config.get("scoring_params")      or config.get("SCORINGPARAMS_V2", None)
+    signal_params      = config.get("signal_params")       or config.get("SIGNALPARAMS_V2", None)
+    convergence_params = config.get("convergence_params")  or config.get("CONVERGENCEPARAMS_V2", None)
+    action_params      = config.get("action_params")       or config.get("ACTIONPARAMS_V2", None)
+    breadth_params     = config.get("breadth_params")      or config.get("BREADTHPARAMS", None)       # FIX 8
+    rotation_params    = config.get("rotation_params")     or config.get("ROTATIONPARAMS", None)      # FIX 9
+
     logger.info(
-        "Regime context: breadth=%s breadthscore=%s vol=%s volscore=%s",
-        breadth_info.get("breadth_regime", "unknown"),
-        breadth_info.get("breadthscore", None),
-        last_vol.get("volregime", "unknown"),
-        last_vol.get("volregimescore", None),
+        "run_pipeline_v2 start: market=%s tradable=%d leadership=%d",
+        market, len(tradable_frames), len(leadership_frames or {}),
     )
 
+    # ── A. volatility regime from benchmark (FIX 1: config-driven) ────────────
+    regime_df = classify_volatility_regime(bench_df, params=vol_regime_params)
+
+    # ── B. merge all symbol frames into one working universe ──────────────────
+    all_symbol_frames: dict[str, pd.DataFrame] = {}
+    if leadership_frames:
+        all_symbol_frames.update(leadership_frames)
+    all_symbol_frames.update(tradable_frames)
+
+    logger.info(
+        "Universe merge: combined=%d (tradable=%d leadership=%d overlap=%d)",
+        len(all_symbol_frames),
+        len(tradable_frames),
+        len(leadership_frames or {}),
+        len(set(tradable_frames) & set(leadership_frames or {})),
+    )
+
+    # ── C. BREADTH (FIX 8: config-driven) ─────────────────────────────────────
+    breadth_computed_df = compute_breadth(all_symbol_frames, params=breadth_params)
+
+    if (
+        breadth_df is not None
+        and not breadth_df.empty
+        and "breadthscore" in breadth_df.columns
+    ):
+        breadth_info = _classify_breadth_regime(breadth_df)
+        breadth_source = "caller"
+    elif not breadth_computed_df.empty:
+        breadth_info = _classify_breadth_regime(breadth_computed_df)
+        breadth_source = "computed"
+    else:
+        breadth_info = {
+            "breadth_regime": "unknown",
+            "breadthscore": None,
+            "dispersion20": None,
+            "dispersion": None,
+        }
+        breadth_source = "none"
+
+    logger.info(
+        "Breadth context (source=%s): regime=%s score=%s dispersion20=%s",
+        breadth_source,
+        breadth_info.get("breadth_regime", "unknown"),
+        breadth_info.get("breadthscore"),
+        breadth_info.get("dispersion20"),
+    )
+
+    # ── D. CROSS-SECTIONAL RS ─────────────────────────────────────────────────
+    all_symbol_frames = compute_rs_zscores(all_symbol_frames, bench_df)
+    all_symbol_frames = enrich_rs_regimes(all_symbol_frames)
+
+    tradable_enriched = {
+        k: all_symbol_frames[k]
+        for k in tradable_frames
+        if k in all_symbol_frames
+    }
+    leadership_enriched = {
+        k: all_symbol_frames[k]
+        for k in (leadership_frames or {})
+        if k in all_symbol_frames
+    }
+
+    # ── D2. SECTOR ROTATION (FIX 9: config-driven) ───────────────────────────
+    rotation_result = compute_sector_rotation(
+        all_symbol_frames,
+        bench_df,
+        market=market,
+        params=rotation_params,
+    )
+    sector_regimes = rotation_result["sector_regimes"]
+    ticker_regimes = rotation_result["ticker_regimes"]
+    sector_summary = rotation_result["sector_summary"]
+
+    # ── E. leadership snapshot ────────────────────────────────────────────────
+    leadership_snapshot = _normalize_leadership(
+        _build_leadership_snapshot(leadership_enriched)
+    )
+
+    last_vol = regime_df.iloc[-1]
+
+    leading_sectors = (
+        sector_summary.loc[sector_summary["regime"] == "leading", "sector"].tolist()
+        if not sector_summary.empty else []
+    )
+    lagging_sectors = (
+        sector_summary.loc[sector_summary["regime"] == "lagging", "sector"].tolist()
+        if not sector_summary.empty else []
+    )
+    logger.info(
+        "Regime context: breadth=%s breadthscore=%s vol=%s volscore=%s "
+        "leading_sectors=%s lagging_sectors=%s",
+        breadth_info.get("breadth_regime", "unknown"),
+        breadth_info.get("breadthscore"),
+        last_vol.get("volregime", "unknown"),
+        last_vol.get("volregimescore", None),
+        leading_sectors or ["none"],
+        lagging_sectors or ["none"],
+    )
+
+    # ── rotation recommendation mapping (FIX 7: from convergence config) ──────
+    _cp = convergence_params if convergence_params is not None else CONVERGENCEPARAMS_V2
+    _sect_to_rec = _cp.get("rotation_rec_map", {
+        "leading":   "STRONGBUY",
+        "improving": "BUY",
+        "weakening": "SELL",
+        "lagging":   "SELL",
+    })
+    _sect_to_rec_default = _cp.get("rotation_rec_default", "HOLD")
+
+    logger.info(
+        "Rotation rec map: %s  default=%s",
+        _sect_to_rec, _sect_to_rec_default,
+    )
+
+    # ── F. per-symbol preparation loop ────────────────────────────────────────
     latest_rows = []
     skipped_rows = []
     prep_logged = 0
 
-    for ticker, df in tradable_frames.items():
+    for ticker, df in tradable_enriched.items():
         if df is None or df.empty:
             logger.debug("Skipping empty tradable frame for %s", ticker)
             continue
@@ -623,12 +985,46 @@ def run_pipeline_v2(
         row = prepared.iloc[-1].to_dict()
         row["ticker"] = ticker
         row["instrument_type"] = _instrument_type(ticker)
-        row["volregime"] = row.get("volregime", last_vol.get("volregime", "calm"))
-        row["volregimescore"] = row.get("volregimescore", last_vol.get("volregimescore", 0.0))
-        row["breadthregime"] = row.get("breadthregime", breadth_info.get("breadth_regime", "unknown"))
-        row["breadthscore"] = row.get("breadthscore", breadth_info.get("breadthscore", 0.5))
-        row["sector"] = row.get("sector", "Unknown")
-        row["theme"] = row.get("theme", "Unknown")
+
+        # ── attach pipeline-level context ─────────────────────────────────────
+        _row_vol = row.get("volregime")
+        if _row_vol is None or str(_row_vol).lower() in ("unknown", "nan", ""):
+            row["volregime"] = last_vol.get("volregime", "calm")
+        _row_volscore = row.get("volregimescore")
+        if _row_volscore is None or (isinstance(_row_volscore, float) and math.isnan(_row_volscore)):
+            row["volregimescore"] = last_vol.get("volregimescore", 0.0)
+
+        _row_br = row.get("breadthregime")
+        if _row_br is None or str(_row_br).lower() in ("unknown", "nan", ""):
+            row["breadthregime"] = breadth_info.get("breadth_regime", "unknown")
+        _row_bs = row.get("breadthscore")
+        if _row_bs is None or (isinstance(_row_bs, float) and math.isnan(_row_bs)):
+            row["breadthscore"] = breadth_info.get("breadthscore", 0.5)
+
+        _row_d20 = row.get("dispersion20")
+        if _row_d20 is None or (isinstance(_row_d20, float) and math.isnan(_row_d20)):
+            row["dispersion20"] = breadth_info.get("dispersion20")
+        _row_d = row.get("dispersion")
+        if _row_d is None or (isinstance(_row_d, float) and math.isnan(_row_d)):
+            row["dispersion"] = breadth_info.get("dispersion")
+
+        if not row.get("sector") or row["sector"] == "Unknown":
+            row["sector"] = get_sector_or_class(ticker)
+        row["sector"] = row.get("sector") or "Unknown"
+
+        _row_sr = row.get("sectrsregime")
+        if _row_sr is None or str(_row_sr).lower() in ("unknown", "nan", ""):
+            row["sectrsregime"] = ticker_regimes.get(ticker, "unknown")
+
+        # ── rotation recommendation (FIX 7: from config map) ──────────────────
+        _row_rr = row.get("rotationrec")
+        if _row_rr is None or str(_row_rr).lower() in ("unknown", "nan", ""):
+            row["rotationrec"] = _sect_to_rec.get(
+                str(row.get("sectrsregime", "unknown")).lower(),
+                _sect_to_rec_default,
+            )
+
+        row["theme"] = row.get("theme") or "Unknown"
 
         is_scoreable = bool(row.get("scoreable_v2", True))
         if not is_scoreable:
@@ -642,6 +1038,8 @@ def run_pipeline_v2(
                 "scoreability_reason_v2": row.get("scoreability_reason_v2", "missing critical inputs"),
                 "breadthregime": row.get("breadthregime", "unknown"),
                 "volregime": row.get("volregime", "unknown"),
+                "sectrsregime": row.get("sectrsregime", "unknown"),
+                "rotationrec": row.get("rotationrec", _sect_to_rec_default),
                 "sector": row.get("sector", "Unknown"),
                 "theme": row.get("theme", "Unknown"),
             })
@@ -656,17 +1054,23 @@ def run_pipeline_v2(
 
         if logger.isEnabledFor(logging.DEBUG) and prep_logged < 25:
             logger.debug(
-                "Prepared %s last-row snapshot: close=%.4f rsi14=%.2f adx14=%.2f atr14pct=%.4f rvol=%.2f score_inputs(rs=%s sect=%s breadth=%s vol=%s)",
+                "Prepared %s last-row snapshot: close=%.4f rsi14=%.2f adx14=%.2f "
+                "atr14pct=%.4f rvol=%.2f rszscore=%s rsregime=%s sectrsregime=%s "
+                "rotationrec=%s breadth=%s vol=%s dispersion20=%s sector=%s",
                 ticker,
                 float(row.get("close", 0.0) or 0.0),
                 float(row.get("rsi14", 50.0) or 50.0),
                 float(row.get("adx14", 20.0) or 20.0),
                 float(row.get("atr14pct", 0.03) or 0.03),
                 float(row.get("relativevolume", 1.0) or 1.0),
+                row.get("rszscore", "missing"),
                 row.get("rsregime", "unknown"),
                 row.get("sectrsregime", "unknown"),
+                row.get("rotationrec", _sect_to_rec_default),
                 row.get("breadthregime", "unknown"),
                 row.get("volregime", "unknown"),
+                row.get("dispersion20", "missing"),
+                row.get("sector", "Unknown"),
             )
             prep_logged += 1
 
@@ -679,66 +1083,104 @@ def run_pipeline_v2(
         latest = ensure_columns(latest)
         latest = annotate_scoreability(latest)
         logger.info(
-            "Latest snapshot diagnostics: avg_rsi14=%.2f avg_adx14=%.2f avg_rvol=%.2f avg_lead=%.2f",
+            "Latest snapshot diagnostics: avg_rsi14=%.2f avg_adx14=%.2f avg_rvol=%.2f "
+            "avg_lead=%.2f avg_rszscore=%s breadth=%s",
             float(latest["rsi14"].fillna(50.0).mean()),
             float(latest["adx14"].fillna(20.0).mean()),
             float(latest["relativevolume"].fillna(1.0).mean()),
             float(latest["leadership_strength"].fillna(0.0).mean()),
+            f"{float(latest['rszscore'].dropna().mean()):.4f}" if latest["rszscore"].notna().any() else "nan",
+            breadth_info.get("breadth_regime", "unknown"),
         )
+
+        if "rotationrec" in latest.columns:
+            rr_dist = latest["rotationrec"].value_counts().to_dict()
+            logger.info("Scoreable set rotationrec distribution: %s", rr_dist)
+
+        if "sectrsregime" in latest.columns:
+            sr_dist = latest["sectrsregime"].value_counts().to_dict()
+            logger.info("Scoreable set sectrsregime distribution: %s", sr_dist)
+
         if logger.isEnabledFor(logging.DEBUG):
-            cols = [c for c in ["ticker", "close", "rsi14", "adx14", "atr14pct", "relativevolume", "leadership_strength", "breadthregime", "volregime", "scoreable_v2", "missing_critical_fields_v2", "sector", "theme"] if c in latest.columns]
+            cols = [c for c in [
+                "ticker", "close", "rsi14", "adx14", "atr14pct", "relativevolume",
+                "rszscore", "rsregime", "sectrsregime", "rotationrec",
+                "leadership_strength", "breadthregime", "breadthscore",
+                "volregime", "realizedvol20d", "gaprate20", "dispersion20",
+                "scoreable_v2", "missing_critical_fields_v2", "sector", "theme",
+            ] if c in latest.columns]
             logger.debug("Latest snapshot preview:\n%s", latest[cols].head(30).to_string(index=False))
 
-    scored = compute_composite_v2(latest) if not latest.empty else pd.DataFrame()
+    scored = compute_composite_v2(latest, weights=scoring_weights, params=scoring_params) if not latest.empty else pd.DataFrame()
     logger.info("Scored rows=%d", len(scored))
     if not scored.empty:
-        scored["scorecomposite_v2"] = (scored["scorecomposite_v2"] + 0.10 * scored.get("leadership_strength", 0.0)).clip(0, 1)
+        _ap = action_params if action_params is not None else ACTIONPARAMS_V2
+        _lead_w = _ap.get("leadership_boost_weight", 0.10)
+        scored["scorecomposite_v2"] = (
+            scored["scorecomposite_v2"]
+            + _lead_w * scored.get("leadership_strength", 0.0)
+        ).clip(0, 1)
+
+        # FIX 13: use config entry threshold for diagnostics
+        _sp = signal_params if signal_params is not None else SIGNALPARAMS_V2
+        _diag_entry = _sp.get("base_entry_threshold", 0.55)
         logger.info(
-            "Score diagnostics: min=%.4f median=%.4f max=%.4f >=0.62=%d >=0.50=%d",
+            "Score diagnostics: min=%.4f median=%.4f max=%.4f >=entry(%.2f)=%d >=0.50=%d",
             float(scored["scorecomposite_v2"].min()),
             float(scored["scorecomposite_v2"].median()),
             float(scored["scorecomposite_v2"].max()),
-            int((scored["scorecomposite_v2"] >= 0.62).sum()),
+            _diag_entry,
+            int((scored["scorecomposite_v2"] >= _diag_entry).sum()),
             int((scored["scorecomposite_v2"] >= 0.50).sum()),
         )
         if logger.isEnabledFor(logging.DEBUG):
             cols = [c for c in ["ticker", "scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorepenalty", "scorecomposite_v2", "rsi14", "adx14", "relativevolume"] if c in scored.columns]
             logger.debug("Top scored names:\n%s", scored.sort_values("scorecomposite_v2", ascending=False)[cols].head(30).to_string(index=False))
 
-    signaled = apply_signals_v2(scored) if not scored.empty else pd.DataFrame()
+    signaled = apply_signals_v2(scored, params=signal_params) if not scored.empty else pd.DataFrame()
     logger.info("Signals rows=%d", len(signaled))
     if not signaled.empty and logger.isEnabledFor(logging.DEBUG):
         cols = [c for c in ["ticker", "scorecomposite_v2", "sigeffectiveentrymin_v2", "sigconfirmed_v2", "sigexit_v2", "rsi14", "adx14"] if c in signaled.columns]
         logger.debug("Signal preview:\n%s", signaled.sort_values("scorecomposite_v2", ascending=False)[cols].head(30).to_string(index=False))
 
-    converged = apply_convergence_v2(signaled) if not signaled.empty else pd.DataFrame()
+    converged = apply_convergence_v2(signaled, params=convergence_params) if not signaled.empty else pd.DataFrame()
     logger.info("Converged rows=%d", len(converged))
-    if not converged.empty and logger.isEnabledFor(logging.DEBUG):
-        cols = [c for c in ["ticker", "scorecomposite_v2", "scoreadjusted_v2", "sigeffectiveentrymin_v2", "sigconfirmed_v2", "sigexit_v2", "rsi14", "adx14", "relativevolume"] if c in converged.columns]
-        logger.debug("Converged preview:\n%s", converged.sort_values(cols[1] if len(cols) > 1 else converged.columns[0], ascending=False)[cols].head(30).to_string(index=False))
+    if not converged.empty:
+        if "convergence_label_v2" in converged.columns:
+            cl_dist = converged["convergence_label_v2"].value_counts().to_dict()
+            logger.info("Convergence label distribution: %s", cl_dist)
+        if logger.isEnabledFor(logging.DEBUG):
+            cols = [c for c in ["ticker", "scorecomposite_v2", "scoreadjusted_v2", "sigeffectiveentrymin_v2", "sigconfirmed_v2", "sigexit_v2", "convergence_label_v2", "rotationrec", "rsi14", "adx14", "relativevolume"] if c in converged.columns]
+            logger.debug("Converged preview:\n%s", converged.sort_values(cols[1] if len(cols) > 1 else converged.columns[0], ascending=False)[cols].head(30).to_string(index=False))
 
-    action_table = _generate_actions(converged) if not converged.empty else pd.DataFrame()
+    action_table = _generate_actions(converged, params=action_params) if not converged.empty else pd.DataFrame()
     logger.info("Action table rows=%d", len(action_table))
     if not action_table.empty:
         logger.info("Action counts=%s", action_table["action_v2"].value_counts().to_dict())
         if logger.isEnabledFor(logging.DEBUG):
-            cols = [c for c in ["ticker", "action_v2", "conviction_v2", "scorecomposite_v2", "scoreadjusted_v2", "score_percentile_v2", "rsi14", "adx14", "relativevolume", "action_reason_v2"] if c in action_table.columns]
+            cols = [c for c in ["ticker", "action_v2", "conviction_v2", "scorecomposite_v2", "scoreadjusted_v2", "score_percentile_v2", "rsi14", "adx14", "relativevolume", "sectrsregime", "rotationrec", "convergence_label_v2", "action_reason_v2"] if c in action_table.columns]
             logger.debug("Action table preview:\n%s", action_table[cols].head(50).to_string(index=False))
 
-    review_table = _build_review_table(action_table) if not action_table.empty else pd.DataFrame()
+    # FIX 3 (critical): pass action_params to review table
+    review_table = _build_review_table(action_table, action_params=action_params) if not action_table.empty else pd.DataFrame()
+
     selling_exhaustion_table = _build_selling_exhaustion_table(
-        tradable_frames,
+        tradable_enriched,
         breadth_info.get("breadth_regime", "unknown"),
         last_vol.get("volregime", "unknown"),
         leadership_snapshot,
     )
+
+    # FIX 2 (critical): forward ALL portfolio params
     params = portfolio_params or {}
     portfolio = (
         build_portfolio_v2(
             action_table,
-            max_positions=params.get("max_positions", 8),
-            max_sector_weight=params.get("max_sector_weight", 0.35),
-            max_theme_names=params.get("max_theme_names", 2),
+            max_positions=params.get("max_positions", DEFAULT_MAX_POSITIONS),
+            max_sector_weight=params.get("max_sector_weight", DEFAULT_MAX_SECTOR_WEIGHT),
+            max_theme_names=params.get("max_theme_names", DEFAULT_MAX_THEME_NAMES),
+            max_single_weight=params.get("max_single_weight", DEFAULT_MAX_SINGLE_WEIGHT),
+            min_weight=params.get("min_weight", DEFAULT_MIN_WEIGHT),
         )
         if not action_table.empty
         else {
@@ -755,10 +1197,10 @@ def run_pipeline_v2(
 
     logger.info(
         "Pipeline skip summary: scored=%d skipped=%d",
-        len(latest),
-        len(skipped_table),
+        len(latest), len(skipped_table),
     )
     logger.info("Portfolio meta=%s", portfolio.get("meta", {}))
+
     return {
         "market": market,
         "latest": latest,
@@ -772,82 +1214,52 @@ def run_pipeline_v2(
         "portfolio": portfolio,
         "regime_df": regime_df,
         "breadth_info": breadth_info,
+        "breadth_df": breadth_computed_df,
+        "sector_summary": sector_summary,
+        "sector_regimes": sector_regimes,
         "leadership_snapshot": leadership_snapshot,
     }
 
-##################################################################
-""" refactor/demo_runner.py """
-from __future__ import annotations
-import pandas as pd
-from .strategy.regime_v2 import classify_volatility_regime
-from .strategy.adapters_v2 import ensure_columns, attach_benchmark_regime, attach_breadth_context
-from .strategy.scoring_v2 import compute_composite_v2
-from .strategy.signals_v2 import apply_signals_v2, apply_convergence_v2
-from .pipeline_v2 import run_pipeline_v2
 
+########################################
+"""
+refactor/report_v2.py
 
-def run_demo() -> dict:
-    idx = pd.date_range('2025-01-01', periods=8, freq='D')
-    bench = pd.DataFrame({'close':[100,102,101,104,103,105,107,106], 'high':[101,103,102,105,104,106,108,107], 'low':[99,101,100,103,102,104,106,105]}, index=idx)
-    regime = classify_volatility_regime(bench)
-    breadth = pd.DataFrame({'breadthscore':[0.52,0.54,0.56,0.59,0.61,0.58,0.57,0.60], 'breadthregime':['neutral','neutral','neutral','strong','strong','neutral','neutral','strong']}, index=idx)
-    names = {
-        'NVDA': {'sector':'Technology','theme':'AI'},
-        'CRWD': {'sector':'Technology','theme':'Cybersecurity'},
-        'CEG': {'sector':'Utilities','theme':'Nuclear'},
-        'PLTR': {'sector':'Technology','theme':'AI'},
-    }
-    universe_frames = {}
-    for i, (ticker, meta) in enumerate(names.items()):
-        df = pd.DataFrame({
-            'ticker': ticker,
-            'sector': meta['sector'],
-            'theme': meta['theme'],
-            'close': [100+i,102+i,103+i,104+i,105+i,106+i,107+i,108+i],
-            'rszscore': [0.1+i*0.2,0.2+i*0.2,0.4+i*0.2,0.7+i*0.2,0.8+i*0.2,0.9+i*0.2,1.0+i*0.2,1.1+i*0.2],
-            'sectrszscore': [0.2,0.2,0.3,0.4,0.4,0.5,0.5,0.6],
-            'rsaccel20': [0.0,0.01,0.02,0.02,0.03,0.03,0.04,0.04],
-            'closevsema30pct': [0.00,0.01,0.02,0.03,0.02,0.01,0.02,0.01],
-            'closevssma50pct': [0.03,0.04,0.04,0.05,0.05,0.05,0.06,0.05],
-            'relativevolume': [1.0,1.1,1.1,1.2,1.2,1.2,1.3,1.3],
-            'obvslope10d': [0.00,0.01,0.01,0.02,0.02,0.03,0.03,0.03],
-            'adlineslope10d': [0.00,0.00,0.01,0.01,0.01,0.02,0.02,0.02],
-            'dollarvolume20d': [2e7,2e7,2.2e7,2.3e7,2.5e7,2.7e7,2.8e7,3e7],
-            'atr14pct': [0.03,0.03,0.03,0.04,0.04,0.04,0.03,0.03],
-            'amihud20': [0.001]*8,
-            'gaprate20': [0.06]*8,
-            'rsi14': [52,54,55,58,57,56,58,55],
-            'adx14': [18,19,20,22,22,23,24,24],
-            'rsregime': ['improving','improving','improving','leading','leading','leading','leading','leading'],
-            'sectrsregime': ['neutral','neutral','leading','leading','leading','leading','leading','leading'],
-            'rotationrec': ['HOLD','BUY','BUY','BUY','BUY','BUY','BUY','STRONGBUY'],
-        }, index=idx)
-        universe_frames[ticker] = df
-    try:
-        return run_pipeline_v2(universe_frames, bench, breadth, market='US')
-    except Exception as e:
-        return {'error': str(e), 'portfolio': {'selected': pd.DataFrame(), 'meta': {'target_exposure': 0.0, 'reason': 'repo universe not found in sandbox demo'}}}
+Report builder for the v2 pipeline.
 
-if __name__ == '__main__':
-    result = run_demo()
-    print(result.get('portfolio', {}).get('meta', result.get('error')))
-    selected = result.get('portfolio', {}).get('selected', pd.DataFrame())
-    if selected is None or selected.empty:
-        print('no selections')
-    else:
-        cols = [c for c in ['ticker','sector','theme','scoreadjusted_v2','target_weight'] if c in selected.columns]
-        print(selected[cols])
+Consumes the dict returned by ``run_pipeline_v2`` and produces:
 
-############################################################
-""" refactor/report_v2.py"""
+    1.  A structured ``dict`` (``build_report_v2``) suitable for JSON
+        serialisation, dashboards, or downstream programmatic use.
+    2.  A plain-text rendering (``to_text_v2``) for logging, email, or
+        terminal display.
+
+The report is organised into sections:
+
+    header              – market, universe sizes, processing counts.
+    regime              – breadth, volatility, target exposure.
+    rotation            – sector rotation heatmap and quadrant summary.
+    scoring             – sub-score distribution statistics.
+    actions             – action count breakdown.
+    portfolio           – selected names, weights, sector tilt,
+                          rotation exposure.
+    review              – top-ranked review table rows.
+    selling_exhaustion  – reversal watch candidates.
+    skipped             – names excluded from scoring and why.
+"""
 from __future__ import annotations
 
 import logging
 import math
+
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _safe_float(value, default: float = 0.0) -> float:
     try:
@@ -856,6 +1268,13 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _safe_str(value, default: str = "unknown") -> str:
+    if value is None:
+        return default
+    s = str(value).strip()
+    return default if s.lower() in ("", "nan", "none") else s
 
 
 def _df_shape(df: pd.DataFrame | None) -> tuple[int, int]:
@@ -870,7 +1289,11 @@ def _df_cols(df: pd.DataFrame | None) -> list[str]:
     return list(df.columns)
 
 
-def _preview_df(df: pd.DataFrame | None, cols: list[str], n: int = 10) -> list[dict]:
+def _preview_df(
+    df: pd.DataFrame | None,
+    cols: list[str],
+    n: int = 10,
+) -> list[dict]:
     if df is None or df.empty:
         return []
     use = [c for c in cols if c in df.columns]
@@ -889,9 +1312,236 @@ def _count_actions(actions: pd.DataFrame | None) -> dict[str, int]:
     return summary
 
 
-def _log_report_inputs(result: dict, portfolio: dict, selected: pd.DataFrame, actions: pd.DataFrame, review: pd.DataFrame, latest: pd.DataFrame) -> None:
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section builders
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_header(result: dict, latest: pd.DataFrame) -> dict:
+    market = result.get("market", "UNKNOWN")
+    leadership = result.get("leadership_snapshot", pd.DataFrame())
+    return {
+        "market": market,
+        "tradable_universe_size": len(result.get("scored", pd.DataFrame())),
+        "leadership_universe_size": len(leadership) if leadership is not None else 0,
+        "processed_names": 0 if latest is None else len(latest),
+        "skipped_names": len(result.get("skipped_table", pd.DataFrame())),
+        "rsi_field": "rsi14",
+    }
+
+
+def _build_regime_section(meta: dict, breadth_info: dict | None) -> dict:
+    breadth_info = breadth_info or {}
+    return {
+        "breadth_regime": _safe_str(meta.get("breadth_regime", breadth_info.get("breadth_regime"))),
+        "breadth_score": _safe_float(breadth_info.get("breadthscore")),
+        "vol_regime": _safe_str(meta.get("vol_regime")),
+        "target_exposure": _safe_float(meta.get("target_exposure", 0.0)),
+        "dispersion20": _safe_float(breadth_info.get("dispersion20")),
+    }
+
+
+def _build_rotation_section(result: dict) -> dict:
+    """Build sector rotation heatmap and quadrant summary."""
+    sector_summary = result.get("sector_summary", pd.DataFrame())
+    sector_regimes = result.get("sector_regimes", {})
+
+    if sector_summary is None or sector_summary.empty:
+        return {
+            "available": False,
+            "heatmap": [],
+            "quadrant_counts": {},
+        }
+
+    # Heatmap: one entry per sector, sorted by rs_rank
+    heatmap = []
+    display_cols = [
+        "sector", "etf", "regime", "rs_rank", "momentum_rank",
+        "rs_level", "rs_momentum", "excess_return_20d",
+    ]
+    cols = [c for c in display_cols if c in sector_summary.columns]
+    sorted_df = sector_summary.sort_values("rs_rank") if "rs_rank" in sector_summary.columns else sector_summary
+
+    for _, row in sorted_df.iterrows():
+        entry = {}
+        for c in cols:
+            val = row.get(c)
+            if isinstance(val, float) and not math.isnan(val):
+                entry[c] = round(val, 4) if c not in ("rs_rank", "momentum_rank") else int(val)
+            elif isinstance(val, (int,)):
+                entry[c] = int(val)
+            else:
+                entry[c] = _safe_str(val, "")
+        heatmap.append(entry)
+
+    # Quadrant summary
+    quadrant_counts = {}
+    if "regime" in sector_summary.columns:
+        for regime in ("leading", "improving", "weakening", "lagging"):
+            names = sector_summary.loc[
+                sector_summary["regime"] == regime, "sector"
+            ].tolist()
+            quadrant_counts[regime] = {
+                "count": len(names),
+                "sectors": names,
+            }
+
+    return {
+        "available": True,
+        "heatmap": heatmap,
+        "quadrant_counts": quadrant_counts,
+    }
+
+
+def _build_scoring_section(scored: pd.DataFrame) -> dict:
+    """Sub-score distribution statistics."""
+    if scored is None or scored.empty:
+        return {"available": False}
+
+    sub_scores = [
+        "scoretrend", "scoreparticipation", "scorerisk",
+        "scoreregime", "scorerotation", "scorepenalty",
+        "scorecomposite_v2",
+    ]
+    stats = {}
+    for col in sub_scores:
+        if col not in scored.columns:
+            continue
+        s = pd.to_numeric(scored[col], errors="coerce").dropna()
+        if s.empty:
+            continue
+        stats[col] = {
+            "mean": round(float(s.mean()), 4),
+            "median": round(float(s.median()), 4),
+            "min": round(float(s.min()), 4),
+            "max": round(float(s.max()), 4),
+            "std": round(float(s.std()), 4),
+        }
+
+    # Composite distribution buckets
+    comp = pd.to_numeric(
+        scored.get("scorecomposite_v2", pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    buckets = {}
+    if not comp.empty:
+        buckets = {
+            ">=0.75": int((comp >= 0.75).sum()),
+            "0.62-0.75": int(((comp >= 0.62) & (comp < 0.75)).sum()),
+            "0.50-0.62": int(((comp >= 0.50) & (comp < 0.62)).sum()),
+            "<0.50": int((comp < 0.50).sum()),
+        }
+
+    return {
+        "available": True,
+        "sub_scores": stats,
+        "composite_buckets": buckets,
+    }
+
+
+def _build_portfolio_section(
+    portfolio: dict,
+    review: pd.DataFrame,
+) -> dict:
+    selected = portfolio.get("selected", pd.DataFrame())
+    meta = portfolio.get("meta", {}) or {}
+
+    # Selected preview
+    selected_preview = []
+    if selected is not None and not selected.empty:
+        keep = [
+            c for c in [
+                "selection_rank", "ticker", "portfolio_weight_pct",
+                "action_v2", "conviction_v2",
+                "scoreadjusted_v2", "scorecomposite_v2",
+                "sector", "sectrsregime", "theme",
+                "rsi14", "adx14", "relativevolume",
+                "effective_sector_cap", "selection_reason",
+            ] if c in selected.columns
+        ]
+        selected_preview = selected[keep].head(15).to_dict(orient="records")
+
+    # Top picks from review table
+    top_picks = []
+    if review is not None and not review.empty:
+        review_keep = [
+            c for c in [
+                "ticker", "recommendation", "composite_score",
+                "score_percentile", "rsi_14", "adx_14",
+                "relative_volume", "price_vs_ema30_pct",
+                "leadership_strength", "overextended_flag",
+                "sector", "sectrsregime", "theme",
+                "conviction_v2", "why_this_name",
+            ] if c in review.columns
+        ]
+        top_picks = review[review_keep].head(15).to_dict(orient="records")
+
+    return {
+        "selected_count": int(meta.get("selected_count", 0)),
+        "candidate_count": int(meta.get("candidate_count", 0)),
+        "actual_exposure": _safe_float(meta.get("actual_exposure", 0.0)),
+        "cash_reserve": _safe_float(meta.get("cash_reserve", 1.0)),
+        "sector_tilt": meta.get("sector_tilt", []),
+        "rotation_exposure": meta.get("rotation_exposure", []),
+        "top_picks": top_picks,
+        "selected_preview": selected_preview,
+    }
+
+
+def _build_exhaustion_section(result: dict) -> dict:
+    df = result.get("selling_exhaustion_table", pd.DataFrame())
+    if df is None or df.empty:
+        return {"available": False, "count": 0, "names": []}
+
+    keep = [
+        c for c in [
+            "ticker", "status", "quality_label",
+            "selling_exhaustion_score", "reversal_trigger_score",
+            "rsi_14", "rsi_turn_up_1d", "bullish_close_1d",
+            "close_above_prior_high", "volume_reexpansion_1d",
+            "relative_volume", "adx_14", "price_5d_change",
+            "sector", "theme", "decision_hint",
+        ] if c in df.columns
+    ]
+    names = df[keep].head(15).to_dict(orient="records")
+
+    return {
+        "available": True,
+        "count": len(df),
+        "names": names,
+    }
+
+
+def _build_skipped_section(result: dict) -> dict:
+    df = result.get("skipped_table", pd.DataFrame())
+    if df is None or df.empty:
+        return {"count": 0, "names": []}
+
+    keep = [
+        c for c in [
+            "ticker", "instrument_type", "status_v2",
+            "missing_critical_count_v2", "missing_critical_fields_v2",
+            "scoreability_reason_v2", "sector", "sectrsregime",
+        ] if c in df.columns
+    ]
+    names = df[keep].head(20).to_dict(orient="records")
+    return {"count": len(df), "names": names}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Logging helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _log_report_inputs(
+    result: dict,
+    portfolio: dict,
+    selected: pd.DataFrame,
+    actions: pd.DataFrame,
+    review: pd.DataFrame,
+    latest: pd.DataFrame,
+) -> None:
     logger.info(
-        "build_report_v2 input shapes: selected=%s actions=%s review=%s latest=%s",
+        "build_report_v2 input shapes: selected=%s actions=%s "
+        "review=%s latest=%s",
         _df_shape(selected),
         _df_shape(actions),
         _df_shape(review),
@@ -902,21 +1552,13 @@ def _log_report_inputs(result: dict, portfolio: dict, selected: pd.DataFrame, ac
         sorted(list(portfolio.keys())) if isinstance(portfolio, dict) else [],
         sorted(list(result.keys())) if isinstance(result, dict) else [],
     )
-    logger.info(
-        "build_report_v2 columns: selected=%s actions=%s review=%s latest=%s",
-        _df_cols(selected),
-        _df_cols(actions),
-        _df_cols(review),
-        _df_cols(latest),
-    )
 
 
-def _log_portfolio_meta(meta: dict, market: str, leadership: list, tradable: list) -> None:
+def _log_portfolio_meta(meta: dict, market: str) -> None:
     logger.info(
-        "build_report_v2 market=%s tradable=%d leadership=%d selected_count=%s candidate_count=%s target_exposure=%s",
+        "build_report_v2 market=%s selected_count=%s "
+        "candidate_count=%s target_exposure=%s",
         market,
-        len(tradable),
-        len(leadership),
         meta.get("selected_count", 0),
         meta.get("candidate_count", 0),
         meta.get("target_exposure", 0.0),
@@ -928,167 +1570,390 @@ def _log_portfolio_meta(meta: dict, market: str, leadership: list, tradable: lis
     )
 
 
-def _log_review_summary(review: pd.DataFrame | None, top: list[dict]) -> None:
+def _log_review_summary(review: pd.DataFrame | None) -> None:
     if review is None or review.empty:
         logger.warning("build_report_v2: review table is empty")
         return
     logger.info(
-        "build_report_v2 review summary: rows=%d cols=%d top_rows=%d",
-        len(review),
-        len(review.columns),
-        len(top),
+        "build_report_v2 review summary: rows=%d cols=%d",
+        len(review), len(review.columns),
     )
     if "recommendation" in review.columns:
-        logger.info("build_report_v2 review recommendations=%s", review["recommendation"].value_counts(dropna=False).to_dict())
-    if "action_v2" in review.columns:
-        logger.info("build_report_v2 review action_v2=%s", review["action_v2"].value_counts(dropna=False).to_dict())
-    if "ticker" in review.columns and logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "build_report_v2 review preview:\n%s",
-            review.head(30).to_string(index=False),
+        logger.info(
+            "build_report_v2 review recommendations=%s",
+            review["recommendation"].value_counts(dropna=False).to_dict(),
         )
 
 
-def _log_selected_summary(selected: pd.DataFrame | None, selected_preview: list[dict]) -> None:
+def _log_selected_summary(selected: pd.DataFrame | None) -> None:
     if selected is None or selected.empty:
         logger.warning("build_report_v2: selected portfolio is empty")
         return
     logger.info(
-        "build_report_v2 selected summary: rows=%d cols=%d preview_rows=%d",
-        len(selected),
-        len(selected.columns),
-        len(selected_preview),
+        "build_report_v2 selected summary: rows=%d cols=%d",
+        len(selected), len(selected.columns),
     )
-    if "action_v2" in selected.columns:
-        logger.info("build_report_v2 selected action_v2=%s", selected["action_v2"].value_counts(dropna=False).to_dict())
     if "sector" in selected.columns:
-        logger.info("build_report_v2 selected sector=%s", selected["sector"].value_counts(dropna=False).to_dict())
-    if "theme" in selected.columns:
-        logger.info("build_report_v2 selected theme=%s", selected["theme"].value_counts(dropna=False).to_dict())
-    if logger.isEnabledFor(logging.DEBUG):
-        keep = [c for c in ["ticker", "target_weight", "scoreadjusted_v2", "action_v2", "sector", "theme"] if c in selected.columns]
-        if keep:
-            logger.debug("build_report_v2 selected preview:\n%s", selected[keep].head(30).to_string(index=False))
+        logger.info(
+            "build_report_v2 selected sector=%s",
+            selected["sector"].value_counts(dropna=False).to_dict(),
+        )
+    if "sectrsregime" in selected.columns:
+        logger.info(
+            "build_report_v2 selected sectrsregime=%s",
+            selected["sectrsregime"].value_counts(dropna=False).to_dict(),
+        )
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def build_report_v2(result: dict) -> dict:
+    """
+    Build a structured report from the pipeline output dict.
+
+    Parameters
+    ----------
+    result : dict
+        Output of ``run_pipeline_v2``.
+
+    Returns
+    -------
+    dict
+        Structured report with sections: header, regime, rotation,
+        scoring, actions, portfolio, selling_exhaustion, skipped.
+    """
     portfolio = result.get("portfolio", {}) or {}
     selected = portfolio.get("selected", pd.DataFrame())
     actions = result.get("action_table", pd.DataFrame())
     review = result.get("review_table", pd.DataFrame())
     meta = portfolio.get("meta", {}) or {}
     latest = result.get("latest", pd.DataFrame())
+    scored = result.get("scored", pd.DataFrame())
+    breadth_info = result.get("breadth_info", {}) or {}
     market = result.get("market", "UNKNOWN")
-    leadership = result.get("leadership_universe", []) or []
-    tradable = result.get("tradable_universe", []) or []
 
     _log_report_inputs(result, portfolio, selected, actions, review, latest)
-    _log_portfolio_meta(meta, market, leadership, tradable)
-
-    top = []
-    if review is not None and not review.empty:
-        top = review.head(10).to_dict(orient="records")
-    _log_review_summary(review, top)
-
-    selected_preview = []
-    if selected is not None and not selected.empty:
-        keep = [c for c in ["ticker", "target_weight", "scoreadjusted_v2", "action_v2", "sector", "theme"] if c in selected.columns]
-        selected_preview = selected[keep].head(10).to_dict(orient="records")
-    _log_selected_summary(selected, selected_preview)
+    _log_portfolio_meta(meta, market)
+    _log_review_summary(review)
+    _log_selected_summary(selected)
 
     action_summary = _count_actions(actions)
     logger.info("build_report_v2 action summary=%s", action_summary)
 
     report = {
-        "header": {
-            "market": market,
-            "tradable_universe_size": len(tradable),
-            "leadership_universe_size": len(leadership),
-            "processed_names": 0 if latest is None else len(latest),
-            "rsi_field": "rsi14",
-        },
-        "regime": {
-            "breadth_regime": meta.get("breadth_regime", "unknown"),
-            "vol_regime": meta.get("vol_regime", "unknown"),
-            "target_exposure": _safe_float(meta.get("target_exposure", 0.0)),
-        },
+        "header": _build_header(result, latest),
+        "regime": _build_regime_section(meta, breadth_info),
+        "rotation": _build_rotation_section(result),
+        "scoring": _build_scoring_section(scored),
         "actions": action_summary,
-        "portfolio": {
-            "selected_count": int(meta.get("selected_count", 0)),
-            "candidate_count": int(meta.get("candidate_count", 0)),
-            "top_picks": top,
-            "selected_preview": selected_preview,
-        },
+        "portfolio": _build_portfolio_section(portfolio, review),
+        "selling_exhaustion": _build_exhaustion_section(result),
+        "skipped": _build_skipped_section(result),
     }
 
     logger.info(
-        "build_report_v2 output ready: top_picks=%d selected_preview=%d",
-        len(top),
-        len(selected_preview),
+        "build_report_v2 output ready: top_picks=%d selected=%d "
+        "exhaustion=%d skipped=%d rotation_heatmap=%d",
+        len(report["portfolio"]["top_picks"]),
+        len(report["portfolio"]["selected_preview"]),
+        report["selling_exhaustion"].get("count", 0),
+        report["skipped"].get("count", 0),
+        len(report["rotation"].get("heatmap", [])),
     )
     return report
 
 
 def to_text_v2(report: dict) -> str:
-    h = report["header"]
-    r = report["regime"]
-    a = report["actions"]
-    p = report["portfolio"]
+    """
+    Render the structured report dict as a human-readable plain-text
+    string.
+    """
+    h = report.get("header", {})
+    r = report.get("regime", {})
+    rot = report.get("rotation", {})
+    sc = report.get("scoring", {})
+    a = report.get("actions", {})
+    p = report.get("portfolio", {})
+    exh = report.get("selling_exhaustion", {})
+    skp = report.get("skipped", {})
 
-    logger.info(
-        "to_text_v2 start: market=%s top_picks=%d selected_preview=%d",
-        h.get("market", "UNKNOWN"),
-        len(p.get("top_picks", [])),
-        len(p.get("selected_preview", [])),
-    )
+    sep = "=" * 92
+    thin = "-" * 92
 
     lines = []
-    lines.append("CASH V2 REPORT")
-    lines.append("-" * 90)
-    lines.append(f"Market                  : {h['market']}")
-    lines.append(f"Tradable universe size  : {h['tradable_universe_size']}")
-    lines.append(f"Leadership universe size: {h['leadership_universe_size']}")
-    lines.append(f"Processed names         : {h['processed_names']}")
-    lines.append(f"RSI field used          : {h['rsi_field']} (RSI 14)")
-    lines.append(f"Breadth regime          : {r['breadth_regime']}")
-    lines.append(f"Vol regime              : {r['vol_regime']}")
-    lines.append(f"Target exposure         : {_safe_float(r['target_exposure']):.2%}")
-    lines.append(f"Action counts           : STRONG_BUY={a['STRONG_BUY']} BUY={a['BUY']} HOLD={a['HOLD']} SELL={a['SELL']}")
-    lines.append(f"Candidates              : {p['candidate_count']}")
-    lines.append(f"Selected                : {p['selected_count']}")
+
+    # ── HEADER ────────────────────────────────────────────────────────────────
+    lines.append(sep)
+    lines.append("  CASH V2 PIPELINE REPORT")
+    lines.append(sep)
+    lines.append(f"  Market                  : {h.get('market', 'UNKNOWN')}")
+    lines.append(f"  Tradable universe       : {h.get('tradable_universe_size', 0)}")
+    lines.append(f"  Leadership universe     : {h.get('leadership_universe_size', 0)}")
+    lines.append(f"  Processed (scored)      : {h.get('processed_names', 0)}")
+    lines.append(f"  Skipped (not scoreable) : {h.get('skipped_names', 0)}")
+    lines.append(f"  RSI field               : {h.get('rsi_field', 'rsi14')} (RSI 14)")
     lines.append("")
 
-    lines.append("REVIEW TABLE")
-    lines.append("-" * 90)
-    if not p["top_picks"]:
-        lines.append("No signals")
-    else:
-        for i, row in enumerate(p["top_picks"], 1):
+    # ── REGIME ────────────────────────────────────────────────────────────────
+    lines.append(thin)
+    lines.append("  MARKET REGIME")
+    lines.append(thin)
+    lines.append(f"  Breadth regime          : {r.get('breadth_regime', 'unknown')}")
+    lines.append(f"  Breadth score           : {_safe_float(r.get('breadth_score')):.3f}")
+    lines.append(f"  Volatility regime       : {r.get('vol_regime', 'unknown')}")
+    lines.append(f"  Target exposure         : {_safe_float(r.get('target_exposure')):.1%}")
+    lines.append(f"  Dispersion (20d)        : {_safe_float(r.get('dispersion20')):.4f}")
+    lines.append("")
+
+    # ── SECTOR ROTATION ───────────────────────────────────────────────────────
+    lines.append(thin)
+    lines.append("  SECTOR ROTATION (RRG Quadrants)")
+    lines.append(thin)
+
+    if rot.get("available"):
+        # Quadrant summary
+        qc = rot.get("quadrant_counts", {})
+        for quadrant in ("leading", "improving", "weakening", "lagging"):
+            info = qc.get(quadrant, {})
+            count = info.get("count", 0)
+            sectors = ", ".join(info.get("sectors", [])) or "none"
+            lines.append(f"  {quadrant.upper():<12s}  ({count})  {sectors}")
+        lines.append("")
+
+        # Heatmap table
+        heatmap = rot.get("heatmap", [])
+        if heatmap:
             lines.append(
-                f"{i:>2}. {str(row.get('ticker', '?')):12s} {str(row.get('recommendation', '?')):10s} "
-                f"score={_safe_float(row.get('composite_score', 0)):.3f} pct={_safe_float(row.get('score_percentile', 0)):.0%} "
-                f"rsi14={_safe_float(row.get('rsi_14', 0)):.1f} adx14={_safe_float(row.get('adx_14', 0)):.1f} rv={_safe_float(row.get('relative_volume', 0)):.2f} "
-                f"lead={_safe_float(row.get('leadership_strength', 0)):.2f} sector={row.get('sector', 'Unknown')} theme={row.get('theme', 'Unknown')}"
+                f"  {'Rank':>4s}  {'Sector':<22s}  {'ETF':<5s}  "
+                f"{'Regime':<11s}  {'RS Level':>9s}  {'RS Mom':>8s}  "
+                f"{'Excess 20d':>10s}"
+            )
+            lines.append("  " + "-" * 80)
+            for entry in heatmap:
+                rank = entry.get("rs_rank", "")
+                sector = entry.get("sector", "")
+                etf = entry.get("etf", "")
+                regime = entry.get("regime", "")
+                rs_lvl = entry.get("rs_level", "")
+                rs_mom = entry.get("rs_momentum", "")
+                excess = entry.get("excess_return_20d", "")
+                lines.append(
+                    f"  {str(rank):>4s}  {str(sector):<22s}  {str(etf):<5s}  "
+                    f"{str(regime):<11s}  "
+                    f"{_safe_float(rs_lvl):>9.4f}  "
+                    f"{_safe_float(rs_mom):>8.4f}  "
+                    f"{_safe_float(excess):>10.4f}"
+                )
+    else:
+        lines.append("  Sector rotation data not available")
+    lines.append("")
+
+    # ── SCORING SUMMARY ───────────────────────────────────────────────────────
+    lines.append(thin)
+    lines.append("  SCORING SUMMARY")
+    lines.append(thin)
+
+    if sc.get("available"):
+        sub = sc.get("sub_scores", {})
+        for col in (
+            "scoretrend", "scoreparticipation", "scorerisk",
+            "scoreregime", "scorerotation", "scorepenalty",
+            "scorecomposite_v2",
+        ):
+            s = sub.get(col)
+            if s:
+                lines.append(
+                    f"  {col:<22s}  mean={s['mean']:.4f}  "
+                    f"median={s['median']:.4f}  "
+                    f"min={s['min']:.4f}  max={s['max']:.4f}  "
+                    f"std={s['std']:.4f}"
+                )
+
+        buckets = sc.get("composite_buckets", {})
+        if buckets:
+            bucket_str = "  ".join(
+                f"{label}: {count}" for label, count in buckets.items()
+            )
+            lines.append(f"  Distribution: {bucket_str}")
+    else:
+        lines.append("  Scoring data not available")
+    lines.append("")
+
+    # ── ACTIONS ───────────────────────────────────────────────────────────────
+    lines.append(thin)
+    lines.append("  ACTION SUMMARY")
+    lines.append(thin)
+    lines.append(
+        f"  STRONG_BUY={a.get('STRONG_BUY', 0)}  "
+        f"BUY={a.get('BUY', 0)}  "
+        f"HOLD={a.get('HOLD', 0)}  "
+        f"SELL={a.get('SELL', 0)}"
+    )
+    lines.append(
+        f"  Candidates: {p.get('candidate_count', 0)}  "
+        f"Selected: {p.get('selected_count', 0)}  "
+        f"Exposure: {_safe_float(p.get('actual_exposure')):.1%}  "
+        f"Cash reserve: {_safe_float(p.get('cash_reserve')):.1%}"
+    )
+    lines.append("")
+
+    # ── REVIEW TABLE ──────────────────────────────────────────────────────────
+    lines.append(thin)
+    lines.append("  REVIEW TABLE (Top Picks)")
+    lines.append(thin)
+
+    top = p.get("top_picks", [])
+    if not top:
+        lines.append("  No signals")
+    else:
+        for i, row in enumerate(top, 1):
+            ticker = str(row.get("ticker", "?"))
+            rec = str(row.get("recommendation", "?"))
+            score = _safe_float(row.get("composite_score"))
+            pct = _safe_float(row.get("score_percentile"))
+            rsi = _safe_float(row.get("rsi_14"))
+            adx = _safe_float(row.get("adx_14"))
+            rv = _safe_float(row.get("relative_volume"))
+            lead = _safe_float(row.get("leadership_strength"))
+            ext = row.get("overextended_flag", "")
+            sect = row.get("sector", "Unknown")
+            sr = row.get("sectrsregime", "unknown")
+            conv = row.get("conviction_v2", "")
+
+            lines.append(
+                f"  {i:>2}. {ticker:<10s}  {rec:<10s}  "
+                f"score={score:.3f}  pct={pct:.0%}  "
+                f"rsi={rsi:.0f}  adx={adx:.0f}  rv={rv:.2f}  "
+                f"lead={lead:.2f}  ext={ext}  "
+                f"conv={conv}  {sect}({sr})"
+            )
+    lines.append("")
+
+    # ── SELECTED PORTFOLIO ────────────────────────────────────────────────────
+    lines.append(thin)
+    lines.append("  SELECTED PORTFOLIO")
+    lines.append(thin)
+
+    sel = p.get("selected_preview", [])
+    if not sel:
+        lines.append("  No positions selected")
+    else:
+        for i, row in enumerate(sel, 1):
+            ticker = str(row.get("ticker", "?"))
+            weight = _safe_float(row.get("portfolio_weight_pct"))
+            score = _safe_float(
+                row.get("scoreadjusted_v2", row.get("scorecomposite_v2")),
+            )
+            action = row.get("action_v2", "?")
+            conv = row.get("conviction_v2", "")
+            sect = row.get("sector", "Unknown")
+            sr = row.get("sectrsregime", "unknown")
+            theme = row.get("theme", "Unknown")
+
+            lines.append(
+                f"  {i:>2}. {ticker:<10s}  wt={weight:>5.1f}%  "
+                f"score={score:.3f}  {action:<10s}  conv={conv}  "
+                f"{sect}({sr})  theme={theme}"
             )
 
-    if p.get("selected_preview"):
-        lines.append("")
-        lines.append("SELECTED PORTFOLIO")
-        lines.append("-" * 90)
-        for i, row in enumerate(p["selected_preview"], 1):
+        # Sector tilt
+        tilt = p.get("sector_tilt", [])
+        if tilt:
+            lines.append("")
+            lines.append("  Sector tilt:")
+            for entry in tilt:
+                lines.append(
+                    f"    {entry.get('sector', '?'):<20s}  "
+                    f"regime={entry.get('regime', '?'):<10s}  "
+                    f"wt={entry.get('weight_pct', 0):>5.1f}%  "
+                    f"cap={entry.get('effective_cap_pct', 0):>5.1f}%  "
+                    f"room={entry.get('headroom_pct', 0):>+5.1f}%  "
+                    f"names={entry.get('count', 0)}"
+                )
+
+        # Rotation exposure
+        rot_exp = p.get("rotation_exposure", [])
+        if rot_exp:
+            lines.append("")
+            lines.append("  Rotation quadrant exposure:")
+            for entry in rot_exp:
+                tickers = ", ".join(entry.get("tickers", []))
+                lines.append(
+                    f"    {entry.get('quadrant', '?'):<10s}  "
+                    f"wt={entry.get('weight_pct', 0):>5.1f}%  "
+                    f"names={entry.get('count', 0)}  "
+                    f"[{tickers}]"
+                )
+    lines.append("")
+
+    # ── SELLING EXHAUSTION ────────────────────────────────────────────────────
+    lines.append(thin)
+    lines.append("  SELLING EXHAUSTION (Reversal Watch)")
+    lines.append(thin)
+
+    if exh.get("available"):
+        lines.append(f"  Total candidates: {exh.get('count', 0)}")
+        for i, row in enumerate(exh.get("names", []), 1):
+            ticker = str(row.get("ticker", "?"))
+            status = row.get("status", "?")
+            quality = row.get("quality_label", "?")
+            exh_score = _safe_float(row.get("selling_exhaustion_score"))
+            trig = _safe_float(row.get("reversal_trigger_score"))
+            rsi_val = _safe_float(row.get("rsi_14"))
+            rsi_up = row.get("rsi_turn_up_1d", "")
+            bull_close = row.get("bullish_close_1d", "")
+            vol_reexp = row.get("volume_reexpansion_1d", "")
+            p5d = _safe_float(row.get("price_5d_change"))
+            sect = row.get("sector", "Unknown")
+
             lines.append(
-                f"{i:>2}. {str(row.get('ticker', '?')):12s} wt={_safe_float(row.get('target_weight', 0)):.2%} "
-                f"score={_safe_float(row.get('scoreadjusted_v2', 0)):.3f} action={row.get('action_v2', '?')} "
-                f"sector={row.get('sector', 'Unknown')} theme={row.get('theme', 'Unknown')}"
+                f"  {i:>2}. {ticker:<10s}  {status:<22s}  "
+                f"quality={quality}  exh={exh_score:.0f}  "
+                f"trig={trig:.0f}  rsi={rsi_val:.0f}  "
+                f"rsi_up={rsi_up}  bull={bull_close}  "
+                f"vol_re={vol_reexp}  5d={p5d:+.1%}  {sect}"
             )
+    else:
+        lines.append("  No selling exhaustion candidates")
+    lines.append("")
+
+    # ── SKIPPED NAMES ─────────────────────────────────────────────────────────
+    skipped_count = skp.get("count", 0)
+    if skipped_count > 0:
+        lines.append(thin)
+        lines.append(f"  SKIPPED NAMES ({skipped_count})")
+        lines.append(thin)
+        for row in skp.get("names", []):
+            ticker = str(row.get("ticker", "?"))
+            reason = row.get("scoreability_reason_v2", "unknown")
+            missing = row.get("missing_critical_fields_v2", "")
+            sr = row.get("sectrsregime", "unknown")
+            lines.append(
+                f"  {ticker:<10s}  sect_regime={sr}  "
+                f"reason={reason}  missing=[{missing}]"
+            )
+        lines.append("")
+
+    lines.append(sep)
+    lines.append("  END OF REPORT")
+    lines.append(sep)
 
     text = "\n".join(lines)
-    logger.info("to_text_v2 complete: lines=%d chars=%d", len(lines), len(text))
+    logger.info(
+        "to_text_v2 complete: sections=8 lines=%d chars=%d",
+        len(lines), len(text),
+    )
     return text
 
-##############################################################
+
+####################################
+"""refactor/runner_v2.py"""
 from __future__ import annotations
 
+from utils.run_logger import RunLogger
+from utils.display_results import print_run_summary
 
 import argparse
 import logging
@@ -1237,7 +2102,7 @@ def _build_frames_from_panel(df: pd.DataFrame, market: str) -> tuple[dict[str, p
 
 
     bench_df = universe_frames.get(benchmark)
-    
+
     if bench_df is None:
         for alt in BENCHMARK_FALLBACKS.get(market.upper(), []):
             if alt in universe_frames:
@@ -1301,7 +2166,7 @@ def load_market_data_v2(
 
 
 
-def run_strategy_v2(market: str, universe_frames: dict[str, pd.DataFrame], bench_df: pd.DataFrame, breadth_df: pd.DataFrame | None = None) -> dict[str, Any]:
+def run_strategy_v2(market: str, universe_frames: dict[str, pd.DataFrame], bench_df: pd.DataFrame, breadth_df: pd.DataFrame | None = None, config: dict | None = None,) -> dict[str, Any]:
     cfg = get_market_config_v2(market)
     tradable = set(cfg["tradable_universe"])
     leadership = set(cfg["leadership_universe"])
@@ -1322,21 +2187,29 @@ def run_strategy_v2(market: str, universe_frames: dict[str, pd.DataFrame], bench
         logger.info("Missing leadership symbols in parquet: count=%d sample=%s", len(missing_leadership), missing_leadership[:25])
 
 
+    # ── Build portfolio params from market config ─────────────────────────
+    portfolio_params = {
+        "max_positions": cfg.get("max_positions", 8),
+        "max_sector_weight": cfg.get("max_sector_weight", 0.35),
+        "max_theme_names": cfg.get("max_theme_names", 2),
+        "max_single_weight": cfg.get("max_single_weight", 0.20),
+        "min_weight": cfg.get("min_weight", 0.04),
+    }
+
     result = run_pipeline_v2(
         tradable_frames=tradable_frames,
         leadership_frames=leadership_frames,
         bench_df=bench_df,
         breadth_df=breadth_df,
         market=cfg["market"],
-        portfolio_params={
-            "max_positions": cfg["max_positions"],
-            "max_sector_weight": cfg["max_sector_weight"],
-            "max_theme_names": cfg["max_theme_names"],
-        },
+        portfolio_params=portfolio_params,
+        config=config,
     )
     result["market_config_v2"] = cfg
     result["tradable_universe"] = sorted(tradable)
     result["leadership_universe"] = sorted(leadership)
+
+    # ── Log skipped names ─────────────────────────────────────────────────
     skipped_table = result.get("skipped_table", pd.DataFrame())
     if isinstance(skipped_table, pd.DataFrame) and not skipped_table.empty:
         sample_cols = [c for c in ["ticker", "missing_critical_fields_v2"] if c in skipped_table.columns]
@@ -1345,16 +2218,92 @@ def run_strategy_v2(market: str, universe_frames: dict[str, pd.DataFrame], bench
             len(skipped_table),
             skipped_table[sample_cols].head(20).to_dict(orient="records") if sample_cols else skipped_table.head(20).to_dict(orient="records"),
         )
+
+    # ── Log selling exhaustion ────────────────────────────────────────────
+    exhaustion_table = result.get("selling_exhaustion_table", pd.DataFrame())
+    if isinstance(exhaustion_table, pd.DataFrame) and not exhaustion_table.empty:
+        logger.info(
+            "Selling exhaustion candidates: count=%d",
+            len(exhaustion_table),
+        )
+        # Status breakdown
+        if "status" in exhaustion_table.columns:
+            status_counts = exhaustion_table["status"].value_counts(dropna=False).to_dict()
+            logger.info(
+                "Selling exhaustion status breakdown: %s", status_counts,
+            )
+        # Quality breakdown
+        if "quality_label" in exhaustion_table.columns:
+            quality_counts = exhaustion_table["quality_label"].value_counts(dropna=False).to_dict()
+            logger.info(
+                "Selling exhaustion quality breakdown: %s", quality_counts,
+            )
+        # Top candidates preview
+        preview_cols = [
+            c for c in [
+                "ticker", "status", "quality_label",
+                "selling_exhaustion_score", "reversal_trigger_score",
+                "rsi_14", "price_5d_change", "sector",
+            ] if c in exhaustion_table.columns
+        ]
+        if preview_cols:
+            logger.info(
+                "Selling exhaustion top candidates:\n%s",
+                exhaustion_table[preview_cols].head(10).to_string(index=False),
+            )
+
+        # Sector distribution of exhaustion candidates
+        if "sector" in exhaustion_table.columns:
+            sector_counts = exhaustion_table["sector"].value_counts(dropna=False).to_dict()
+            logger.info(
+                "Selling exhaustion by sector: %s", sector_counts,
+            )
+    else:
+        logger.info("Selling exhaustion: no candidates detected")
+
+    # ── Build report ──────────────────────────────────────────────────────
     report = build_report_v2(result)
     result["report_v2"] = report
     result["report_text_v2"] = to_text_v2(report)
+
+    # ── Summary logging (read from nested report structure) ───────────────
+    header = report.get("header", {})
+    portfolio_section = report.get("portfolio", {})
+    action_summary = report.get("actions", {})
+    rotation_section = report.get("rotation", {})
+    exhaustion_section = report.get("selling_exhaustion", {})
+
     logger.info(
-        "Strategy result summary: processed=%s candidates=%s selected=%s action_counts=%s",
-        report.get("processed_names"),
-        report.get("candidate_count"),
-        report.get("selected_count"),
-        report.get("action_counts"),
+        "Strategy result summary: "
+        "processed=%s candidates=%s selected=%s "
+        "actions=%s exhaustion=%s",
+        header.get("processed_names", 0),
+        portfolio_section.get("candidate_count", 0),
+        portfolio_section.get("selected_count", 0),
+        action_summary,
+        exhaustion_section.get("count", 0),
     )
+
+    # ── Rotation summary ──────────────────────────────────────────────────
+    if rotation_section.get("available"):
+        qc = rotation_section.get("quadrant_counts", {})
+        parts = []
+        for q in ("leading", "improving", "weakening", "lagging"):
+            info = qc.get(q, {})
+            count = info.get("count", 0)
+            sectors = info.get("sectors", [])
+            parts.append(f"{q}={count}({','.join(sectors[:3])})")
+        logger.info("Sector rotation: %s", "  ".join(parts))
+
+    # ── Portfolio rotation exposure ───────────────────────────────────────
+    rot_exp = portfolio_section.get("rotation_exposure", [])
+    if rot_exp:
+        exp_parts = [
+            f"{e.get('quadrant', '?')}={e.get('weight_pct', 0):.1f}%"
+            for e in rot_exp
+        ]
+        logger.info("Portfolio rotation exposure: %s", "  ".join(exp_parts))
+
     return result
 
 
@@ -1369,22 +2318,32 @@ def main(argv=None):
         logger.info("Start date: %s", args.start_date)
         logger.info("End date: %s", args.end_date)
         logger.info("Verbose logging: %s", args.verbose)
+
         universe_frames, bench_df, breadth_df = load_market_data_v2(
             market=args.market,
             start_date=args.start_date,
             end_date=args.end_date,
             parquet_path=args.parquet_path,
         )
+
         result = run_strategy_v2(
             market=args.market,
             universe_frames=universe_frames,
             bench_df=bench_df,
             breadth_df=breadth_df,
         )
+
+        run_log = RunLogger(f"runner_v2_{args.market}")
+        print_run_summary(result, args.market, run_log)
+        # ─────────────────────────────────────────────────────
+
         logger.info("runner_v2 completed")
+
         if args.print_report and result.get("report_text_v2"):
             print(result["report_text_v2"])
+
         return result
+
     except Exception as exc:
         logger.exception("runner_v2 failed: %s", exc)
         raise
@@ -1394,4 +2353,5 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-###############################################################
+
+##################################################

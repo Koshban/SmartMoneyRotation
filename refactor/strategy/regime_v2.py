@@ -1,4 +1,4 @@
-""" refactor/strategy/regime_v2.py """
+"""refactor/strategy/regime_v2.py"""
 from __future__ import annotations
 
 import numpy as np
@@ -11,13 +11,17 @@ def _clip01(x):
     return np.clip(x, 0.0, 1.0)
 
 
-def classify_volatility_regime(bench: pd.DataFrame, dispersion: pd.Series | None = None) -> pd.DataFrame:
+def classify_volatility_regime(
+    bench: pd.DataFrame,
+    dispersion: pd.Series | None = None,
+    params: dict | None = None,
+) -> pd.DataFrame:
     if bench is None or bench.empty:
         raise ValueError("Benchmark dataframe cannot be empty")
     if "close" not in bench.columns:
         raise ValueError("Benchmark dataframe must contain a close column")
 
-    p = VOLREGIMEPARAMS
+    p = params if params is not None else VOLREGIMEPARAMS
     df = bench.copy()
     close = pd.to_numeric(df["close"], errors="coerce")
     high = pd.to_numeric(df.get("high", close), errors="coerce")
@@ -43,7 +47,15 @@ def classify_volatility_regime(bench: pd.DataFrame, dispersion: pd.Series | None
         + w["dispersion"] * pd.Series(disp_s, index=df.index).fillna(0)
     )
 
-    label = np.select([score >= 0.75, score >= 0.35], ["chaotic", "volatile"], default="calm")
+    # FIX: regime label thresholds from config instead of hardcoded
+    chaotic_thresh = p.get("chaotic_threshold", 0.75)
+    volatile_thresh = p.get("volatile_threshold", 0.35)
+
+    label = np.select(
+        [score >= chaotic_thresh, score >= volatile_thresh],
+        ["chaotic", "volatile"],
+        default="calm",
+    )
     return pd.DataFrame(
         {
             "volregime": label,

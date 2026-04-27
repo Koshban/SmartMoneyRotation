@@ -1,6 +1,492 @@
 """
+backtest/phase2/run_backtest.py
+CLI entry point.
+
+    python -m backtest.run_backtest --market HK --start 2025-10-01 --end 2026-04-20
+    python -m backtest.run_backtest --market IN --start 2025-06-01 --end 2026-04-20
+    python -m backtest.run_backtest --market US --start 2025-06-01 --end 2026-04-20
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from rich.console import Console
+
+from backtest.phase2.data_source import BacktestDataSource
+from backtest.phase2.compare import build_config_dict, run_comparison, print_comparison
+from copy import deepcopy
+from refactor.common.config_refactor import (
+    VOLREGIMEPARAMS,
+    SCORINGWEIGHTS_V2,
+    SCORINGPARAMS_V2,
+    SIGNALPARAMS_V2,
+    CONVERGENCEPARAMS_V2,
+    ACTIONPARAMS_V2,
+    BREADTHPARAMS,          # ← NEW
+    ROTATIONPARAMS,         # ← NEW
+)
+
+console = Console()
+log = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════════════
+#  LOGGING SETUP
+# ══════════════════════════════════════════════════════════════════
+LOGS_DIR = Path("logs") / "backtest"
+
+
+def _setup_logging(market: str, level: int = logging.INFO) -> Path:
+    """
+    Configure the root logger to write to both:
+      • stderr   (concise, INFO+)
+      • file     (verbose, DEBUG+)
+
+    Returns the path to the log file.
+    """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = LOGS_DIR / f"backtest_{market}_{timestamp}.log"
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # ── file handler (verbose — captures DEBUG from all modules) ──
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root.addHandler(fh)
+
+    # ── console handler (concise — INFO only) ─────────────────────
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(logging.Formatter(
+        "%(asctime)s  %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    root.addHandler(ch)
+
+    # ── silence noisy modules on the console ──────────────────────
+    # These still write DEBUG to the log file via the file handler.
+    for noisy in (
+        "refactor.strategy.rotation_v2",
+        "refactor.pipeline_v2",
+        "refactor.strategy",
+        "refactor.scoring",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    return log_file
+
+
+def _log_and_print(msg: str, rich_msg: str | None = None, level: int = logging.INFO):
+    """Log a plain-text message AND print a (possibly styled) version to Rich console."""
+    log.log(level, msg)
+    console.print(rich_msg if rich_msg is not None else msg)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  UNIVERSE + BENCHMARK MAPPING
+# ══════════════════════════════════════════════════════════════════
+
+from common.universe import get_universe_for_market
+
+BENCHMARKS = {
+    "HK": "2800.HK",      # Tracker Fund of Hong Kong
+    "IN": "NIFTYBEES.NS",  # Nifty ETF (adjust to your universe)
+    "US": "SPY",           # S&P 500 ETF
+}
+
+
+def _get_tickers(market: str) -> list[str]:
+    return get_universe_for_market(market)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PARQUET DATA LOADING
+# ══════════════════════════════════════════════════════════════════
+
+def load_data(
+    market: str,
+    data_dir: str = "data",
+    lookback_bars: int = 300,
+) -> BacktestDataSource:
+    parquet_path = Path(data_dir) / f"{market}_cash.parquet"
+    tickers = _get_tickers(market)
+    benchmark = BENCHMARKS.get(market)
+
+    plain = (
+        f"Market: {market}   Universe: {len(tickers)} tickers   "
+        f"Benchmark: {benchmark or 'none'}   File: {parquet_path}"
+    )
+    rich = (
+        f"[bold]Market:[/] {market}   "
+        f"[bold]Universe:[/] {len(tickers)} tickers   "
+        f"[bold]Benchmark:[/] {benchmark or 'none'}   "
+        f"[bold]File:[/] {parquet_path}"
+    )
+    _log_and_print(plain, rich)
+
+    ds = BacktestDataSource.from_parquet(
+        parquet_path=parquet_path,
+        tickers=tickers,
+        benchmark_ticker=benchmark,
+        lookback_bars=lookback_bars,
+    )
+
+    lo, hi = ds.get_date_range()
+    loaded = ds.get_tickers()
+
+    plain = (
+        f"Loaded {len(loaded)}/{len(tickers)} tickers  "
+        f"({lo.strftime('%Y-%m-%d')} -> {hi.strftime('%Y-%m-%d')})"
+    )
+    rich = (
+        f"[green]Loaded {len(loaded)}/{len(tickers)} tickers  "
+        f"({lo.strftime('%Y-%m-%d')} → {hi.strftime('%Y-%m-%d')})[/]"
+    )
+    _log_and_print(plain, rich)
+
+    if len(loaded) < len(tickers):
+        missing = set(tickers) - set(loaded)
+        preview = sorted(missing)[:15]
+        suffix = "..." if len(missing) > 15 else ""
+        plain = f"Missing {len(missing)} tickers: {preview}{suffix}"
+        rich = f"[yellow]Missing {len(missing)} tickers: {preview}{suffix}[/]"
+        _log_and_print(plain, rich, level=logging.WARNING)
+
+    return ds
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TWO CONFIGS TO COMPARE
+# ══════════════════════════════════════════════════════════════════
+
+from copy import deepcopy
+
+_ACTION_COMMON = {
+    "strong_buy": {
+        "min_percentile": 0.90, "min_score": 0.76, "score_above_entry": 0.08,
+        "min_rvol": 1.10, "requires_confirmation": True,
+        "requires_strong_context": True, "blocks_overextended": True,
+    },
+    "buy": {
+        "min_percentile": 0.65, "min_score": 0.62, "score_above_entry": 0.02,
+        "requires_confirmation": True, "requires_decent_momentum": True,
+        "blocks_weak_context": True,
+    },
+    "hold": {
+        "min_percentile": 0.35, "min_score": 0.54, "score_below_entry": 0.06,
+        "blocks_weak_context": True,
+    },
+    "sell": {
+        "floor_score": 0.50, "floor_percentile": 0.15,
+        "exit_score_below_entry": 0.05, "exit_percentile_floor": 0.20,
+    },
+    "strong_context": {
+        "breadth_regimes": ["strong"], "vol_regimes": ["calm"],
+        "min_leadership": 0.60,
+    },
+    "weak_context": {
+        "breadth_regimes": ["weak", "critical"], "vol_regimes": ["chaotic"],
+        "sector_regimes": ["lagging"],
+    },
+    "healthy_momentum": {
+        "allowed_rs": ["leading", "improving"], "blocked_sector": ["lagging"],
+        "min_rsi": 52, "min_adx": 22,
+    },
+    "decent_momentum": {
+        "allowed_rs": ["leading", "improving"],
+        "min_rsi": 45, "min_adx": 16,
+    },
+    "overextended": {"max_ema_pct": 0.045, "max_rsi": 74},
+    "conviction": {
+        "high_pct": 0.90, "high_score": 0.84,
+        "medium_pct": 0.60, "medium_score": 0.68,
+    },
+    "leadership_boost_weight": 0.10,
+}
+_VOL_COMMON = {
+    "atrp_window": 14, "realized_vol_window": 20,
+    "dispersion_window": 20, "gap_window": 20,
+    "calm_atrp_max": 0.035, "volatile_atrp_max": 0.060,
+    "calm_rvol_max": 0.28, "volatile_rvol_max": 0.42,
+    "volatile_gap_rate": 0.18, "chaotic_gap_rate": 0.28,
+    "calm_dispersion_max": 0.022, "volatile_dispersion_max": 0.040,
+    "score_weights": {"atrp": 0.35, "realized_vol": 0.35,
+                      "gap_rate": 0.15, "dispersion": 0.15},
+}
+
+_VOL_LOOSE = {**_VOL_COMMON, "chaotic_threshold": 0.75, "volatile_threshold": 0.35}
+_VOL_TIGHT = {**_VOL_COMMON, "chaotic_threshold": 0.70, "volatile_threshold": 0.30}
+_ROTATION_COMMON = {
+    "rs_sma_period": 50,
+    "rs_momentum_period": 20,
+    "smooth_span": 10,
+    "min_history": 60,
+}
+CONFIG_LOOSE = build_config_dict(
+    vol_regime_params=_VOL_LOOSE,
+    scoring_weights={"trend": 0.38, "participation": 0.22, "risk": 0.25, "regime": 0.15},
+    scoring_params={
+        "trend": {"w_stock_rs": 0.45, "w_sector_rs": 0.25, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
+        "participation": {"w_rvol": 0.35, "w_obv": 0.30, "w_adline": 0.20, "w_dollar_volume": 0.15},
+        "risk": {"w_vol_penalty": 0.35, "w_liquidity_penalty": 0.25, "w_gap_penalty": 0.20, "w_extension_penalty": 0.20},
+        "regime": {"w_breadth": 0.60, "w_vol_regime": 0.40},
+        "penalties": {
+            "rsi_soft_low": 38.0, "rsi_soft_high": 78.0, "adx_soft_min": 16.0,
+            "atrp_high": 0.07, "extension_warn": 0.12, "extension_bad": 0.22,
+            "illiquidity_bad": 0.015,
+        },
+    },
+    signal_params={
+        "base_entry_threshold": 0.58, "base_exit_threshold": 0.42,
+        "allowed_rs_regimes": ("leading", "improving"),
+        "blocked_sector_regimes": ("lagging",),
+        "hard_block_breadth_regimes": ("critical",),
+        "hard_block_vol_regimes": ("chaotic",),
+        "continuation_min_trend": 0.62, "pullback_min_trend": 0.68,
+        "pullback_max_short_extension": 0.04, "pullback_rsi_max": 58.0,
+        "cooldown_days": 4,
+        "rs_fail_penalty": 0.08,
+        "breadth_fail_penalty": 0.03,
+        "min_rank_pct": 0.80,
+        "relative_setup_rank_pct": 0.75,
+        "exit_rank_floor": 0.20,
+        "chaotic_exit_bump": 0.08,
+        "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10},
+        "breadth_entry_adjustment": {"strong": -0.02, "neutral": 0.00, "weak": 0.03, "critical": 0.08, "unknown": 0.00},
+        "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35},
+        # ── position sizing (loose — larger positions) ──
+        "position_base_pct": 0.04,
+        "position_range_pct": 0.08,
+        "position_max_pct": 0.12,
+        # ── pullback lower bound (loose — allows more stretched-down names) ──
+        "pullback_min_short_extension": -0.06,
+        # ── continuation participation floor (loose — lower bar) ──
+        "continuation_min_participation": 0.45,
+    },
+    convergence_params={
+        "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
+        "adjustments": {"calm": 0.04, "volatile": 0.02, "chaotic": 0.00},
+        # ── rotation recommendation mapping (loose — weakening = HOLD) ──
+        "rotation_rec_map": {
+            "leading": "STRONGBUY", "improving": "BUY",
+            "weakening": "HOLD", "lagging": "SELL",
+        },
+        "rotation_rec_default": "HOLD",
+    },
+    action_params=deepcopy(_ACTION_COMMON),
+    breadth_params={
+        "min_symbols": 5, "min_history": 55, "ema_span": 5,
+        "regime_strong": 0.62, "regime_moderate": 0.42, "regime_weak": 0.22,
+        "composite_weights": {
+            "pct_above_sma50": 0.30, "pct_above_sma200": 0.20,
+            "pct_above_sma20": 0.15, "pct_advancing": 0.15,
+            "net_new_highs": 0.20,
+        },
+    },
+    rotation_params=_ROTATION_COMMON,
+)
+CONFIG_TIGHT = build_config_dict(
+    vol_regime_params=_VOL_TIGHT,
+    scoring_weights={"trend": 0.36, "participation": 0.18, "risk": 0.26, "regime": 0.20},
+    scoring_params={
+        "trend": {"w_stock_rs": 0.42, "w_sector_rs": 0.28, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
+        "participation": {"w_rvol": 0.35, "w_obv": 0.25, "w_adline": 0.20, "w_dollar_volume": 0.20},
+        "risk": {"w_vol_penalty": 0.32, "w_liquidity_penalty": 0.23, "w_gap_penalty": 0.20, "w_extension_penalty": 0.25},
+        "regime": {"w_breadth": 0.65, "w_vol_regime": 0.35},
+        "penalties": {
+            "rsi_soft_low": 40.0, "rsi_soft_high": 76.0, "adx_soft_min": 18.0,
+            "atrp_high": 0.065, "extension_warn": 0.10, "extension_bad": 0.18,
+            "illiquidity_bad": 0.012,
+        },
+    },
+    signal_params={
+        "base_entry_threshold": 0.60, "base_exit_threshold": 0.44,
+        "allowed_rs_regimes": ("leading", "improving"),
+        "blocked_sector_regimes": ("lagging",),
+        "hard_block_breadth_regimes": ("critical",),
+        "hard_block_vol_regimes": ("chaotic",),
+        "continuation_min_trend": 0.64, "pullback_min_trend": 0.70,
+        "pullback_max_short_extension": 0.06, "pullback_rsi_max": 62.0,
+        "cooldown_days": 4,
+        "rs_fail_penalty": 0.12,
+        "breadth_fail_penalty": 0.06,
+        "min_rank_pct": 0.88,
+        "relative_setup_rank_pct": 0.82,
+        "exit_rank_floor": 0.30,
+        "chaotic_exit_bump": 0.12,
+        "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.04, "chaotic": 0.12},
+        "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.08, "critical": 0.14, "unknown": 0.03},
+        "size_multipliers": {"calm": 1.00, "volatile": 0.65, "chaotic": 0.30},
+        # ── position sizing (tight — smaller positions, lower cap) ──
+        "position_base_pct": 0.03,
+        "position_range_pct": 0.07,
+        "position_max_pct": 0.10,
+        # ── pullback lower bound (tight — narrower acceptable range) ──
+        "pullback_min_short_extension": -0.04,
+        # ── continuation participation floor (tight — higher bar) ──
+        "continuation_min_participation": 0.55,
+    },
+    convergence_params={
+        "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
+        "adjustments": {"calm": 0.04, "volatile": 0.01, "chaotic": 0.00},
+        # ── rotation recommendation mapping (tight — weakening = SELL) ──
+        "rotation_rec_map": {
+            "leading": "STRONGBUY", "improving": "BUY",
+            "weakening": "SELL", "lagging": "SELL",
+        },
+        "rotation_rec_default": "HOLD",
+    },
+    action_params=deepcopy(_ACTION_COMMON),
+    breadth_params={
+        "min_symbols": 5, "min_history": 55, "ema_span": 5,
+        "regime_strong": 0.68, "regime_moderate": 0.48, "regime_weak": 0.28,
+        "composite_weights": {
+            "pct_above_sma50": 0.30, "pct_above_sma200": 0.20,
+            "pct_above_sma20": 0.15, "pct_advancing": 0.15,
+            "net_new_highs": 0.20,
+        },
+    },
+    rotation_params=_ROTATION_COMMON,
+)
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Backtest config comparison against a market universe"
+    )
+    parser.add_argument(
+        "--market", required=True,
+        help="Market code as defined in common/universe.py  (e.g. HK, IN, US)",
+    )
+    parser.add_argument("--start", required=True, help="Start date  YYYY-MM-DD")
+    parser.add_argument("--end",   required=True, help="End date    YYYY-MM-DD")
+    parser.add_argument("--capital", type=float, default=1_000_000)
+    parser.add_argument("--max-positions", type=int, default=12)
+    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--lookback", type=int, default=300,
+                        help="Lookback bars for indicator warmup")
+    parser.add_argument(
+        "--name-a", default="Loose",
+        help="Display name for Config A",
+    )
+    parser.add_argument(
+        "--name-b", default="Tight",
+        help="Display name for Config B",
+    )
+    args = parser.parse_args()
+
+    # ── set up dual logging (file + console) ──────────────────
+    log_file = _setup_logging(args.market)
+
+    # ── log the full command / args ───────────────────────────
+    log.info("=" * 70)
+    log.info("Backtest started  market=%s  start=%s  end=%s", args.market, args.start, args.end)
+    log.info("capital=%.0f  max_positions=%d  lookback=%d", args.capital, args.max_positions, args.lookback)
+    log.info("name_a=%s  name_b=%s  data_dir=%s", args.name_a, args.name_b, args.data_dir)
+    log.info("Log file: %s", log_file)
+    log.info("=" * 70)
+
+    # ── load data ─────────────────────────────────────────────
+    console.rule(f"[bold cyan]Backtest: {args.market} market")
+    log.info("--- Loading data for %s market ---", args.market)
+    ds = load_data(args.market, args.data_dir, args.lookback)
+
+    # ── run both configs ──────────────────────────────────────
+    console.rule("[bold cyan]Running comparison")
+    log.info("--- Running comparison: %s vs %s ---", args.name_a, args.name_b)
+    ra, rb, comp = run_comparison(
+        data_source=ds,
+        market=args.market,
+        config_a=CONFIG_LOOSE,
+        config_b=CONFIG_TIGHT,
+        start_date=args.start,
+        end_date=args.end,
+        name_a=args.name_a,
+        name_b=args.name_b,
+        initial_capital=args.capital,
+        max_positions=args.max_positions,
+    )
+
+    # ── display ───────────────────────────────────────────────
+    console.print()
+    print_comparison(comp, args.name_a, args.name_b, console)
+
+    # Log comparison table to file as well
+    log.info("--- Comparison Table ---")
+    for _, row in comp.iterrows():
+        log.info("  %-30s  %s=%s  %s=%s",
+                 row.get("Metric", ""),
+                 args.name_a, row.get(args.name_a, ""),
+                 args.name_b, row.get(args.name_b, ""))
+
+    # ── summary ───────────────────────────────────────────────
+    bench_ret_a = ra.get("metrics", {}).get("benchmark_total_return", 0)
+    summary_lines = [
+        f"Market          : {args.market}",
+        f"Period          : {args.start} -> {args.end}",
+        f"Start capital   : ${args.capital:,.0f}",
+        f"Benchmark       : {BENCHMARKS.get(args.market, '?')}  ({bench_ret_a:+.1%})",
+        f"{args.name_a:15s} : ${ra['final_value']:,.0f}  (alpha {ra.get('metrics', {}).get('alpha', 0):+.1%})",
+        f"{args.name_b:15s} : ${rb['final_value']:,.0f}  (alpha {rb.get('metrics', {}).get('alpha', 0):+.1%})",
+    ]
+    for line in summary_lines:
+        _log_and_print(f"  {line}", f"  {line}")
+
+    # ── save ──────────────────────────────────────────────────
+    out = Path("backtest_results") / args.market
+    out.mkdir(parents=True, exist_ok=True)
+
+    comp.to_csv(out / "comparison.csv", index=False)
+
+    # Merge equity curves — include benchmark once
+    eq_a = ra["equity_curve"][["date", "value"]].rename(columns={"value": f"value_{args.name_a}"})
+    eq_b = rb["equity_curve"][["date", "value"]].rename(columns={"value": f"value_{args.name_b}"})
+    eq_bench = ra["equity_curve"][["date", "benchmark"]].rename(columns={"benchmark": "benchmark"})
+
+    eq = eq_a.merge(eq_b, on="date").merge(eq_bench, on="date")
+    eq.to_csv(out / "equity_curves.csv", index=False)
+
+    if not ra["trade_log"].empty:
+        ra["trade_log"].to_csv(out / f"trades_{args.name_a}.csv", index=False)
+    if not rb["trade_log"].empty:
+        rb["trade_log"].to_csv(out / f"trades_{args.name_b}.csv", index=False)
+
+    # ── daily log for debugging ───────────────────────────────
+    ra["daily_log"].to_csv(out / f"daily_{args.name_a}.csv", index=False)
+    rb["daily_log"].to_csv(out / f"daily_{args.name_b}.csv", index=False)
+
+    _log_and_print(
+        f"Results saved to {out}/",
+        f"\n[green]Results saved to {out}/[/]",
+    )
+    _log_and_print(
+        f"Log file: {log_file}",
+        f"[green]Log file: {log_file}[/]",
+    )
+    log.info("Backtest finished successfully.")
+
+
+if __name__ == "__main__":
+    main()
+
+################################
+"""
 backtest/phase2/compare.py
-Run two configs side-by-side and print a comparison table.
+Run two configs side-by-side and print a comparison table,
+including benchmark performance.
 """
 from __future__ import annotations
 
@@ -23,11 +509,10 @@ def build_config_dict(
     signal_params: dict,
     convergence_params: dict,
     action_params: dict | None = None,
+    breadth_params: dict | None = None,
+    rotation_params: dict | None = None,
 ) -> Dict[str, Any]:
-    """Bundle the config blocks into one dict for the engine.
-
-    Keys must match what run_pipeline_v2 reads via config.get(...).
-    """
+    """Bundle config blocks into one dict for the engine."""
     cfg = {
         "vol_regime_params": vol_regime_params,
         "scoring_weights": scoring_weights,
@@ -37,6 +522,10 @@ def build_config_dict(
     }
     if action_params is not None:
         cfg["action_params"] = action_params
+    if breadth_params is not None:
+        cfg["breadth_params"] = breadth_params
+    if rotation_params is not None:
+        cfg["rotation_params"] = rotation_params
     return cfg
 
 
@@ -108,6 +597,17 @@ _ROWS = [
     ("Avg Positions",          "avg_positions",        ".1f",  None),
     ("Buy Signals",            "total_buy_signals",    "d",    None),
     ("Sell Signals",           "total_sell_signals",   "d",    None),
+    ("SEP", None, None, None),
+    # ── Benchmark & relative metrics ──────────────────────────────
+    ("Benchmark Return",       "benchmark_total_return", ".1%", None),
+    ("Benchmark Ann. Return",  "benchmark_ann_return", ".1%",  None),
+    ("Benchmark Sharpe",       "benchmark_sharpe",     ".2f",  None),
+    ("Benchmark Max DD",       "benchmark_max_dd",     ".1%",  None),
+    ("SEP", None, None, None),
+    ("Alpha (Jensen)",         "alpha",                ".2%",  False),
+    ("Beta",                   "beta",                 ".2f",  None),
+    ("Tracking Error",         "tracking_error",       ".1%",  True),
+    ("Information Ratio",      "information_ratio",    ".2f",  False),
 ]
 
 
@@ -126,8 +626,7 @@ def _comparison_df(
         if lower_better is None:
             better = ""
         elif lower_better:
-            # for drawdown / vol: less negative is better
-            better = name_a if va > vb else name_b if vb > va else "Tie"
+            better = name_a if va < vb else name_b if vb < va else "Tie"
         else:
             better = name_a if va > vb else name_b if vb > va else "Tie"
 
@@ -171,7 +670,7 @@ def print_comparison(
 
     console.print(table)
 
-############################################
+###############################
 """
 backtest/phase2/data_source.py
 Date-aware data source wrapper for backtesting.
@@ -392,1152 +891,7 @@ def _find_column(df: pd.DataFrame, candidates: tuple) -> Optional[str]:
             return cols_lower[c]
     return None
 
-#############################################
-"""
-backtest/phase2/engine.py
-Core backtesting engine.
-
-Replays history day-by-day, runs the pipeline on each day's visible
-data, and feeds actions to the portfolio tracker.
-"""
-from __future__ import annotations
-
-import logging
-import pandas as pd
-from typing import Any, Dict, List
-
-from backtest.phase2.data_source import BacktestDataSource
-from backtest.phase2.tracker import PortfolioTracker
-
-log = logging.getLogger(__name__)
-
-
-class BacktestEngine:
-
-    def __init__(
-        self,
-        data_source: BacktestDataSource,
-        market: str,
-        config: Dict[str, Any],
-        start_date: str,
-        end_date: str,
-        initial_capital: float = 1_000_000.0,
-        max_positions: int = 12,
-        commission_rate: float = 0.0010,
-        slippage_rate: float = 0.0010,
-        config_name: str = "default",
-    ):
-        self.data_source = data_source
-        self.market = market
-        self.config = config
-        self.start_date = start_date
-        self.end_date = end_date
-        self.initial_capital = initial_capital
-        self.max_positions = max_positions
-        self.commission_rate = commission_rate
-        self.slippage_rate = slippage_rate
-        self.config_name = config_name
-
-        # result accumulators
-        self.daily_log: List[Dict] = []
-        self.equity_curve: List[tuple] = []
-        self.action_history: Dict = {}
-
-    # ==================================================================
-    #  MAIN LOOP
-    # ==================================================================
-    def run(self) -> Dict[str, Any]:
-        tickers = self.data_source.get_tickers()
-        trading_days = self.data_source.get_trading_days(
-            self.start_date, self.end_date
-        )
-        if not trading_days:
-            raise ValueError(
-                f"No trading days between {self.start_date} and {self.end_date}"
-            )
-
-        tracker = PortfolioTracker(
-            initial_capital=self.initial_capital,
-            max_positions=self.max_positions,
-            commission_rate=self.commission_rate,
-            slippage_rate=self.slippage_rate,
-        )
-
-        log.info(
-            "[%s] backtest %s -> %s  (%d days, %d tickers)",
-            self.config_name,
-            self.start_date,
-            self.end_date,
-            len(trading_days),
-            len(tickers),
-        )
-
-        prev_actions: Dict[str, str] = {}
-
-        for i, day in enumerate(trading_days):
-
-            # 1 — set visible data window ──────────────────────────
-            self.data_source.set_cutoff(day)
-
-            # 2 — run pipeline ─────────────────────────────────────
-            try:
-                output = self._run_pipeline(day, tickers)
-                actions = self._extract_actions(output)
-            except Exception as exc:
-                log.warning(
-                    "[%s] pipeline error %s: %s",
-                    self.config_name, day, exc,
-                )
-                actions = {}
-
-            # 3 — execute PREVIOUS day's signals at TODAY's open ───
-            prices_open = self._prices(day, tickers, field="open")
-            if i > 0 and prev_actions:
-                tracker.process_signals(day, prev_actions, prices_open)
-
-            # 4 — mark-to-market at close ──────────────────────────
-            prices_close = self._prices(day, tickers, field="close")
-            port_value = tracker.mark_to_market(day, prices_close)
-
-            # 5 — record ──────────────────────────────────────────
-            self.equity_curve.append((day, port_value))
-            self.daily_log.append(
-                {
-                    "date": day,
-                    "portfolio_value": port_value,
-                    "cash": tracker.cash,
-                    "n_positions": len(tracker.positions),
-                    "positions": list(tracker.positions.keys()),
-                    "n_buys": sum(
-                        1 for a in actions.values()
-                        if a in ("BUY", "STRONG_BUY")
-                    ),
-                    "n_sells": sum(
-                        1 for a in actions.values() if a == "SELL"
-                    ),
-                }
-            )
-            prev_actions = actions
-            self.action_history[day] = actions
-
-            if (i + 1) % 20 == 0 or i == len(trading_days) - 1:
-                log.info(
-                    "[%s] %d/%d  %s  $%s  pos=%d",
-                    self.config_name,
-                    i + 1,
-                    len(trading_days),
-                    day.strftime("%Y-%m-%d"),
-                    f"{port_value:,.0f}",
-                    len(tracker.positions),
-                )
-
-        # ── assemble results ──────────────────────────────────────
-        return {
-            "config_name": self.config_name,
-            "config": self.config,
-            "equity_curve": pd.DataFrame(
-                self.equity_curve, columns=["date", "value"]
-            ),
-            "daily_log": pd.DataFrame(self.daily_log),
-            "trade_log": (
-                pd.DataFrame(tracker.closed_trades)
-                if tracker.closed_trades
-                else pd.DataFrame()
-            ),
-            "final_value": (
-                self.equity_curve[-1][1]
-                if self.equity_curve
-                else self.initial_capital
-            ),
-            "initial_capital": self.initial_capital,
-            "open_positions": dict(tracker.positions),
-        }
-
-    # ==================================================================
-    #  >>> INTEGRATION POINT 1 — run the pipeline for one day <<<
-    # ==================================================================
-    def _run_pipeline(self, day, tickers) -> Dict:
-        """
-        Translate engine state into the arguments run_pipeline_v2
-        actually expects.
-        """
-        from refactor.pipeline_v2 import run_pipeline_v2
-
-        # 1 — build tradable_frames: {ticker: visible_df}
-        tradable_frames = {}
-        for t in tickers:
-            df = self.data_source.fetch(t)
-            if not df.empty:
-                tradable_frames[t] = df
-
-        # 2 — benchmark DataFrame via dedicated accessor
-        bench_df = self.data_source.fetch_benchmark()
-        if bench_df is None or bench_df.empty:
-            # fallback: try fetching benchmark by ticker name from
-            # ticker_data in case it was loaded as a regular ticker
-            bench_ticker = self.config.get("BENCH_TICKER", "SPY")
-            bench_df = self.data_source.fetch(bench_ticker)
-        if bench_df is None or bench_df.empty:
-            raise ValueError(
-                f"Benchmark returned empty frame on {day}. "
-                f"Ensure benchmark_ticker is set in "
-                f"BacktestDataSource.from_parquet()."
-            )
-
-        # 3 — breadth (optional — pipeline computes its own)
-        breadth_df = None
-
-        # 4 — leadership frames (optional)
-        leadership_frames = None
-        leadership_tickers = self.config.get("LEADERSHIP_TICKERS", None)
-        if leadership_tickers:
-            leadership_frames = {}
-            for t in leadership_tickers:
-                df = self.data_source.fetch(t)
-                if not df.empty:
-                    leadership_frames[t] = df
-
-        # 5 — pack config the way run_pipeline_v2 unpacks it
-        pipeline_config = {
-            "scoring_weights": self.config.get("SCORINGWEIGHTS_V2"),
-            "scoring_params": self.config.get("SCORINGPARAMS_V2"),
-            "signal_params": self.config.get("SIGNALPARAMS_V2"),
-            "convergence_params": self.config.get("CONVERGENCEPARAMS_V2"),
-            "action_params": self.config.get("ACTIONPARAMS_V2"),
-        }
-
-        # 6 — portfolio params (optional)
-        portfolio_params = self.config.get("PORTFOLIO_PARAMS", None)
-
-        return run_pipeline_v2(
-            tradable_frames=tradable_frames,
-            bench_df=bench_df,
-            breadth_df=breadth_df,
-            market=self.market,
-            leadership_frames=leadership_frames,
-            portfolio_params=portfolio_params,
-            config=pipeline_config,
-        )
-
-    # ==================================================================
-    #  >>> INTEGRATION POINT 2 — extract {ticker: action} from output <<<
-    # ==================================================================
-    def _extract_actions(self, output: Dict) -> Dict[str, str]:
-        """
-        Pull {ticker: action_string} from whatever the pipeline returns.
-        Tries keys: action_table, snapshot, actions — in that order.
-        """
-        actions: Dict[str, str] = {}
-
-        for key in ("action_table", "snapshot", "actions"):
-            if key not in output:
-                continue
-            df = output[key]
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-
-            # find action column
-            act_col = next(
-                (
-                    c
-                    for c in ("action_v2", "action", "signal")
-                    if c in df.columns
-                ),
-                None,
-            )
-            if act_col is None:
-                continue
-
-            # find ticker column or use index
-            if "ticker" in df.columns:
-                for _, row in df.iterrows():
-                    actions[row["ticker"]] = str(row[act_col]).upper()
-            else:
-                for ticker, row in df.iterrows():
-                    actions[str(ticker)] = str(row[act_col]).upper()
-            break
-
-        return actions
-
-    # ------------------------------------------------------------------
-    #  helpers
-    # ------------------------------------------------------------------
-    def _prices(
-        self, day, tickers, field: str = "open"
-    ) -> Dict[str, float]:
-        prices = {}
-        for t in tickers:
-            df = self.data_source.fetch(t)
-            if not df.empty and day in df.index:
-                prices[t] = float(df.loc[day, field])
-        return prices
-    
-###############################################################################
-
-"""
-backtest/phase2/metrics.py
-Performance metrics from backtest results.
-"""
-from __future__ import annotations
-
-import numpy as np
-import pandas as pd
-from typing import Any, Dict
-
-
-def compute_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
-    equity = results["equity_curve"].copy()
-    trades = results.get("trade_log", pd.DataFrame())
-    initial = results["initial_capital"]
-    final = results["final_value"]
-
-    # ── returns ───────────────────────────────────────────────────
-    total_ret = (final - initial) / initial
-    equity["daily_ret"] = equity["value"].pct_change()
-    daily = equity["daily_ret"].dropna()
-
-    n_days = len(equity)
-    ann_factor = 252 / max(n_days, 1)
-    ann_ret = (1 + total_ret) ** ann_factor - 1
-
-    # ── volatility ────────────────────────────────────────────────
-    ann_vol = daily.std() * np.sqrt(252)
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
-
-    down = daily[daily < 0]
-    down_vol = down.std() * np.sqrt(252) if len(down) > 0 else 0.001
-    sortino = ann_ret / down_vol
-
-    # ── drawdown ──────────────────────────────────────────────────
-    equity["peak"] = equity["value"].cummax()
-    equity["dd"] = (equity["value"] - equity["peak"]) / equity["peak"]
-    max_dd = equity["dd"].min()
-
-    in_dd = equity["dd"] < 0
-    if in_dd.any():
-        groups = (~in_dd).cumsum()
-        max_dd_dur = int(in_dd.groupby(groups).sum().max())
-    else:
-        max_dd_dur = 0
-
-    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0.0
-
-    # ── portfolio utilisation ─────────────────────────────────────
-    dl = results.get("daily_log", pd.DataFrame())
-    avg_pos = dl["n_positions"].mean() if not dl.empty else 0
-    max_pos = int(dl["n_positions"].max()) if not dl.empty else 0
-    total_buys = int(dl["n_buys"].sum()) if not dl.empty else 0
-    total_sells = int(dl["n_sells"].sum()) if not dl.empty else 0
-
-    # ── trade stats ───────────────────────────────────────────────
-    tm = _trade_metrics(trades)
-
-    return {
-        "total_return": total_ret,
-        "annualized_return": ann_ret,
-        "final_value": final,
-        "annualized_vol": ann_vol,
-        "sharpe_ratio": sharpe,
-        "sortino_ratio": sortino,
-        "max_drawdown": max_dd,
-        "max_dd_duration_days": max_dd_dur,
-        "calmar_ratio": calmar,
-        "avg_positions": avg_pos,
-        "max_positions_held": max_pos,
-        "trading_days": n_days,
-        "total_buy_signals": total_buys,
-        "total_sell_signals": total_sells,
-        **tm,
-    }
-
-
-# ------------------------------------------------------------------
-def _trade_metrics(trades: pd.DataFrame) -> Dict[str, Any]:
-    empty = {
-        "total_trades": 0,
-        "winning_trades": 0,
-        "losing_trades": 0,
-        "win_rate": 0.0,
-        "avg_win_pct": 0.0,
-        "avg_loss_pct": 0.0,
-        "profit_factor": 0.0,
-        "avg_pnl_pct": 0.0,
-        "median_pnl_pct": 0.0,
-        "avg_holding_days": 0.0,
-        "best_trade_pct": 0.0,
-        "worst_trade_pct": 0.0,
-        "expectancy_dollar": 0.0,
-    }
-    if trades.empty:
-        return empty
-
-    w = trades[trades["pnl"] > 0]
-    l = trades[trades["pnl"] <= 0]
-    n = len(trades)
-
-    gross_win = w["pnl"].sum() if not w.empty else 0.0
-    gross_loss = abs(l["pnl"].sum()) if not l.empty else 0.001
-
-    return {
-        "total_trades": n,
-        "winning_trades": len(w),
-        "losing_trades": len(l),
-        "win_rate": len(w) / n,
-        "avg_win_pct": w["pnl_pct"].mean() if not w.empty else 0.0,
-        "avg_loss_pct": l["pnl_pct"].mean() if not l.empty else 0.0,
-        "profit_factor": gross_win / gross_loss,
-        "avg_pnl_pct": trades["pnl_pct"].mean(),
-        "median_pnl_pct": trades["pnl_pct"].median(),
-        "avg_holding_days": trades["holding_days"].mean(),
-        "best_trade_pct": trades["pnl_pct"].max(),
-        "worst_trade_pct": trades["pnl_pct"].min(),
-        "expectancy_dollar": trades["pnl"].mean(),
-    }
-
-
-###################################################################
-"""
-backtest/phase2/run_backtest.py
-CLI entry point.
-
-    python -m backtest.run_backtest --market HK --start 2025-10-01 --end 2026-04-20
-    python -m backtest.run_backtest --market IN --start 2025-06-01 --end 2026-04-20
-    python -m backtest.run_backtest --market US --start 2025-06-01 --end 2026-04-20
-"""
-from __future__ import annotations
-
-import argparse
-import logging
-from datetime import datetime
-from pathlib import Path
-
-import pandas as pd
-from rich.console import Console
-
-from backtest.phase2.data_source import BacktestDataSource
-from backtest.phase2.compare import build_config_dict, run_comparison, print_comparison
-
-console = Console()
-log = logging.getLogger(__name__)
-
-# ══════════════════════════════════════════════════════════════════
-#  LOGGING SETUP
-# ══════════════════════════════════════════════════════════════════
-LOGS_DIR = Path("logs") / "backtest"
-
-
-def _setup_logging(market: str, level: int = logging.INFO) -> Path:
-    """
-    Configure the root logger to write to both:
-      • stderr   (concise, INFO+)
-      • file     (verbose, DEBUG+)
-
-    Returns the path to the log file.
-    """
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = LOGS_DIR / f"backtest_{market}_{timestamp}.log"
-
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-
-    # ── file handler (verbose) ────────────────────────────────
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    root.addHandler(fh)
-
-    # ── console handler (concise) ─────────────────────────────
-    ch = logging.StreamHandler()
-    ch.setLevel(level)
-    ch.setFormatter(logging.Formatter(
-        "%(asctime)s  %(message)s",
-        datefmt="%H:%M:%S",
-    ))
-    root.addHandler(ch)
-
-    return log_file
-
-
-def _log_and_print(msg: str, rich_msg: str | None = None, level: int = logging.INFO):
-    """Log a plain-text message AND print a (possibly styled) version to Rich console."""
-    log.log(level, msg)
-    console.print(rich_msg if rich_msg is not None else msg)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  UNIVERSE + BENCHMARK MAPPING
-# ══════════════════════════════════════════════════════════════════
-
-from common.universe import get_universe_for_market
-
-BENCHMARKS = {
-    "HK": "2800.HK",      # Tracker Fund of Hong Kong
-    "IN": "NIFTYBEES.NS",  # Nifty ETF (adjust to your universe)
-    "US": "SPY",           # S&P 500 ETF
-}
-
-
-def _get_tickers(market: str) -> list[str]:
-    """
-    Pull the ticker list from common/universe.py via get_universe_for_market().
-    Supports 'US', 'HK', and 'IN'.
-    """
-    return get_universe_for_market(market)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  PARQUET DATA LOADING
-# ══════════════════════════════════════════════════════════════════
-
-def load_data(
-    market: str,
-    data_dir: str = "data",
-    lookback_bars: int = 300,
-) -> BacktestDataSource:
-    """
-    Load from  data/{market}_cash.parquet  and filter to the
-    universe defined in common/universe.py.
-    """
-    parquet_path = Path(data_dir) / f"{market}_cash.parquet"
-    tickers = _get_tickers(market)
-    benchmark = BENCHMARKS.get(market)
-
-    plain = (
-        f"Market: {market}   Universe: {len(tickers)} tickers   "
-        f"Benchmark: {benchmark or 'none'}   File: {parquet_path}"
-    )
-    rich = (
-        f"[bold]Market:[/] {market}   "
-        f"[bold]Universe:[/] {len(tickers)} tickers   "
-        f"[bold]Benchmark:[/] {benchmark or 'none'}   "
-        f"[bold]File:[/] {parquet_path}"
-    )
-    _log_and_print(plain, rich)
-
-    ds = BacktestDataSource.from_parquet(
-        parquet_path=parquet_path,
-        tickers=tickers,
-        benchmark_ticker=benchmark,
-        lookback_bars=lookback_bars,
-    )
-
-    lo, hi = ds.get_date_range()
-    loaded = ds.get_tickers()
-
-    plain = (
-        f"Loaded {len(loaded)}/{len(tickers)} tickers  "
-        f"({lo.strftime('%Y-%m-%d')} -> {hi.strftime('%Y-%m-%d')})"
-    )
-    rich = (
-        f"[green]Loaded {len(loaded)}/{len(tickers)} tickers  "
-        f"({lo.strftime('%Y-%m-%d')} → {hi.strftime('%Y-%m-%d')})[/]"
-    )
-    _log_and_print(plain, rich)
-
-    if len(loaded) < len(tickers):
-        missing = set(tickers) - set(loaded)
-        preview = sorted(missing)[:15]
-        suffix = "..." if len(missing) > 15 else ""
-        plain = f"Missing {len(missing)} tickers: {preview}{suffix}"
-        rich = f"[yellow]Missing {len(missing)} tickers: {preview}{suffix}[/]"
-        _log_and_print(plain, rich, level=logging.WARNING)
-
-    return ds
-
-
-# ══════════════════════════════════════════════════════════════════
-#  TWO CONFIGS TO COMPARE
-# ══════════════════════════════════════════════════════════════════
-
-_VOL_COMMON = {
-    "atrp_window": 14, "realized_vol_window": 20,
-    "dispersion_window": 20, "gap_window": 20,
-    "calm_atrp_max": 0.035, "volatile_atrp_max": 0.060,
-    "calm_rvol_max": 0.28, "volatile_rvol_max": 0.42,
-    "volatile_gap_rate": 0.18, "chaotic_gap_rate": 0.28,
-    "calm_dispersion_max": 0.022, "volatile_dispersion_max": 0.040,
-    "score_weights": {"atrp": 0.35, "realized_vol": 0.35,
-                      "gap_rate": 0.15, "dispersion": 0.15},
-}
-
-CONFIG_LOOSE = build_config_dict(
-    vol_regime_params=_VOL_COMMON,
-    scoring_weights={"trend": 0.38, "participation": 0.22, "risk": 0.25, "regime": 0.15},
-    scoring_params={
-        "trend": {"w_stock_rs": 0.45, "w_sector_rs": 0.25, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
-        "participation": {"w_rvol": 0.35, "w_obv": 0.30, "w_adline": 0.20, "w_dollar_volume": 0.15},
-        "risk": {"w_vol_penalty": 0.35, "w_liquidity_penalty": 0.25, "w_gap_penalty": 0.20, "w_extension_penalty": 0.20},
-        "regime": {"w_breadth": 0.60, "w_vol_regime": 0.40},
-        "penalties": {
-            "rsi_soft_low": 38.0, "rsi_soft_high": 78.0, "adx_soft_min": 16.0,
-            "atrp_high": 0.07, "extension_warn": 0.12, "extension_bad": 0.22,
-            "illiquidity_bad": 0.015,
-        },
-    },
-    signal_params={
-        "base_entry_threshold": 0.58, "base_exit_threshold": 0.42,
-        "allowed_rs_regimes": ("leading", "improving"),
-        "blocked_sector_regimes": ("lagging",),
-        "hard_block_breadth_regimes": ("critical",),
-        "hard_block_vol_regimes": ("chaotic",),
-        "continuation_min_trend": 0.62, "pullback_min_trend": 0.68,
-        "pullback_max_short_extension": 0.04, "pullback_rsi_max": 58.0,
-        "cooldown_days": 4,
-        "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10},
-        "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.07, "critical": 0.12, "unknown": 0.00},
-        "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35},
-    },
-    convergence_params={
-        "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
-        "adjustments": {"calm": 0.04, "volatile": 0.02, "chaotic": 0.00},
-    },
-)
-
-CONFIG_TIGHT = build_config_dict(
-    vol_regime_params=_VOL_COMMON,
-    scoring_weights={"trend": 0.36, "participation": 0.18, "risk": 0.26, "regime": 0.20},
-    scoring_params={
-        "trend": {"w_stock_rs": 0.42, "w_sector_rs": 0.28, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
-        "participation": {"w_rvol": 0.35, "w_obv": 0.25, "w_adline": 0.20, "w_dollar_volume": 0.20},
-        "risk": {"w_vol_penalty": 0.32, "w_liquidity_penalty": 0.23, "w_gap_penalty": 0.20, "w_extension_penalty": 0.25},
-        "regime": {"w_breadth": 0.65, "w_vol_regime": 0.35},
-        "penalties": {
-            "rsi_soft_low": 40.0, "rsi_soft_high": 76.0, "adx_soft_min": 18.0,
-            "atrp_high": 0.065, "extension_warn": 0.10, "extension_bad": 0.18,
-            "illiquidity_bad": 0.012,
-        },
-    },
-    signal_params={
-        "base_entry_threshold": 0.60, "base_exit_threshold": 0.44,
-        "allowed_rs_regimes": ("leading", "improving"),
-        "blocked_sector_regimes": ("lagging",),
-        "hard_block_breadth_regimes": ("critical",),
-        "hard_block_vol_regimes": ("chaotic",),
-        "continuation_min_trend": 0.64, "pullback_min_trend": 0.70,
-        "pullback_max_short_extension": 0.06, "pullback_rsi_max": 62.0,
-        "cooldown_days": 4,
-        "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.04, "chaotic": 0.12},
-        "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.08, "critical": 0.14, "unknown": 0.03},
-        "size_multipliers": {"calm": 1.00, "volatile": 0.65, "chaotic": 0.30},
-    },
-    convergence_params={
-        "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
-        "adjustments": {"calm": 0.04, "volatile": 0.01, "chaotic": 0.00},
-    },
-)
-
-
-# ══════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Backtest config comparison against a market universe"
-    )
-    parser.add_argument(
-        "--market", required=True,
-        help="Market code as defined in common/universe.py  (e.g. HK, IN, US)",
-    )
-    parser.add_argument("--start", required=True, help="Start date  YYYY-MM-DD")
-    parser.add_argument("--end",   required=True, help="End date    YYYY-MM-DD")
-    parser.add_argument("--capital", type=float, default=1_000_000)
-    parser.add_argument("--max-positions", type=int, default=12)
-    parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--lookback", type=int, default=300,
-                        help="Lookback bars for indicator warmup")
-    parser.add_argument(
-        "--name-a", default="Loose",
-        help="Display name for Config A",
-    )
-    parser.add_argument(
-        "--name-b", default="Tight",
-        help="Display name for Config B",
-    )
-    args = parser.parse_args()
-
-    # ── set up dual logging (file + console) ──────────────────
-    log_file = _setup_logging(args.market)
-
-    # ── log the full command / args ───────────────────────────
-    log.info("=" * 70)
-    log.info("Backtest started  market=%s  start=%s  end=%s", args.market, args.start, args.end)
-    log.info("capital=%.0f  max_positions=%d  lookback=%d", args.capital, args.max_positions, args.lookback)
-    log.info("name_a=%s  name_b=%s  data_dir=%s", args.name_a, args.name_b, args.data_dir)
-    log.info("Log file: %s", log_file)
-    log.info("=" * 70)
-
-    # ── load data ─────────────────────────────────────────────
-    console.rule(f"[bold cyan]Backtest: {args.market} market")
-    log.info("--- Loading data for %s market ---", args.market)
-    ds = load_data(args.market, args.data_dir, args.lookback)
-
-    # ── run both configs ──────────────────────────────────────
-    console.rule("[bold cyan]Running comparison")
-    log.info("--- Running comparison: %s vs %s ---", args.name_a, args.name_b)
-    ra, rb, comp = run_comparison(
-        data_source=ds,
-        market=args.market,
-        config_a=CONFIG_LOOSE,
-        config_b=CONFIG_TIGHT,
-        start_date=args.start,
-        end_date=args.end,
-        name_a=args.name_a,
-        name_b=args.name_b,
-        initial_capital=args.capital,
-        max_positions=args.max_positions,
-    )
-
-    # ── display ───────────────────────────────────────────────
-    console.print()
-    print_comparison(comp, args.name_a, args.name_b, console)
-
-    # Log comparison table to file as well
-    log.info("--- Comparison Table ---")
-    for _, row in comp.iterrows():
-        log.info("  %-30s  %s=%s  %s=%s",
-                 row.get("metric", ""),
-                 args.name_a, row.get(args.name_a, ""),
-                 args.name_b, row.get(args.name_b, ""))
-
-    summary_lines = [
-        f"Market          : {args.market}",
-        f"Period          : {args.start} -> {args.end}",
-        f"Start capital   : ${args.capital:,.0f}",
-        f"{args.name_a:15s} : ${ra['final_value']:,.0f}",
-        f"{args.name_b:15s} : ${rb['final_value']:,.0f}",
-    ]
-    for line in summary_lines:
-        _log_and_print(f"  {line}", f"  {line}")
-
-    # ── save ──────────────────────────────────────────────────
-    out = Path("backtest_results") / args.market
-    out.mkdir(parents=True, exist_ok=True)
-
-    comp.to_csv(out / "comparison.csv", index=False)
-
-    eq = ra["equity_curve"].merge(
-        rb["equity_curve"], on="date", suffixes=(f"_{args.name_a}", f"_{args.name_b}")
-    )
-    eq.to_csv(out / "equity_curves.csv", index=False)
-
-    if not ra["trade_log"].empty:
-        ra["trade_log"].to_csv(out / f"trades_{args.name_a}.csv", index=False)
-    if not rb["trade_log"].empty:
-        rb["trade_log"].to_csv(out / f"trades_{args.name_b}.csv", index=False)
-
-    # ── daily log for debugging ───────────────────────────────
-    ra["daily_log"].to_csv(out / f"daily_{args.name_a}.csv", index=False)
-    rb["daily_log"].to_csv(out / f"daily_{args.name_b}.csv", index=False)
-
-    _log_and_print(
-        f"Results saved to {out}/",
-        f"\n[green]Results saved to {out}/[/]",
-    )
-    _log_and_print(
-        f"Log file: {log_file}",
-        f"[green]Log file: {log_file}[/]",
-    )
-    log.info("Backtest finished successfully.")
-
-
-if __name__ == "__main__":
-    main()
-
-
-#################################################
-"""
-backtest/phase2/tracker.py
-Virtual portfolio tracker.
-
-Manages cash, positions, trade execution (with slippage + commission),
-and records every completed round-trip for analysis.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List
-import logging
-
-log = logging.getLogger(__name__)
-
-
-# ------------------------------------------------------------------
-@dataclass
-class Position:
-    ticker: str
-    entry_date: object
-    entry_price: float
-    shares: int
-    cost_basis: float          # total cost including commission
-
-
-# ------------------------------------------------------------------
-class PortfolioTracker:
-
-    def __init__(
-        self,
-        initial_capital: float = 1_000_000.0,
-        max_positions: int = 12,
-        commission_rate: float = 0.0010,   # 10 bps per trade
-        slippage_rate: float = 0.0010,     # 10 bps per trade
-    ):
-        self.initial_capital = initial_capital
-        self.cash = initial_capital
-        self.max_positions = max_positions
-        self.commission_rate = commission_rate
-        self.slippage_rate = slippage_rate
-
-        self.positions: Dict[str, Position] = {}
-        self.closed_trades: List[Dict] = []
-
-    # ------------------------------------------------------------------
-    def process_signals(
-        self,
-        date,
-        actions: Dict[str, str],
-        prices: Dict[str, float],
-    ) -> None:
-        """
-        Execute one day's actions.  Sells run first (free up cash),
-        then buys fill up to max_positions.
-
-        Args:
-            date:    current date
-            actions: {ticker: "BUY" | "SELL" | "HOLD" | ...}
-            prices:  {ticker: open_price} for execution
-        """
-        # ── sells first ──────────────────────────────────────────
-        for ticker, action in actions.items():
-            if action == "SELL" and ticker in self.positions:
-                if ticker in prices:
-                    self._sell(date, ticker, prices[ticker])
-
-        # ── then buys ────────────────────────────────────────────
-        buy_tickers = [
-            t
-            for t, a in actions.items()
-            if a in ("BUY", "STRONG_BUY")
-            and t not in self.positions
-            and t in prices
-        ]
-        slots = self.max_positions - len(self.positions)
-        if slots <= 0 or not buy_tickers:
-            return
-
-        for ticker in buy_tickers[:slots]:
-            self._buy(date, ticker, prices[ticker])
-
-    # ------------------------------------------------------------------
-    def _buy(self, date, ticker: str, raw_price: float) -> None:
-        exec_price = raw_price * (1 + self.slippage_rate)
-
-        target_value = min(
-            self.initial_capital / self.max_positions,
-            self.cash * 0.95,                          # keep 5 % buffer
-        )
-        if target_value < 1_000:
-            return
-
-        shares = int(target_value / exec_price)
-        if shares <= 0:
-            return
-
-        cost = shares * exec_price
-        commission = cost * self.commission_rate
-        total = cost + commission
-        if total > self.cash:
-            return
-
-        self.cash -= total
-        self.positions[ticker] = Position(
-            ticker=ticker,
-            entry_date=date,
-            entry_price=exec_price,
-            shares=shares,
-            cost_basis=total,
-        )
-        log.debug(
-            "BUY  %s  %d @ %.3f  cost $%,.0f  comm $%.0f",
-            ticker, shares, exec_price, cost, commission,
-        )
-
-    # ------------------------------------------------------------------
-    def _sell(self, date, ticker: str, raw_price: float) -> None:
-        pos = self.positions.get(ticker)
-        if pos is None:
-            return
-
-        exec_price = raw_price * (1 - self.slippage_rate)
-        proceeds = pos.shares * exec_price
-        commission = proceeds * self.commission_rate
-        net = proceeds - commission
-
-        pnl = net - pos.cost_basis
-        pnl_pct = pnl / pos.cost_basis
-        held = (date - pos.entry_date).days
-
-        self.cash += net
-        del self.positions[ticker]
-
-        self.closed_trades.append(
-            {
-                "ticker": ticker,
-                "entry_date": pos.entry_date,
-                "exit_date": date,
-                "entry_price": pos.entry_price,
-                "exit_price": exec_price,
-                "shares": pos.shares,
-                "cost_basis": pos.cost_basis,
-                "net_proceeds": net,
-                "pnl": pnl,
-                "pnl_pct": pnl_pct,
-                "holding_days": held,
-            }
-        )
-        log.debug(
-            "SELL %s  %d @ %.3f  PnL $%,.0f (%+.1f%%)  held %dd",
-            ticker, pos.shares, exec_price, pnl, pnl_pct * 100, held,
-        )
-
-    # ------------------------------------------------------------------
-    def mark_to_market(
-        self, date, close_prices: Dict[str, float]
-    ) -> float:
-        """Total portfolio value at today's close."""
-        pos_val = sum(
-            close_prices.get(t, p.entry_price) * p.shares
-            for t, p in self.positions.items()
-        )
-        return self.cash + pos_val
-
-############################################################
-"""
-backtest/phase2/data_source.py
-Date-aware data source wrapper for backtesting.
-
-Loads from a single parquet file per market (data/{market}_cash.parquet),
-filters to a given ticker universe, and presents a sliding window up to
-the current backtest date.
-
-Expected parquet schema (long format):
-    date | ticker | open | high | low | close | volume
-
-The 'date' column should be parseable as datetime.  Column names are
-normalised to lowercase on load.  If the parquet uses 'symbol' instead
-of 'ticker', that works too.
-"""
-from __future__ import annotations
-
-import logging
-from pathlib import Path
-from typing import Dict, List, Optional
-
-import pandas as pd
-
-log = logging.getLogger(__name__)
-
-
-class BacktestDataSource:
-
-    def __init__(
-        self,
-        ticker_data: Dict[str, pd.DataFrame],
-        benchmark_data: Optional[pd.DataFrame] = None,
-        lookback_bars: int = 300,
-    ):
-        self.ticker_data = ticker_data
-        self.benchmark_data = benchmark_data
-        self.lookback_bars = lookback_bars
-        self._cutoff: Optional[pd.Timestamp] = None
-
-    # ==================================================================
-    #  Factory — build from parquet + universe list
-    # ==================================================================
-    @classmethod
-    def from_parquet(
-        cls,
-        parquet_path: str | Path,
-        tickers: List[str],
-        benchmark_ticker: Optional[str] = None,
-        lookback_bars: int = 300,
-    ) -> "BacktestDataSource":
-        """
-        Load ``data/{market}_cash.parquet`` and split into per-ticker
-        DataFrames keyed by ticker with a DatetimeIndex.
-
-        Args:
-            parquet_path:     Path to the parquet file.
-            tickers:          Universe tickers to keep.
-            benchmark_ticker: e.g. "2800.HK".  Looked up in the same
-                              parquet; ignored if not found.
-            lookback_bars:    Max bars per fetch() call.
-        """
-        path = Path(parquet_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Parquet file not found: {path}")
-
-        raw = pd.read_parquet(path)
-        raw.columns = raw.columns.str.strip().str.lower()
-
-        # ── normalise ticker column ──────────────────────────────
-        ticker_col = _find_column(raw, ("ticker", "symbol", "code", "stock"))
-        if ticker_col is None:
-            raise KeyError(
-                f"Cannot find a ticker/symbol column in {path}.  "
-                f"Columns present: {list(raw.columns)}"
-            )
-
-        # ── normalise date column / index ────────────────────────
-        date_col = _find_column(raw, ("date", "datetime", "timestamp", "time"))
-        if date_col is not None:
-            raw[date_col] = pd.to_datetime(raw[date_col])
-        elif isinstance(raw.index, pd.DatetimeIndex):
-            raw = raw.reset_index()
-            date_col = raw.columns[0]  # the old index name
-        else:
-            raise KeyError(
-                f"Cannot find a date column in {path}.  "
-                f"Columns present: {list(raw.columns)}"
-            )
-
-        # ── normalise OHLCV column names ─────────────────────────
-        rename_map = {}
-        for target, candidates in [
-            ("open",   ("open", "o")),
-            ("high",   ("high", "h")),
-            ("low",    ("low", "l")),
-            ("close",  ("close", "c", "adj close", "adj_close", "adjclose")),
-            ("volume", ("volume", "vol", "v")),
-        ]:
-            found = _find_column(raw, candidates)
-            if found and found != target:
-                rename_map[found] = target
-        if rename_map:
-            raw = raw.rename(columns=rename_map)
-
-        needed = {"open", "high", "low", "close", "volume"}
-        missing = needed - set(raw.columns)
-        if missing:
-            raise KeyError(f"Missing OHLCV columns after rename: {missing}")
-
-        # ── filter to universe tickers ───────────────────────────
-        all_tickers_in_file = set(raw[ticker_col].unique())
-        want = set(tickers)
-        if benchmark_ticker:
-            want.add(benchmark_ticker)
-
-        found_tickers = want & all_tickers_in_file
-        not_found = want - all_tickers_in_file
-        if not_found:
-            log.warning(
-                "%d tickers not in parquet and will be skipped: %s",
-                len(not_found),
-                sorted(not_found)[:20],
-            )
-
-        raw = raw[raw[ticker_col].isin(found_tickers)].copy()
-        raw = raw.sort_values([ticker_col, date_col])
-
-        # ── split into {ticker: DataFrame} ───────────────────────
-        ticker_data: Dict[str, pd.DataFrame] = {}
-        benchmark_data: Optional[pd.DataFrame] = None
-
-        for tkr, group in raw.groupby(ticker_col):
-            df = (
-                group.set_index(date_col)[["open", "high", "low", "close", "volume"]]
-                .sort_index()
-                .copy()
-            )
-            df.index.name = "date"
-            # drop exact duplicate indices if any
-            df = df[~df.index.duplicated(keep="last")]
-            ticker_data[tkr] = df
-
-            if tkr == benchmark_ticker:
-                benchmark_data = df.copy()
-
-        log.info(
-            "Loaded %d tickers from %s  (date range %s → %s)",
-            len(ticker_data),
-            path.name,
-            raw[date_col].min().strftime("%Y-%m-%d"),
-            raw[date_col].max().strftime("%Y-%m-%d"),
-        )
-
-        return cls(
-            ticker_data=ticker_data,
-            benchmark_data=benchmark_data,
-            lookback_bars=lookback_bars,
-        )
-
-    # ==================================================================
-    #  Cutoff management
-    # ==================================================================
-    def set_cutoff(self, dt) -> None:
-        self._cutoff = pd.Timestamp(dt)
-
-    # ==================================================================
-    #  Data access
-    # ==================================================================
-    def fetch(self, ticker: str) -> pd.DataFrame:
-        if ticker not in self.ticker_data:
-            return pd.DataFrame()
-        df = self.ticker_data[ticker]
-        if self._cutoff is not None:
-            df = df.loc[df.index <= self._cutoff]
-        if len(df) > self.lookback_bars:
-            df = df.iloc[-self.lookback_bars:]
-        return df.copy()
-
-    def fetch_benchmark(self) -> pd.DataFrame:
-        if self.benchmark_data is None:
-            return pd.DataFrame()
-        df = self.benchmark_data
-        if self._cutoff is not None:
-            df = df.loc[df.index <= self._cutoff]
-        if len(df) > self.lookback_bars:
-            df = df.iloc[-self.lookback_bars:]
-        return df.copy()
-
-    def get_tickers(self) -> List[str]:
-        return list(self.ticker_data.keys())
-
-    def get_trading_days(self, start: str, end: str) -> List[pd.Timestamp]:
-        all_dates: set = set()
-        for df in self.ticker_data.values():
-            all_dates.update(df.index.tolist())
-        s, e = pd.Timestamp(start), pd.Timestamp(end)
-        return sorted(d for d in all_dates if s <= d <= e)
-
-    def get_date_range(self) -> tuple:
-        """Min and max dates across all loaded tickers."""
-        lo, hi = pd.Timestamp.max, pd.Timestamp.min
-        for df in self.ticker_data.values():
-            if not df.empty:
-                lo = min(lo, df.index.min())
-                hi = max(hi, df.index.max())
-        return lo, hi
-
-
-# ------------------------------------------------------------------
-#  helpers
-# ------------------------------------------------------------------
-
-def _find_column(df: pd.DataFrame, candidates: tuple) -> Optional[str]:
-    """Return the first column name from *candidates* present in df."""
-    cols_lower = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c in cols_lower:
-            return cols_lower[c]
-    return None
-
-####################
+###############################
 """backtest/phase2/diagnostics.py
 
 Drop-in signal diagnostics. Wire into your engine's day loop
@@ -1874,8 +1228,7 @@ class SignalDiagnostics:
 
         logger.info(f"[{self.name}] {'=' * 60}")
 
-##########
-
+##########################
 """
 backtest/phase2/engine.py
 Core backtesting engine.
@@ -2090,6 +1443,11 @@ class BacktestEngine:
         """
         Translate engine state into the arguments run_pipeline_v2
         actually expects.
+
+        Config keys are lowercase throughout (vol_regime_params,
+        scoring_weights, scoring_params, signal_params,
+        convergence_params, action_params).  build_config_dict()
+        in compare.py produces the same keys.
         """
         from refactor.pipeline_v2 import run_pipeline_v2
 
@@ -2103,7 +1461,7 @@ class BacktestEngine:
         # 2 — benchmark DataFrame via dedicated accessor
         bench_df = self.data_source.fetch_benchmark()
         if bench_df is None or bench_df.empty:
-            bench_ticker = self.config.get("BENCH_TICKER", "SPY")
+            bench_ticker = self.config.get("bench_ticker", "SPY")
             bench_df = self.data_source.fetch(bench_ticker)
         if bench_df is None or bench_df.empty:
             raise ValueError(
@@ -2117,7 +1475,7 @@ class BacktestEngine:
 
         # 4 — leadership frames (optional)
         leadership_frames = None
-        leadership_tickers = self.config.get("LEADERSHIP_TICKERS", None)
+        leadership_tickers = self.config.get("leadership_tickers", None)
         if leadership_tickers:
             leadership_frames = {}
             for t in leadership_tickers:
@@ -2125,17 +1483,19 @@ class BacktestEngine:
                 if not df.empty:
                     leadership_frames[t] = df
 
-        # 5 — pack config the way run_pipeline_v2 unpacks it
+        # 5 — pass config straight through; keys already match
+        #     what run_pipeline_v2 reads via config.get(...)
         pipeline_config = {
-            "scoring_weights": self.config.get("SCORINGWEIGHTS_V2"),
-            "scoring_params": self.config.get("SCORINGPARAMS_V2"),
-            "signal_params": self.config.get("SIGNALPARAMS_V2"),
-            "convergence_params": self.config.get("CONVERGENCEPARAMS_V2"),
-            "action_params": self.config.get("ACTIONPARAMS_V2"),
+            "vol_regime_params":  self.config.get("vol_regime_params"),
+            "scoring_weights":    self.config.get("scoring_weights"),
+            "scoring_params":     self.config.get("scoring_params"),
+            "signal_params":      self.config.get("signal_params"),
+            "convergence_params": self.config.get("convergence_params"),
+            "action_params":      self.config.get("action_params"),
         }
 
         # 6 — portfolio params (optional)
-        portfolio_params = self.config.get("PORTFOLIO_PARAMS", None)
+        portfolio_params = self.config.get("portfolio_params", None)
 
         return run_pipeline_v2(
             tradable_frames=tradable_frames,
@@ -2197,8 +1557,222 @@ class BacktestEngine:
             if not df.empty and day in df.index:
                 prices[t] = float(df.loc[day, field])
         return prices
+    
+#############################################
+"""
+backtest/phase2/metrics.py
+Performance metrics from backtest results, including benchmark comparison.
+"""
+from __future__ import annotations
 
-###############
+import numpy as np
+import pandas as pd
+from typing import Any, Dict
+
+
+def compute_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
+    equity = results["equity_curve"].copy()
+    trades = results.get("trade_log", pd.DataFrame())
+    initial = results["initial_capital"]
+    final = results["final_value"]
+
+    # ── returns ───────────────────────────────────────────────────
+    total_ret = (final - initial) / initial
+    equity["daily_ret"] = equity["value"].pct_change()
+    daily = equity["daily_ret"].dropna()
+
+    n_days = len(equity)
+    ann_factor = 252 / max(n_days, 1)
+    ann_ret = (1 + total_ret) ** ann_factor - 1
+
+    # ── volatility ────────────────────────────────────────────────
+    ann_vol = daily.std() * np.sqrt(252)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+
+    down = daily[daily < 0]
+    down_vol = down.std() * np.sqrt(252) if len(down) > 0 else 0.001
+    sortino = ann_ret / down_vol
+
+    # ── drawdown ──────────────────────────────────────────────────
+    equity["peak"] = equity["value"].cummax()
+    equity["dd"] = (equity["value"] - equity["peak"]) / equity["peak"]
+    max_dd = equity["dd"].min()
+
+    in_dd = equity["dd"] < 0
+    if in_dd.any():
+        groups = (~in_dd).cumsum()
+        max_dd_dur = int(in_dd.groupby(groups).sum().max())
+    else:
+        max_dd_dur = 0
+
+    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0.0
+
+    # ── portfolio utilisation ─────────────────────────────────────
+    dl = results.get("daily_log", pd.DataFrame())
+    avg_pos = dl["n_positions"].mean() if not dl.empty else 0
+    max_pos = int(dl["n_positions"].max()) if not dl.empty else 0
+    total_buys = int(dl["n_buys"].sum()) if not dl.empty else 0
+    total_sells = int(dl["n_sells"].sum()) if not dl.empty else 0
+
+    # ── trade stats ───────────────────────────────────────────────
+    tm = _trade_metrics(trades)
+
+    # ── benchmark comparison ──────────────────────────────────────
+    bm = _benchmark_metrics(equity, ann_ret, ann_factor)
+
+    return {
+        "total_return": total_ret,
+        "annualized_return": ann_ret,
+        "final_value": final,
+        "annualized_vol": ann_vol,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown": max_dd,
+        "max_dd_duration_days": max_dd_dur,
+        "calmar_ratio": calmar,
+        "avg_positions": avg_pos,
+        "max_positions_held": max_pos,
+        "trading_days": n_days,
+        "total_buy_signals": total_buys,
+        "total_sell_signals": total_sells,
+        **tm,
+        **bm,
+    }
+
+
+# ------------------------------------------------------------------
+def _benchmark_metrics(
+    equity: pd.DataFrame,
+    strategy_ann_ret: float,
+    ann_factor: float,
+) -> Dict[str, Any]:
+    """
+    Compute benchmark return and relative metrics (alpha, beta,
+    tracking error, information ratio) from the equity DataFrame.
+
+    Expects columns: 'value', 'benchmark'.
+    """
+    defaults = {
+        "benchmark_total_return": 0.0,
+        "benchmark_ann_return": 0.0,
+        "benchmark_ann_vol": 0.0,
+        "benchmark_sharpe": 0.0,
+        "benchmark_max_dd": 0.0,
+        "alpha": 0.0,
+        "beta": 0.0,
+        "tracking_error": 0.0,
+        "information_ratio": 0.0,
+    }
+
+    if "benchmark" not in equity.columns:
+        return defaults
+
+    bench = equity["benchmark"]
+    if bench.isna().all():
+        return defaults
+
+    # Forward-fill any gaps, then drop remaining NaNs
+    bench = bench.ffill()
+    valid = equity[["value", "benchmark"]].dropna()
+    if len(valid) < 10:
+        return defaults
+
+    bench_initial = valid["benchmark"].iloc[0]
+    bench_final = valid["benchmark"].iloc[-1]
+    bench_total_ret = (bench_final - bench_initial) / bench_initial if bench_initial > 0 else 0.0
+    bench_ann_ret = (1 + bench_total_ret) ** ann_factor - 1
+
+    # Daily returns for both
+    combined = pd.DataFrame({
+        "port_ret": valid["value"].pct_change(),
+        "bench_ret": valid["benchmark"].pct_change(),
+    }).dropna()
+
+    if len(combined) < 5:
+        return {**defaults, "benchmark_total_return": bench_total_ret, "benchmark_ann_return": bench_ann_ret}
+
+    bench_ann_vol = combined["bench_ret"].std() * np.sqrt(252)
+    bench_sharpe = bench_ann_ret / bench_ann_vol if bench_ann_vol > 0 else 0.0
+
+    # Benchmark drawdown
+    bench_peak = valid["benchmark"].cummax()
+    bench_dd = (valid["benchmark"] - bench_peak) / bench_peak
+    bench_max_dd = bench_dd.min()
+
+    # Excess returns
+    excess = combined["port_ret"] - combined["bench_ret"]
+    tracking_error = excess.std() * np.sqrt(252) if len(excess) > 1 else 0.0
+
+    # Beta = Cov(Rp, Rb) / Var(Rb)
+    bench_var = combined["bench_ret"].var()
+    if bench_var > 0:
+        beta = combined[["port_ret", "bench_ret"]].cov().iloc[0, 1] / bench_var
+    else:
+        beta = 0.0
+
+    # Jensen's alpha
+    alpha = strategy_ann_ret - beta * bench_ann_ret
+
+    # Information ratio
+    info_ratio = (strategy_ann_ret - bench_ann_ret) / tracking_error if tracking_error > 0 else 0.0
+
+    return {
+        "benchmark_total_return": bench_total_ret,
+        "benchmark_ann_return": bench_ann_ret,
+        "benchmark_ann_vol": bench_ann_vol,
+        "benchmark_sharpe": bench_sharpe,
+        "benchmark_max_dd": bench_max_dd,
+        "alpha": alpha,
+        "beta": beta,
+        "tracking_error": tracking_error,
+        "information_ratio": info_ratio,
+    }
+
+
+# ------------------------------------------------------------------
+def _trade_metrics(trades: pd.DataFrame) -> Dict[str, Any]:
+    empty = {
+        "total_trades": 0,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "win_rate": 0.0,
+        "avg_win_pct": 0.0,
+        "avg_loss_pct": 0.0,
+        "profit_factor": 0.0,
+        "avg_pnl_pct": 0.0,
+        "median_pnl_pct": 0.0,
+        "avg_holding_days": 0.0,
+        "best_trade_pct": 0.0,
+        "worst_trade_pct": 0.0,
+        "expectancy_dollar": 0.0,
+    }
+    if trades.empty:
+        return empty
+
+    w = trades[trades["pnl"] > 0]
+    l = trades[trades["pnl"] <= 0]
+    n = len(trades)
+
+    gross_win = w["pnl"].sum() if not w.empty else 0.0
+    gross_loss = abs(l["pnl"].sum()) if not l.empty else 0.001
+
+    return {
+        "total_trades": n,
+        "winning_trades": len(w),
+        "losing_trades": len(l),
+        "win_rate": len(w) / n,
+        "avg_win_pct": w["pnl_pct"].mean() if not w.empty else 0.0,
+        "avg_loss_pct": l["pnl_pct"].mean() if not l.empty else 0.0,
+        "profit_factor": gross_win / gross_loss,
+        "avg_pnl_pct": trades["pnl_pct"].mean(),
+        "median_pnl_pct": trades["pnl_pct"].median(),
+        "avg_holding_days": trades["holding_days"].mean(),
+        "best_trade_pct": trades["pnl_pct"].max(),
+        "worst_trade_pct": trades["pnl_pct"].min(),
+        "expectancy_dollar": trades["pnl"].mean(),
+    }
+
+##############################
 """
 backtest/phase2/tracker.py
 Virtual portfolio tracker.
@@ -2359,5 +1933,3 @@ class PortfolioTracker:
             for t, p in self.positions.items()
         )
         return self.cash + pos_val
-
-#########################

@@ -1,4 +1,4 @@
-""" refactor/pipeline_v2.py """
+"""refactor/pipeline_v2.py"""
 from __future__ import annotations
 
 import logging
@@ -9,17 +9,33 @@ import pandas as pd
 
 from compute.indicators import compute_all_indicators
 
-from common.sector_map import get_sector_or_class                           # ← NEW
+from common.sector_map import get_sector_or_class
 
 from .strategy.adapters_v2 import ensure_columns
 from .strategy.breadth_v2 import compute_breadth
-from .strategy.portfolio_v2 import build_portfolio_v2
+from .strategy.portfolio_v2 import (
+    build_portfolio_v2,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_MAX_SECTOR_WEIGHT,
+    DEFAULT_MAX_THEME_NAMES,
+    DEFAULT_MAX_SINGLE_WEIGHT,
+    DEFAULT_MIN_WEIGHT,
+)
 from .strategy.regime_v2 import classify_volatility_regime
-from .strategy.rotation_v2 import compute_sector_rotation                   # ← NEW
+from .strategy.rotation_v2 import compute_sector_rotation
 from .strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
 from .strategy.scoring_v2 import compute_composite_v2
 from .strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
-from refactor.common.config_refactor import ACTIONPARAMS_V2
+from refactor.common.config_refactor import (
+    VOLREGIMEPARAMS,
+    SCORINGWEIGHTS_V2,
+    SCORINGPARAMS_V2,
+    SIGNALPARAMS_V2,
+    CONVERGENCEPARAMS_V2,
+    ACTIONPARAMS_V2,
+    BREADTHPARAMS,          # ← NEW
+    ROTATIONPARAMS,         # ← NEW
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +65,6 @@ def _is_missing_value(value) -> bool:
 
 
 def _classify_breadth_regime(breadth_df: pd.DataFrame | None) -> dict:
-    """Extract last-row breadth context including dispersion fields."""
     if breadth_df is None or breadth_df.empty:
         return {
             "breadth_regime": "unknown",
@@ -102,12 +117,6 @@ def _canonicalize_indicator_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fill_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute critical indicators as fallbacks when ``compute_all_indicators``
-    did not produce them.  Only creates columns that are completely absent
-    after canonicalization so that existing (possibly partial) series from
-    the indicator library are never overwritten.
-    """
     out = df.copy()
     close = (
         pd.to_numeric(out["close"], errors="coerce")
@@ -117,14 +126,12 @@ def _fill_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if close is None or int(close.notna().sum()) < 20:
         return out
 
-    # realizedvol20d — annualised 20-day rolling std of log returns
     if "realizedvol20d" not in out.columns:
         log_ret = np.log(close / close.shift(1))
         out["realizedvol20d"] = (
             log_ret.rolling(20, min_periods=15).std() * np.sqrt(252)
         )
 
-    # gaprate20 — fraction of last 20 days with |overnight gap| > 0.5%
     if "gaprate20" not in out.columns and "open" in out.columns:
         open_ = pd.to_numeric(out["open"], errors="coerce")
         gap_pct = (open_ / close.shift(1) - 1.0).abs()
@@ -132,7 +139,6 @@ def _fill_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
             (gap_pct > 0.005).astype(float).rolling(20, min_periods=15).mean()
         )
 
-    # atr14pct — ATR(14) as a fraction of the closing price
     if "atr14pct" not in out.columns and all(
         c in out.columns for c in ("high", "low")
     ):
@@ -151,7 +157,6 @@ def _fill_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# top of the module that contains annotate_scoreability
 _dispersion_warned: set[tuple[str, ...]] = set()
 
 
@@ -168,7 +173,6 @@ def annotate_scoreability(df: pd.DataFrame) -> pd.DataFrame:
     required_cols = [c for c in CRITICAL_SCORE_COLUMNS_V2 if c in out.columns]
     unavailable_required = [c for c in CRITICAL_SCORE_COLUMNS_V2 if c not in out.columns]
 
-    # ── warn ONCE if all dispersion proxies are NaN ───────────
     if available_optional:
         all_optional_nan = all(out[c].isna().all() for c in available_optional)
         if all_optional_nan:
@@ -191,7 +195,6 @@ def annotate_scoreability(df: pd.DataFrame) -> pd.DataFrame:
     for _, row in out.iterrows():
         row_missing = [c for c in required_cols if _is_missing_value(row.get(c))]
         row_missing.extend(unavailable_required)
-
         row_missing = list(dict.fromkeys(row_missing))
         is_scoreable = len(row_missing) == 0
 
@@ -224,7 +227,6 @@ def _build_leadership_snapshot(leadership_frames: dict[str, pd.DataFrame]) -> pd
         prepared = _prepare_frame(df)
         row = prepared.iloc[-1].to_dict()
         row["ticker"] = ticker
-        # ── resolve sector from sector_map if not already set ─────────  # ← NEW
         if not row.get("sector") or row["sector"] == "Unknown":
             row["sector"] = get_sector_or_class(ticker)
         row["sector"] = row.get("sector") or "Unknown"
@@ -332,8 +334,6 @@ def _add_score_percentiles(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _log_action_diagnostics(out: pd.DataFrame, params: dict) -> None:
-    """Log detailed diagnostics for the action decision. All thresholds
-    are read from *params* so diagnostics always match the actual logic."""
     if out.empty:
         logger.info("Action diagnostics skipped because input frame is empty")
         return
@@ -503,9 +503,6 @@ def _log_action_diagnostics(out: pd.DataFrame, params: dict) -> None:
 
 
 def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
-    """Translate scored/signaled rows into actionable recommendations.
-    Every threshold is read from *params* (falling back to ACTIONPARAMS_V2)
-    so the caller can tune behaviour entirely from config_refactor."""
     ap = params if params is not None else ACTIONPARAMS_V2
 
     out = _add_score_percentiles(df.copy())
@@ -516,7 +513,6 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         out["action_sort_key_v2"] = pd.Series(dtype=float)
         return out
 
-    # ── unpack config tiers ──────────────────────────────────────────
     sb = ap["strong_buy"]
     bu = ap["buy"]
     ho = ap["hold"]
@@ -541,7 +537,6 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         dm["allowed_rs"], dm["min_rsi"], dm["min_adx"],
     )
 
-    # ── extract series ───────────────────────────────────────────────
     score = out.get("scoreadjusted_v2", out.get("scorecomposite_v2", pd.Series(0.0, index=out.index))).fillna(0.0)
     pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
     entry = out.get("sigeffectiveentrymin_v2", pd.Series(0.60, index=out.index)).fillna(0.60)
@@ -568,7 +563,6 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i])
         ext = float(short_ext.loc[i])
 
-        # ── context evaluation (all from config) ─────────────────────
         strong_context = (
             (b in sc["breadth_regimes"] and v in sc["vol_regimes"])
             or l >= sc["min_leadership"]
@@ -591,7 +585,6 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         )
         overext = ext >= oe["max_ema_pct"] or ri >= oe["max_rsi"]
 
-        # ── action decision tree (all thresholds from config) ────────
         if x == 1 and (
             s < max(se["floor_score"], e - se["exit_score_below_entry"])
             or pv <= se["exit_percentile_floor"]
@@ -662,9 +655,13 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _build_review_table(action_table: pd.DataFrame) -> pd.DataFrame:
+def _build_review_table(action_table: pd.DataFrame, action_params: dict | None = None) -> pd.DataFrame:
+    """FIX 3 (critical): overextended thresholds from config, not hardcoded."""
     if action_table.empty:
         return pd.DataFrame()
+
+    ap = action_params if action_params is not None else ACTIONPARAMS_V2
+    oe = ap["overextended"]
 
     review = action_table.rename(columns={
         "action_v2": "recommendation",
@@ -681,8 +678,8 @@ def _build_review_table(action_table: pd.DataFrame) -> pd.DataFrame:
     }).copy()
 
     review["overextended_flag"] = (
-        (review.get("price_vs_ema30_pct", pd.Series(0.0, index=review.index)).fillna(0) >= 0.045) |
-        (review.get("rsi_14", pd.Series(50.0, index=review.index)).fillna(50) >= 74)
+        (review.get("price_vs_ema30_pct", pd.Series(0.0, index=review.index)).fillna(0) >= oe["max_ema_pct"]) |
+        (review.get("rsi_14", pd.Series(50.0, index=review.index)).fillna(50) >= oe["max_rsi"])
     ).map({True: "YES", False: "NO"})
 
     def why(row):
@@ -837,31 +834,37 @@ def run_pipeline_v2(
     breadth_df: pd.DataFrame | None = None,
     market: str = "US",
     leadership_frames: dict[str, pd.DataFrame] | None = None,
-    portfolio_params: dict | None = None,config: dict | None = None, 
+    portfolio_params: dict | None = None,
+    config: dict | None = None,
 ) -> dict:
     if bench_df is None or bench_df.empty:
         raise ValueError("bench_df is required and cannot be empty")
-    
+
     config = config or {}
-    scoring_weights   = config.get("scoring_weights")   or config.get("SCORINGWEIGHTS_V2", None)
-    scoring_params    = config.get("scoring_params")     or config.get("SCORINGPARAMS_V2", None)
-    signal_params     = config.get("signal_params")      or config.get("SIGNALPARAMS_V2", None)
-    convergence_params = config.get("convergence_params") or config.get("CONVERGENCEPARAMS_V2", None)
-    action_params     = config.get("action_params")      or config.get("ACTIONPARAMS_V2", None)
+
+    # ── unpack ALL config blocks (critical fix 1 + moderate fixes 7–9) ────────
+    vol_regime_params  = config.get("vol_regime_params")   or config.get("VOLREGIMEPARAMS", None)
+    scoring_weights    = config.get("scoring_weights")     or config.get("SCORINGWEIGHTS_V2", None)
+    scoring_params     = config.get("scoring_params")      or config.get("SCORINGPARAMS_V2", None)
+    signal_params      = config.get("signal_params")       or config.get("SIGNALPARAMS_V2", None)
+    convergence_params = config.get("convergence_params")  or config.get("CONVERGENCEPARAMS_V2", None)
+    action_params      = config.get("action_params")       or config.get("ACTIONPARAMS_V2", None)
+    breadth_params     = config.get("breadth_params")      or config.get("BREADTHPARAMS", None)       # FIX 8
+    rotation_params    = config.get("rotation_params")     or config.get("ROTATIONPARAMS", None)      # FIX 9
 
     logger.info(
         "run_pipeline_v2 start: market=%s tradable=%d leadership=%d",
         market, len(tradable_frames), len(leadership_frames or {}),
     )
 
-    # ── A. volatility regime from benchmark ───────────────────────────────────
-    regime_df = classify_volatility_regime(bench_df)
+    # ── A. volatility regime from benchmark (FIX 1: config-driven) ────────────
+    regime_df = classify_volatility_regime(bench_df, params=vol_regime_params)
 
     # ── B. merge all symbol frames into one working universe ──────────────────
     all_symbol_frames: dict[str, pd.DataFrame] = {}
     if leadership_frames:
         all_symbol_frames.update(leadership_frames)
-    all_symbol_frames.update(tradable_frames)  # tradable wins on overlap
+    all_symbol_frames.update(tradable_frames)
 
     logger.info(
         "Universe merge: combined=%d (tradable=%d leadership=%d overlap=%d)",
@@ -871,8 +874,8 @@ def run_pipeline_v2(
         len(set(tradable_frames) & set(leadership_frames or {})),
     )
 
-    # ── C. BREADTH — cross-sectional breadth from the universe ────────────────
-    breadth_computed_df = compute_breadth(all_symbol_frames)
+    # ── C. BREADTH (FIX 8: config-driven) ─────────────────────────────────────
+    breadth_computed_df = compute_breadth(all_symbol_frames, params=breadth_params)
 
     if (
         breadth_df is not None
@@ -905,7 +908,6 @@ def run_pipeline_v2(
     all_symbol_frames = compute_rs_zscores(all_symbol_frames, bench_df)
     all_symbol_frames = enrich_rs_regimes(all_symbol_frames)
 
-    # Split back into working sets
     tradable_enriched = {
         k: all_symbol_frames[k]
         for k in tradable_frames
@@ -917,20 +919,24 @@ def run_pipeline_v2(
         if k in all_symbol_frames
     }
 
-    # ── D2. SECTOR ROTATION ──────────────────────────────────────────────────
-    rotation_result = compute_sector_rotation(all_symbol_frames, bench_df)
+    # ── D2. SECTOR ROTATION (FIX 9: config-driven) ───────────────────────────
+    rotation_result = compute_sector_rotation(
+        all_symbol_frames,
+        bench_df,
+        market=market,
+        params=rotation_params,
+    )
     sector_regimes = rotation_result["sector_regimes"]
     ticker_regimes = rotation_result["ticker_regimes"]
     sector_summary = rotation_result["sector_summary"]
 
-    # ── E. leadership snapshot (receives frames WITH rszscore) ────────────────
+    # ── E. leadership snapshot ────────────────────────────────────────────────
     leadership_snapshot = _normalize_leadership(
         _build_leadership_snapshot(leadership_enriched)
     )
 
     last_vol = regime_df.iloc[-1]
 
-    # ── regime context logging (expanded) ─────────────────────────────────────
     leading_sectors = (
         sector_summary.loc[sector_summary["regime"] == "leading", "sector"].tolist()
         if not sector_summary.empty else []
@@ -950,13 +956,20 @@ def run_pipeline_v2(
         lagging_sectors or ["none"],
     )
 
-    # ── rotation recommendation mapping (used per-row below) ──────────────────  # ← FIX 4
-    _sect_to_rec = {
-        "leading":    "STRONGBUY",
-        "improving":  "BUY",
-        "weakening":  "SELL",
-        "lagging":    "SELL",
-    }
+    # ── rotation recommendation mapping (FIX 7: from convergence config) ──────
+    _cp = convergence_params if convergence_params is not None else CONVERGENCEPARAMS_V2
+    _sect_to_rec = _cp.get("rotation_rec_map", {
+        "leading":   "STRONGBUY",
+        "improving": "BUY",
+        "weakening": "SELL",
+        "lagging":   "SELL",
+    })
+    _sect_to_rec_default = _cp.get("rotation_rec_default", "HOLD")
+
+    logger.info(
+        "Rotation rec map: %s  default=%s",
+        _sect_to_rec, _sect_to_rec_default,
+    )
 
     # ── F. per-symbol preparation loop ────────────────────────────────────────
     latest_rows = []
@@ -988,7 +1001,6 @@ def run_pipeline_v2(
         if _row_bs is None or (isinstance(_row_bs, float) and math.isnan(_row_bs)):
             row["breadthscore"] = breadth_info.get("breadthscore", 0.5)
 
-        # ── dispersion (market-level, from breadth) ───────────────────────────
         _row_d20 = row.get("dispersion20")
         if _row_d20 is None or (isinstance(_row_d20, float) and math.isnan(_row_d20)):
             row["dispersion20"] = breadth_info.get("dispersion20")
@@ -996,25 +1008,20 @@ def run_pipeline_v2(
         if _row_d is None or (isinstance(_row_d, float) and math.isnan(_row_d)):
             row["dispersion"] = breadth_info.get("dispersion")
 
-        # ── sector from sector_map ────────────────────────────────────────────
         if not row.get("sector") or row["sector"] == "Unknown":
             row["sector"] = get_sector_or_class(ticker)
         row["sector"] = row.get("sector") or "Unknown"
 
-        # ── sector rotation regime ────────────────────────────────────────────
         _row_sr = row.get("sectrsregime")
         if _row_sr is None or str(_row_sr).lower() in ("unknown", "nan", ""):
             row["sectrsregime"] = ticker_regimes.get(ticker, "unknown")
 
-        # ── rotation recommendation from sector regime ────────────────────────  # ← FIX 4
-        # Translate the sector rotation regime into a discrete recommendation
-        # that apply_convergence_v2 reads from the "rotationrec" column.
-        # Without this, rotationrec defaults to "HOLD" everywhere and the
-        # convergence module's aligned/avoid/mixed logic is dead code.
+        # ── rotation recommendation (FIX 7: from config map) ──────────────────
         _row_rr = row.get("rotationrec")
         if _row_rr is None or str(_row_rr).lower() in ("unknown", "nan", ""):
             row["rotationrec"] = _sect_to_rec.get(
-                str(row.get("sectrsregime", "unknown")).lower(), "HOLD"
+                str(row.get("sectrsregime", "unknown")).lower(),
+                _sect_to_rec_default,
             )
 
         row["theme"] = row.get("theme") or "Unknown"
@@ -1032,7 +1039,7 @@ def run_pipeline_v2(
                 "breadthregime": row.get("breadthregime", "unknown"),
                 "volregime": row.get("volregime", "unknown"),
                 "sectrsregime": row.get("sectrsregime", "unknown"),
-                "rotationrec": row.get("rotationrec", "HOLD"),               # ← FIX 4
+                "rotationrec": row.get("rotationrec", _sect_to_rec_default),
                 "sector": row.get("sector", "Unknown"),
                 "theme": row.get("theme", "Unknown"),
             })
@@ -1049,7 +1056,7 @@ def run_pipeline_v2(
             logger.debug(
                 "Prepared %s last-row snapshot: close=%.4f rsi14=%.2f adx14=%.2f "
                 "atr14pct=%.4f rvol=%.2f rszscore=%s rsregime=%s sectrsregime=%s "
-                "rotationrec=%s breadth=%s vol=%s dispersion20=%s sector=%s",     # ← FIX 4
+                "rotationrec=%s breadth=%s vol=%s dispersion20=%s sector=%s",
                 ticker,
                 float(row.get("close", 0.0) or 0.0),
                 float(row.get("rsi14", 50.0) or 50.0),
@@ -1059,7 +1066,7 @@ def run_pipeline_v2(
                 row.get("rszscore", "missing"),
                 row.get("rsregime", "unknown"),
                 row.get("sectrsregime", "unknown"),
-                row.get("rotationrec", "HOLD"),                                   # ← FIX 4
+                row.get("rotationrec", _sect_to_rec_default),
                 row.get("breadthregime", "unknown"),
                 row.get("volregime", "unknown"),
                 row.get("dispersion20", "missing"),
@@ -1086,12 +1093,10 @@ def run_pipeline_v2(
             breadth_info.get("breadth_regime", "unknown"),
         )
 
-        # ── rotation rec distribution within scoreable set ────────────────────  # ← FIX 4
         if "rotationrec" in latest.columns:
             rr_dist = latest["rotationrec"].value_counts().to_dict()
             logger.info("Scoreable set rotationrec distribution: %s", rr_dist)
 
-        # ── sector rotation distribution within scoreable set ─────────────────
         if "sectrsregime" in latest.columns:
             sr_dist = latest["sectrsregime"].value_counts().to_dict()
             logger.info("Scoreable set sectrsregime distribution: %s", sr_dist)
@@ -1099,30 +1104,33 @@ def run_pipeline_v2(
         if logger.isEnabledFor(logging.DEBUG):
             cols = [c for c in [
                 "ticker", "close", "rsi14", "adx14", "atr14pct", "relativevolume",
-                "rszscore", "rsregime", "sectrsregime", "rotationrec",            # ← FIX 4
+                "rszscore", "rsregime", "sectrsregime", "rotationrec",
                 "leadership_strength", "breadthregime", "breadthscore",
                 "volregime", "realizedvol20d", "gaprate20", "dispersion20",
                 "scoreable_v2", "missing_critical_fields_v2", "sector", "theme",
             ] if c in latest.columns]
             logger.debug("Latest snapshot preview:\n%s", latest[cols].head(30).to_string(index=False))
 
-  
     scored = compute_composite_v2(latest, weights=scoring_weights, params=scoring_params) if not latest.empty else pd.DataFrame()
     logger.info("Scored rows=%d", len(scored))
     if not scored.empty:
-        # ── AFTER (config-driven) ─────────────────────────────────────────
         _ap = action_params if action_params is not None else ACTIONPARAMS_V2
         _lead_w = _ap.get("leadership_boost_weight", 0.10)
         scored["scorecomposite_v2"] = (
             scored["scorecomposite_v2"]
             + _lead_w * scored.get("leadership_strength", 0.0)
         ).clip(0, 1)
+
+        # FIX 13: use config entry threshold for diagnostics
+        _sp = signal_params if signal_params is not None else SIGNALPARAMS_V2
+        _diag_entry = _sp.get("base_entry_threshold", 0.55)
         logger.info(
-            "Score diagnostics: min=%.4f median=%.4f max=%.4f >=0.62=%d >=0.50=%d",
+            "Score diagnostics: min=%.4f median=%.4f max=%.4f >=entry(%.2f)=%d >=0.50=%d",
             float(scored["scorecomposite_v2"].min()),
             float(scored["scorecomposite_v2"].median()),
             float(scored["scorecomposite_v2"].max()),
-            int((scored["scorecomposite_v2"] >= 0.62).sum()),
+            _diag_entry,
+            int((scored["scorecomposite_v2"] >= _diag_entry).sum()),
             int((scored["scorecomposite_v2"] >= 0.50).sum()),
         )
         if logger.isEnabledFor(logging.DEBUG):
@@ -1138,7 +1146,6 @@ def run_pipeline_v2(
     converged = apply_convergence_v2(signaled, params=convergence_params) if not signaled.empty else pd.DataFrame()
     logger.info("Converged rows=%d", len(converged))
     if not converged.empty:
-        # ── convergence label distribution ────────────────────────────────────  # ← FIX 4
         if "convergence_label_v2" in converged.columns:
             cl_dist = converged["convergence_label_v2"].value_counts().to_dict()
             logger.info("Convergence label distribution: %s", cl_dist)
@@ -1154,7 +1161,8 @@ def run_pipeline_v2(
             cols = [c for c in ["ticker", "action_v2", "conviction_v2", "scorecomposite_v2", "scoreadjusted_v2", "score_percentile_v2", "rsi14", "adx14", "relativevolume", "sectrsregime", "rotationrec", "convergence_label_v2", "action_reason_v2"] if c in action_table.columns]
             logger.debug("Action table preview:\n%s", action_table[cols].head(50).to_string(index=False))
 
-    review_table = _build_review_table(action_table) if not action_table.empty else pd.DataFrame()
+    # FIX 3 (critical): pass action_params to review table
+    review_table = _build_review_table(action_table, action_params=action_params) if not action_table.empty else pd.DataFrame()
 
     selling_exhaustion_table = _build_selling_exhaustion_table(
         tradable_enriched,
@@ -1163,13 +1171,16 @@ def run_pipeline_v2(
         leadership_snapshot,
     )
 
+    # FIX 2 (critical): forward ALL portfolio params
     params = portfolio_params or {}
     portfolio = (
         build_portfolio_v2(
             action_table,
-            max_positions=params.get("max_positions", 8),
-            max_sector_weight=params.get("max_sector_weight", 0.35),
-            max_theme_names=params.get("max_theme_names", 2),
+            max_positions=params.get("max_positions", DEFAULT_MAX_POSITIONS),
+            max_sector_weight=params.get("max_sector_weight", DEFAULT_MAX_SECTOR_WEIGHT),
+            max_theme_names=params.get("max_theme_names", DEFAULT_MAX_THEME_NAMES),
+            max_single_weight=params.get("max_single_weight", DEFAULT_MAX_SINGLE_WEIGHT),
+            min_weight=params.get("min_weight", DEFAULT_MIN_WEIGHT),
         )
         if not action_table.empty
         else {

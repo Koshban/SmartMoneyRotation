@@ -1,664 +1,1180 @@
-##########
-"""refactor/strategy/adapters_v2.py"""
+"""
+refactor/strategy/adapters_v2.py
+
+Column contract and default-value guarantees for the v2 pipeline.
+
+Every module in the pipeline reads columns from DataFrames that may or
+may not have been populated by an earlier stage.  ``ensure_columns``
+is called at key checkpoints to guarantee that every expected column
+exists with a sensible typed default, so that downstream code can
+safely do ``row.get("sectrsregime")`` or ``df["scorerotation"]``
+without guarding against KeyError.
+
+The column spec is defined in a single ``COLUMN_SPEC`` dict, making
+it trivial to audit every column the pipeline touches, its expected
+type, and its neutral default.
+
+Usage
+-----
+The pipeline calls ``ensure_columns(df)`` after indicator computation
+and again after the leadership snapshot merge.  It is idempotent:
+columns that already exist and contain real values are never
+overwritten — only genuinely missing columns are created, and only
+NaN cells within existing columns are backfilled with the neutral
+default.
+
+Design rationale
+----------------
+- **Single source of truth.**  Every column name, default, and dtype
+  lives in one place.  Adding a new column to the pipeline means
+  adding one entry to ``COLUMN_SPEC``.
+
+- **Neutral defaults, not optimistic ones.**  Missing RSI defaults to
+  50 (midpoint), missing regime to ``"unknown"``, missing score to
+  0.0 (not 0.5) — because a missing score should rank last, while a
+  missing indicator should be non-committal.
+
+- **No silent type coercion on existing data.**  If ``rsi14`` is
+  already a float column, ``ensure_columns`` will only fill NaN cells,
+  never re-cast the entire series.
+"""
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-CRITICAL_COLUMNS = {
-    "rszscore",
-    "breadthscore",
-    "breadthregime",
-    "rsregime",
+# ═══════════════════════════════════════════════════════════════════════════════
+# Column specification
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Format:  column_name → (default_value, dtype_string)
+#
+# dtype_string is one of:
+#   "float"   → np.float64
+#   "int"     → int (via .astype(int) after fillna)
+#   "str"     → object / string
+#   "bool"    → bool
+#
+# The default value is used both to create missing columns and to fill
+# NaN cells within existing columns.  For "str" columns, NaN cells are
+# filled with the string default (e.g. "unknown"), not with np.nan.
+
+COLUMN_SPEC: dict[str, tuple] = {
+    # ── OHLCV basics ──────────────────────────────────────────────────────
+    "open":                     (0.0,       "float"),
+    "high":                     (0.0,       "float"),
+    "low":                      (0.0,       "float"),
+    "close":                    (0.0,       "float"),
+    "volume":                   (0.0,       "float"),
+
+    # ── Trend indicators ──────────────────────────────────────────────────
+    "rsi14":                    (50.0,      "float"),
+    "adx14":                    (20.0,      "float"),
+    "ema30":                    (0.0,       "float"),
+    "sma30":                    (0.0,       "float"),
+    "sma50":                    (0.0,       "float"),
+    "closevsema30pct":          (0.0,       "float"),
+    "closevssma50pct":          (0.0,       "float"),
+    "macdline":                 (0.0,       "float"),
+    "macdsignal":               (0.0,       "float"),
+    "macdhist":                 (0.0,       "float"),
+
+    # ── Volatility / risk indicators ──────────────────────────────────────
+    "atr14":                    (0.0,       "float"),
+    "atr14pct":                 (0.03,      "float"),
+    "realizedvol20d":           (0.25,      "float"),
+    "realizedvol20dchg5":       (0.0,       "float"),
+    "gaprate20":                (0.15,      "float"),
+
+    # ── Volume indicators ─────────────────────────────────────────────────
+    "relativevolume":           (1.0,       "float"),
+    "volumeavg20":              (0.0,       "float"),
+    "dollarvolumeavg20":        (0.0,       "float"),
+    "dollarvolume20d":          (0.0,       "float"),
+
+    # ── Relative strength (cross-sectional) ───────────────────────────────
+    "rszscore":                 (0.0,       "float"),
+    "rsaccel20":                (0.0,       "float"),
+    "rsregime":                 ("unknown", "str"),
+
+    # ── Sector rotation ───────────────────────────────────────────────────
+    "sectrsregime":             ("unknown", "str"),
+
+    # ── Breadth & dispersion ──────────────────────────────────────────────
+    "breadthregime":            ("unknown", "str"),
+    "breadthscore":             (0.5,       "float"),
+    "dispersion20":             (None,      "float"),
+    "dispersion":               (None,      "float"),
+
+    # ── Volatility regime ─────────────────────────────────────────────────
+    "volregime":                ("calm",    "str"),
+    "volregimescore":           (0.5,       "float"),
+
+    # ── Classification / grouping ─────────────────────────────────────────
+    "sector":                   ("Unknown", "str"),
+    "theme":                    ("Unknown", "str"),
+    "instrument_type":          ("stock",   "str"),
+
+    # ── Leadership ────────────────────────────────────────────────────────
+    "leadership_strength":      (0.0,       "float"),
+
+    # ── Scoring sub-components ────────────────────────────────────────────
+    "scoretrend":               (0.0,       "float"),
+    "scoreparticipation":       (0.0,       "float"),
+    "scorerisk":                (0.0,       "float"),
+    "scoreregime":              (0.0,       "float"),
+    "scorerotation":            (0.0,       "float"),
+    "scorepenalty":             (0.0,       "float"),
+    "scorecomposite_v2":        (0.0,       "float"),
+
+    # ── Signals ───────────────────────────────────────────────────────────
+    "sigconfirmed_v2":          (0,         "int"),
+    "sigexit_v2":               (0,         "int"),
+    "sigeffectiveentrymin_v2":  (0.60,      "float"),
+
+    # ── Convergence ───────────────────────────────────────────────────────
+    "scoreadjusted_v2":         (0.0,       "float"),
+
+    # ── Actions ───────────────────────────────────────────────────────────
+    "action_v2":                ("SELL",    "str"),
+    "conviction_v2":            ("low",     "str"),
+    "action_reason_v2":         ("",        "str"),
+    "action_sort_key_v2":       (0.0,       "float"),
+    "score_percentile_v2":      (0.0,       "float"),
+
+    # ── Scoreability annotations ──────────────────────────────────────────
+    "scoreable_v2":             (True,      "bool"),
+    "missing_critical_count_v2": (0,        "int"),
+    "missing_critical_fields_v2": ("",      "str"),
+    "scoreability_reason_v2":   ("ok",      "str"),
+
+    # ── Portfolio ─────────────────────────────────────────────────────────
+    "portfolio_weight":         (0.0,       "float"),
+    "portfolio_weight_pct":     (0.0,       "float"),
+    "selection_rank":           (0,         "int"),
+    "effective_sector_cap":     (0.0,       "float"),
+    "selection_reason":         ("",        "str"),
 }
 
-DEFAULTS: dict[str, Any] = {
-    "rszscore": np.nan,
-    "sectrszscore": np.nan,
-    "rsaccel20": 0.0,
-    "closevsema30pct": 0.0,
-    "closevssma50pct": 0.0,
-    "relativevolume": 1.0,
-    "obvslope10d": 0.0,
-    "adlineslope10d": 0.0,
-    "dollarvolume20d": 0.0,
-    "atr14pct": np.nan,
-    "amihud20": np.nan,
-    "gaprate20": np.nan,
-    "breadthscore": np.nan,
-    "breadthregime": "unknown",
-    "rsi14": 50.0,
-    "adx14": 20.0,
-    "rsregime": "unknown",
-    "sectrsregime": "unknown",
-    "rotationrec": "HOLD",
-    "ticker": "UNKNOWN",
-    "sector": "Unknown",
-    "theme": "Unknown",
-    "close": np.nan,
-    "volregime": "unknown",
-    "volregimescore": np.nan,
-}
 
-BENCHMARK_REGIME_COLUMNS = [
-    "volregime",
-    "volregimescore",
-    "atrp_bench",
-    "realizedvol_bench",
-    "gaprate_bench",
-    "dispersion_bench",
-]
-
-BREADTH_COLUMNS = ["breadthscore", "breadthregime"]
+# Columns that ensure_columns should create if missing but should
+# NOT backfill NaN cells — because NaN has legitimate meaning (e.g.
+# "we could not compute dispersion" is different from "dispersion = 0").
+_NO_BACKFILL: frozenset[str] = frozenset({
+    "dispersion20",
+    "dispersion",
+})
 
 
-def _safe_series(df: pd.DataFrame, col: str, default: Any) -> pd.Series:
-    if col in df.columns:
-        return df[col]
-    return pd.Series(default, index=df.index)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════════════════════
 
+def ensure_columns(
+    df: pd.DataFrame,
+    subset: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Guarantee that expected columns exist with typed defaults.
 
-def _safe_numeric_series(df: pd.DataFrame, col: str, default: float) -> pd.Series:
-    return pd.to_numeric(_safe_series(df, col, default), errors="coerce")
+    Parameters
+    ----------
+    df : DataFrame
+        Input frame (modified in-place on a copy).
+    subset : list of str, optional
+        If provided, only ensure these column names (must be keys in
+        ``COLUMN_SPEC``).  If ``None``, ensures **all** columns in the
+        spec.  Passing a subset is useful in tight loops where only a
+        handful of columns are needed and the full spec would be
+        wasteful.
 
-
-def _is_placeholder_unknown(series: pd.Series) -> bool:
-    if series.empty:
-        return True
-    vals = series.dropna().astype(str).str.lower().unique().tolist()
-    if not vals:
-        return True
-    return set(vals).issubset({"unknown", "none", "nan", ""})
-
-
-def _numeric_summary(series: pd.Series, *, fill: float | None = None) -> dict[str, Any]:
-    s = pd.to_numeric(series, errors="coerce")
-    if fill is not None:
-        s = s.fillna(fill)
-    valid = s.dropna()
-    if valid.empty:
-        return {
-            "count": int(len(s)),
-            "nonnull": 0,
-            "nan": int(s.isna().sum()),
-            "mean": np.nan,
-            "min": np.nan,
-            "max": np.nan,
-            "std": np.nan,
-        }
-    return {
-        "count": int(len(s)),
-        "nonnull": int(valid.shape[0]),
-        "nan": int(s.isna().sum()),
-        "mean": float(valid.mean()),
-        "min": float(valid.min()),
-        "max": float(valid.max()),
-        "std": float(valid.std(ddof=0)) if len(valid) > 1 else 0.0,
-    }
-
-
-def _value_counts_str(series: pd.Series, topn: int = 10) -> str:
-    if series.empty:
-        return "empty"
-    vc = (
-        series.astype("object")
-        .where(~series.isna(), other="<<NA>>")
-        .astype(str)
-        .value_counts(dropna=False)
-        .head(topn)
-    )
-    return ", ".join(f"{idx}={int(val)}" for idx, val in vc.items()) if not vc.empty else "empty"
-
-
-def _log_missing_defaults(before_cols: set[str], after_cols: set[str]) -> None:
-    missing = [c for c in DEFAULTS if c not in before_cols]
-    if not missing:
-        logger.info("ensure_columns: no columns injected")
-        return
-
-    critical_missing = [c for c in missing if c in CRITICAL_COLUMNS]
-    soft_missing = [c for c in missing if c not in CRITICAL_COLUMNS]
-
-    logger.info(
-        "ensure_columns: injected %d missing columns (%d critical, %d soft)",
-        len(missing),
-        len(critical_missing),
-        len(soft_missing),
-    )
-    if critical_missing:
-        logger.warning(
-            "ensure_columns: critical columns were missing and created with non-authoritative defaults/nulls: %s",
-            critical_missing,
-        )
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("ensure_columns missing columns full list: %s", missing)
-        if soft_missing:
-            logger.debug("ensure_columns soft-missing columns: %s", soft_missing)
-
-
-def _log_null_diagnostics(df: pd.DataFrame, label: str) -> None:
-    tracked = [c for c in DEFAULTS if c in df.columns]
-    if not tracked:
-        logger.info("%s: no tracked columns present for null diagnostics", label)
-        return
-
-    nan_counts = {c: int(df[c].isna().sum()) for c in tracked if df[c].isna().any()}
-    if nan_counts:
-        logger.warning("%s: NaN counts on tracked columns: %s", label, nan_counts)
-    else:
-        logger.info("%s: no NaNs on tracked columns", label)
-
-    critical_nan = {
-        c: int(df[c].isna().sum())
-        for c in CRITICAL_COLUMNS
-        if c in df.columns and df[c].isna().any()
-    }
-    if critical_nan:
-        logger.warning("%s: critical columns still contain NaNs: %s", label, critical_nan)
-
-
-def _log_scoreability(df: pd.DataFrame, label: str) -> None:
+    Returns
+    -------
+    DataFrame
+        Same data with missing columns added and NaN cells backfilled.
+    """
     if df.empty:
-        logger.info("%s: dataframe empty; scoreability skipped", label)
-        return
+        return df
 
-    critical_presence = {}
-    for col in sorted(CRITICAL_COLUMNS):
-        if col not in df.columns:
-            critical_presence[col] = "missing"
-        elif df[col].dtype == object:
-            if col.endswith("regime"):
-                critical_presence[col] = f"values={_value_counts_str(df[col], topn=6)}"
-            else:
-                critical_presence[col] = f"nonnull={int(df[col].notna().sum())}/{len(df)}"
-        else:
-            s = pd.to_numeric(df[col], errors="coerce")
-            critical_presence[col] = f"nonnull={int(s.notna().sum())}/{len(df)}"
+    out = df.copy()
+    columns_to_check = subset if subset is not None else list(COLUMN_SPEC.keys())
 
-    logger.info("%s: critical field health: %s", label, critical_presence)
+    created: list[str] = []
+    backfilled: list[str] = []
 
-    if "rszscore" in df.columns:
-        rs = pd.to_numeric(df["rszscore"], errors="coerce")
-        valid = rs.dropna()
-        if valid.empty:
-            logger.warning("%s: rszscore has no finite values", label)
-        else:
-            vmin = float(valid.min())
-            vmax = float(valid.max())
-            vstd = float(valid.std(ddof=0)) if len(valid) > 1 else 0.0
-            logger.info(
-                "%s: rszscore distribution min=%.4f max=%.4f std=%.6f nonnull=%d/%d",
-                label,
-                vmin,
-                vmax,
-                vstd,
-                int(valid.shape[0]),
-                len(df),
-            )
-            if np.isclose(vmin, vmax, atol=1e-12):
-                logger.warning(
-                    "%s: rszscore cross-section/time-series is degenerate (min == max). "
-                    "This usually means upstream RS normalization is broken or being neutral-filled.",
-                    label,
+    for col in columns_to_check:
+        if col not in COLUMN_SPEC:
+            continue
+
+        default, dtype_str = COLUMN_SPEC[col]
+
+        if col not in out.columns:
+            # Create column with the default value
+            if dtype_str == "float":
+                if default is None:
+                    out[col] = pd.Series(np.nan, index=out.index, dtype=float)
+                else:
+                    out[col] = pd.Series(
+                        float(default), index=out.index, dtype=float,
+                    )
+            elif dtype_str == "int":
+                out[col] = pd.Series(
+                    int(default), index=out.index, dtype=int,
                 )
+            elif dtype_str == "bool":
+                out[col] = pd.Series(
+                    bool(default), index=out.index, dtype=bool,
+                )
+            else:  # str / object
+                out[col] = pd.Series(
+                    str(default) if default is not None else "",
+                    index=out.index,
+                    dtype=object,
+                )
+            created.append(col)
+            continue
 
-    if "breadthscore" in df.columns:
-        bs = _numeric_summary(df["breadthscore"])
-        logger.info(
-            "%s: breadthscore summary nonnull=%d/%d mean=%s min=%s max=%s std=%s",
-            label,
-            bs["nonnull"],
-            bs["count"],
-            f"{bs['mean']:.4f}" if pd.notna(bs["mean"]) else "nan",
-            f"{bs['min']:.4f}" if pd.notna(bs["min"]) else "nan",
-            f"{bs['max']:.4f}" if pd.notna(bs["max"]) else "nan",
-            f"{bs['std']:.6f}" if pd.notna(bs["std"]) else "nan",
-        )
+        # Column exists — optionally backfill NaN cells
+        if col in _NO_BACKFILL:
+            continue
 
-    if "breadthregime" in df.columns:
-        logger.info("%s: breadthregime distribution %s", label, _value_counts_str(df["breadthregime"], topn=8))
+        if default is None:
+            continue
 
-    if "rsregime" in df.columns:
-        logger.info("%s: rsregime distribution %s", label, _value_counts_str(df["rsregime"], topn=8))
+        if dtype_str == "float":
+            mask = out[col].isna()
+            if mask.any():
+                out.loc[mask, col] = float(default)
+                backfilled.append(col)
+        elif dtype_str == "int":
+            mask = out[col].isna()
+            if mask.any():
+                out[col] = out[col].fillna(int(default))
+                backfilled.append(col)
+        elif dtype_str == "bool":
+            mask = out[col].isna()
+            if mask.any():
+                out[col] = out[col].fillna(bool(default))
+                backfilled.append(col)
+        else:  # str / object
+            # For string columns, also treat empty strings and literal
+            # "nan" as missing.
+            mask = (
+                out[col].isna()
+                | out[col].astype(str).str.lower().isin(["nan", "none", ""])
+            )
+            if mask.any():
+                out.loc[mask, col] = str(default)
+                backfilled.append(col)
 
-    if "sectrsregime" in df.columns:
-        logger.info("%s: sectrsregime distribution %s", label, _value_counts_str(df["sectrsregime"], topn=8))
-
-
-def _log_value_snapshot(out: pd.DataFrame, label: str) -> None:
-    if out.empty:
-        logger.info("%s: dataframe is empty", label)
-        return
-
-    rsz = _numeric_summary(_safe_numeric_series(out, "rszscore", np.nan))
-    breadth = _numeric_summary(_safe_numeric_series(out, "breadthscore", np.nan))
-    rsi = _numeric_summary(_safe_numeric_series(out, "rsi14", 50.0), fill=50.0)
-    adx = _numeric_summary(_safe_numeric_series(out, "adx14", 20.0), fill=20.0)
-
-    logger.info(
-        (
-            "%s: rows=%d cols=%d "
-            "rszscore_nonnull=%d mean=%s min=%s max=%s "
-            "breadth_nonnull=%d mean=%s "
-            "rsi_mean=%.2f adx_mean=%.2f"
-        ),
-        label,
-        len(out),
-        len(out.columns),
-        rsz["nonnull"],
-        f"{rsz['mean']:.4f}" if pd.notna(rsz["mean"]) else "nan",
-        f"{rsz['min']:.4f}" if pd.notna(rsz["min"]) else "nan",
-        f"{rsz['max']:.4f}" if pd.notna(rsz["max"]) else "nan",
-        breadth["nonnull"],
-        f"{breadth['mean']:.4f}" if pd.notna(breadth["mean"]) else "nan",
-        float(rsi["mean"]) if pd.notna(rsi["mean"]) else 50.0,
-        float(adx["mean"]) if pd.notna(adx["mean"]) else 20.0,
-    )
-
-    _log_null_diagnostics(out, label)
-    _log_scoreability(out, label)
-
-    cols = [
-        c
-        for c in [
-            "ticker",
-            "close",
-            "rszscore",
-            "sectrszscore",
-            "rsaccel20",
-            "closevsema30pct",
-            "closevssma50pct",
-            "relativevolume",
-            "atr14pct",
-            "breadthscore",
-            "breadthregime",
-            "rsi14",
-            "adx14",
-            "rsregime",
-            "sectrsregime",
-            "rotationrec",
-            "volregime",
-            "volregimescore",
-            "sector",
-            "theme",
-        ]
-        if c in out.columns
-    ]
-
-    if logger.isEnabledFor(logging.DEBUG):
+    if created or backfilled:
         logger.debug(
-            "%s preview:\n%s",
-            label,
-            out[cols].head(20).to_string(index=False) if cols else out.head(20).to_string(index=False),
-        )
-
-
-def _add_health_flags(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    required_numeric = ["rszscore", "breadthscore"]
-    required_categorical = ["breadthregime", "rsregime"]
-
-    num_ok = pd.Series(True, index=out.index)
-    for col in required_numeric:
-        if col in out.columns:
-            num_ok &= pd.to_numeric(out[col], errors="coerce").notna()
-        else:
-            num_ok &= False
-
-    cat_ok = pd.Series(True, index=out.index)
-    for col in required_categorical:
-        if col in out.columns:
-            if col.endswith("regime"):
-                cat_ok &= out[col].notna() & (out[col].astype(str).str.lower() != "unknown")
-            else:
-                cat_ok &= out[col].notna()
-        else:
-            cat_ok &= False
-
-    out["adapter_scoreable_v2"] = (num_ok & cat_ok).astype(int)
-
-    missing_counts = pd.Series(0, index=out.index, dtype=int)
-    for col in required_numeric:
-        if col not in out.columns:
-            missing_counts += 1
-        else:
-            missing_counts += pd.to_numeric(out[col], errors="coerce").isna().astype(int)
-
-    for col in required_categorical:
-        if col not in out.columns:
-            missing_counts += 1
-        else:
-            missing_counts += (out[col].isna() | (out[col].astype(str).str.lower() == "unknown")).astype(int)
-
-    out["adapter_missing_critical_count"] = missing_counts.astype(int)
-
-    if "rszscore" in out.columns:
-        rs = pd.to_numeric(out["rszscore"], errors="coerce")
-        valid = rs.dropna()
-        degenerate = 1 if (not valid.empty and np.isclose(float(valid.min()), float(valid.max()), atol=1e-12)) else 0
-        out["adapter_rszscore_degenerate"] = degenerate
-    else:
-        out["adapter_rszscore_degenerate"] = 1
-
-    return out
-
-
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    before_cols = set(out.columns)
-
-    logger.info(
-        "ensure_columns: start rows=%d cols=%d incoming_cols_sample=%s",
-        len(out),
-        len(out.columns),
-        sorted(list(out.columns))[:20],
-    )
-
-    for col, val in DEFAULTS.items():
-        if col not in out.columns:
-            out[col] = val
-
-    _log_missing_defaults(before_cols, set(out.columns))
-
-    for col in ["breadthregime", "rsregime", "sectrsregime", "rotationrec", "ticker", "sector", "theme", "volregime"]:
-        if col in out.columns:
-            out[col] = out[col].fillna(DEFAULTS.get(col, "unknown"))
-
-    out = _add_health_flags(out)
-
-    n_scoreable = int(out["adapter_scoreable_v2"].sum()) if "adapter_scoreable_v2" in out.columns else 0
-    logger.info(
-        "ensure_columns: scoreable rows=%d/%d missing_critical_avg=%.3f rszscore_degenerate=%s",
-        n_scoreable,
-        len(out),
-        float(pd.to_numeric(out.get("adapter_missing_critical_count", pd.Series(0, index=out.index)), errors="coerce").mean())
-        if len(out) > 0
-        else 0.0,
-        bool(int(out["adapter_rszscore_degenerate"].iloc[0])) if "adapter_rszscore_degenerate" in out.columns and not out.empty else None,
-    )
-
-    _log_value_snapshot(out, "ensure_columns output")
-    return out
-
-
-def attach_benchmark_regime(stock_df: pd.DataFrame, regime_df: pd.DataFrame | None) -> pd.DataFrame:
-    out = stock_df.copy()
-
-    logger.info(
-        "attach_benchmark_regime: start stock_rows=%d stock_cols=%d regime_rows=%d regime_cols=%s",
-        len(out),
-        len(out.columns),
-        len(regime_df) if regime_df is not None else 0,
-        list(regime_df.columns) if regime_df is not None else [],
-    )
-
-    if regime_df is None or regime_df.empty:
-        logger.warning(
-            "attach_benchmark_regime: regime_df is missing/empty; benchmark regime context not attached"
-        )
-        out = ensure_columns(out)
-        if "volregime" not in out.columns:
-            out["volregime"] = "unknown"
-        if "volregimescore" not in out.columns:
-            out["volregimescore"] = np.nan
-        return out
-
-    missing = [c for c in BENCHMARK_REGIME_COLUMNS if c not in regime_df.columns]
-    if missing:
-        logger.warning("attach_benchmark_regime: missing regime cols=%s", missing)
-
-    use_cols = [c for c in BENCHMARK_REGIME_COLUMNS if c in regime_df.columns]
-    if not use_cols:
-        logger.warning(
-            "attach_benchmark_regime: no usable benchmark regime columns found; returning ensure_columns(stock_df)"
-        )
-        out = ensure_columns(out)
-        if "volregime" not in out.columns:
-            out["volregime"] = "unknown"
-        if "volregimescore" not in out.columns:
-            out["volregimescore"] = np.nan
-        return out
-
-    aligned = regime_df[use_cols].reindex(out.index).ffill()
-
-    aligned_nonnull = {c: int(aligned[c].notna().sum()) for c in use_cols}
-    logger.info("attach_benchmark_regime: aligned non-null counts=%s", aligned_nonnull)
-
-    for col in use_cols:
-        out[col] = aligned[col]
-
-    if "volregime" in out.columns:
-        if _is_placeholder_unknown(out["volregime"]):
-            logger.warning(
-                "attach_benchmark_regime: resulting volregime remains entirely unknown after merge"
-            )
-        logger.info(
-            "attach_benchmark_regime: volregime distribution %s",
-            _value_counts_str(out["volregime"], topn=8),
-        )
-
-    if "volregimescore" in out.columns:
-        vs = _numeric_summary(out["volregimescore"])
-        logger.info(
-            "attach_benchmark_regime: volregimescore nonnull=%d/%d mean=%s min=%s max=%s",
-            vs["nonnull"],
-            vs["count"],
-            f"{vs['mean']:.4f}" if pd.notna(vs["mean"]) else "nan",
-            f"{vs['min']:.4f}" if pd.notna(vs["min"]) else "nan",
-            f"{vs['max']:.4f}" if pd.notna(vs["max"]) else "nan",
-        )
-
-    out = ensure_columns(out)
-
-    if logger.isEnabledFor(logging.DEBUG):
-        preview_cols = [c for c in BENCHMARK_REGIME_COLUMNS if c in out.columns]
-        if preview_cols:
-            logger.debug(
-                "attach_benchmark_regime preview:\n%s",
-                out[preview_cols].head(20).to_string(),
-            )
-
-    return out
-
-
-def attach_breadth_context(stock_df: pd.DataFrame, breadth_df: pd.DataFrame | None) -> pd.DataFrame:
-    out = stock_df.copy()
-
-    logger.info(
-        "attach_breadth_context: start stock_rows=%d stock_cols=%d breadth_rows=%d breadth_cols=%s",
-        len(out),
-        len(out.columns),
-        len(breadth_df) if breadth_df is not None else 0,
-        list(breadth_df.columns) if breadth_df is not None else [],
-    )
-
-    if breadth_df is None or breadth_df.empty:
-        logger.warning(
-            "attach_breadth_context: no breadth data available; retaining stock data with non-authoritative breadth defaults only"
-        )
-        return ensure_columns(out)
-
-    use_cols = [c for c in BREADTH_COLUMNS if c in breadth_df.columns]
-    logger.info("attach_breadth_context: usable breadth columns=%s", use_cols)
-
-    if not use_cols:
-        logger.warning(
-            "attach_breadth_context: breadth_df has no usable columns; applying ensure_columns only"
-        )
-        return ensure_columns(out)
-
-    aligned = breadth_df[use_cols].reindex(out.index).ffill()
-
-    aligned_nonnull = {c: int(aligned[c].notna().sum()) for c in use_cols}
-    logger.info("attach_breadth_context: aligned non-null counts=%s", aligned_nonnull)
-
-    for col in use_cols:
-        out[col] = aligned[col]
-
-    out = ensure_columns(out)
-
-    if "breadthscore" in out.columns:
-        bs = _numeric_summary(out["breadthscore"])
-        logger.info(
-            "attach_breadth_context: resulting breadthscore nonnull=%d/%d mean=%s min=%s max=%s std=%s",
-            bs["nonnull"],
-            bs["count"],
-            f"{bs['mean']:.4f}" if pd.notna(bs["mean"]) else "nan",
-            f"{bs['min']:.4f}" if pd.notna(bs["min"]) else "nan",
-            f"{bs['max']:.4f}" if pd.notna(bs["max"]) else "nan",
-            f"{bs['std']:.6f}" if pd.notna(bs["std"]) else "nan",
-        )
-
-    if "breadthregime" in out.columns:
-        logger.info(
-            "attach_breadth_context: resulting breadthregime distribution %s",
-            _value_counts_str(out["breadthregime"], topn=8),
-        )
-        if _is_placeholder_unknown(out["breadthregime"]):
-            logger.warning(
-                "attach_breadth_context: breadthregime remains entirely unknown after merge"
-            )
-
-    if logger.isEnabledFor(logging.DEBUG):
-        preview_cols = [c for c in ["breadthscore", "breadthregime", "ticker", "sector", "theme"] if c in out.columns]
-        logger.debug(
-            "attach_breadth_context preview:\n%s",
-            out[preview_cols].head(20).to_string(),
+            "ensure_columns: created=%d (%s)  backfilled=%d (%s)",
+            len(created),
+            ", ".join(created[:15]) + ("..." if len(created) > 15 else ""),
+            len(backfilled),
+            ", ".join(backfilled[:15]) + ("..." if len(backfilled) > 15 else ""),
         )
 
     return out
 
-###########################################################################
 
-""" refactor/strategy/portfolio_v2.py """
+# ═══════════════════════════════════════════════════════════════════════════════
+# Utilities for other modules
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_column_default(col: str):
+    """
+    Return the neutral default for a column, or None if not in the spec.
+    """
+    entry = COLUMN_SPEC.get(col)
+    return entry[0] if entry is not None else None
+
+
+def get_column_dtype(col: str) -> str | None:
+    """
+    Return the dtype string for a column, or None if not in the spec.
+    """
+    entry = COLUMN_SPEC.get(col)
+    return entry[1] if entry is not None else None
+
+
+def list_columns(category: str | None = None) -> list[str]:
+    """
+    List column names, optionally filtered by a prefix-based category.
+
+    Categories (prefix matching):
+        "score"     → scoring sub-components and composite
+        "sig"       → signal columns
+        "action"    → action columns
+        "breadth"   → breadth-related
+        "vol"       → volatility regime
+        "rs"        → relative strength
+        "sect"      → sector rotation
+        "portfolio" → portfolio columns
+
+    If *category* is None, returns all columns.
+    """
+    if category is None:
+        return list(COLUMN_SPEC.keys())
+    prefix = category.lower()
+    return [k for k in COLUMN_SPEC if k.lower().startswith(prefix)]
+
+
+def validate_frame(
+    df: pd.DataFrame,
+    required: list[str] | None = None,
+) -> dict:
+    """
+    Check a DataFrame against the column spec and return a diagnostic
+    dict.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Frame to validate.
+    required : list of str, optional
+        Columns that must be present and non-null in the last row.
+        Defaults to all columns in ``COLUMN_SPEC``.
+
+    Returns
+    -------
+    dict
+        Keys: ``ok`` (bool), ``missing_columns`` (list),
+        ``null_in_last_row`` (list), ``total_checked`` (int).
+    """
+    cols_to_check = required if required is not None else list(COLUMN_SPEC.keys())
+
+    missing_cols = [c for c in cols_to_check if c not in df.columns]
+    null_last = []
+
+    if not df.empty:
+        last = df.iloc[-1]
+        for c in cols_to_check:
+            if c in df.columns:
+                val = last.get(c)
+                if val is None:
+                    null_last.append(c)
+                elif isinstance(val, float) and np.isnan(val):
+                    # Allow NaN for no-backfill columns
+                    if c not in _NO_BACKFILL:
+                        null_last.append(c)
+
+    ok = len(missing_cols) == 0 and len(null_last) == 0
+    return {
+        "ok": ok,
+        "missing_columns": missing_cols,
+        "null_in_last_row": null_last,
+        "total_checked": len(cols_to_check),
+    }
+
+
+############################
+"""
+refactor/strategy/breadth_v2.py
+
+Cross-sectional market-breadth computation and regime classification.
+
+Builds a date x symbol close-price panel from the full universe and
+computes the following daily cross-sectional metrics:
+
+    pct_above_sma20   - fraction of symbols above their 20-day SMA
+    pct_above_sma50   - fraction above 50-day SMA
+    pct_above_sma200  - fraction above 200-day SMA
+    pct_advancing     - fraction with a positive daily return
+    net_new_highs_pct - (20-d new highs - 20-d new lows) / universe size
+    dispersion_daily  - cross-sectional std-dev of daily returns
+    dispersion20      - 20-day rolling mean of dispersion_daily
+
+A weighted composite ``breadthscore`` (0-1) is EMA-smoothed and
+classified into one of four regimes:
+
+    strong   - breadthscore >= regime_strong
+    moderate - regime_moderate <= breadthscore < regime_strong
+    weak     - regime_weak <= breadthscore < regime_moderate
+    critical - breadthscore < regime_weak
+
+All thresholds and weights are configurable via params dict.
+"""
 from __future__ import annotations
 
+import logging
+
+import numpy as np
 import pandas as pd
 
-VOL_MULT = {"calm": 1.00, "volatile": 0.75, "chaotic": 0.40}
-BREADTH_EXPOSURE = {"strong": 1.00, "neutral": 0.80, "weak": 0.45, "critical": 0.20, "unknown": 0.80}
+logger = logging.getLogger(__name__)
+
+# ── Module-level defaults (used when no params dict is supplied) ──────────────
+BREADTH_MIN_SYMBOLS = 5
+BREADTH_MIN_HISTORY = 55
+BREADTH_EMA_SPAN = 5
+
+REGIME_STRONG = 0.65
+REGIME_MODERATE = 0.45
+REGIME_WEAK = 0.25
+
+DEFAULT_COMPOSITE_WEIGHTS = {
+    "pct_above_sma50": 0.30,
+    "pct_above_sma200": 0.20,
+    "pct_above_sma20": 0.15,
+    "pct_advancing": 0.15,
+    "net_new_highs": 0.20,
+}
 
 
-def _cap_weights(weights: pd.Series, max_w: float) -> pd.Series:
-    w = weights.clip(lower=0)
-    if w.sum() <= 0:
-        return w
-    w = w / w.sum()
-    for _ in range(10):
-        over = w > max_w
-        if not over.any():
-            break
-        excess = (w[over] - max_w).sum()
-        w.loc[over] = max_w
-        under = ~over
-        if under.any() and excess > 0 and w.loc[under].sum() > 0:
-            w.loc[under] = w.loc[under] + excess * (w.loc[under] / w.loc[under].sum())
-    return w / w.sum()
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_breadth(
+    symbol_frames: dict[str, pd.DataFrame],
+    params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Compute market breadth from the universe of symbol frames.
+
+    Parameters
+    ----------
+    symbol_frames : dict[str, DataFrame]
+        Mapping of ticker -> OHLCV-style DataFrame (must contain ``close``).
+    params : dict, optional
+        Configuration overrides.  Recognised keys:
+            min_symbols, min_history, ema_span,
+            regime_strong, regime_moderate, regime_weak,
+            composite_weights (sub-dict with pct_above_sma50, etc.)
+
+    Returns
+    -------
+    DataFrame
+        Indexed by date with breadth metrics, ``breadthscore``, and
+        ``breadthregime``.  Empty if fewer than ``min_symbols``
+        symbols qualify.
+    """
+    if not symbol_frames:
+        logger.warning("compute_breadth: no symbol frames provided")
+        return pd.DataFrame()
+
+    # ── unpack config (FIX 8: every threshold from params) ────────────────────
+    p = params or {}
+    min_symbols = p.get("min_symbols", BREADTH_MIN_SYMBOLS)
+    min_history = p.get("min_history", BREADTH_MIN_HISTORY)
+    ema_span = p.get("ema_span", BREADTH_EMA_SPAN)
+    regime_strong = p.get("regime_strong", REGIME_STRONG)
+    regime_moderate = p.get("regime_moderate", REGIME_MODERATE)
+    regime_weak = p.get("regime_weak", REGIME_WEAK)
+
+    cw = p.get("composite_weights", DEFAULT_COMPOSITE_WEIGHTS)
+    w_sma50 = cw.get("pct_above_sma50", 0.30)
+    w_sma200 = cw.get("pct_above_sma200", 0.20)
+    w_sma20 = cw.get("pct_above_sma20", 0.15)
+    w_adv = cw.get("pct_advancing", 0.15)
+    w_highs = cw.get("net_new_highs", 0.20)
+
+    logger.info(
+        "compute_breadth params: min_symbols=%d min_history=%d ema_span=%d "
+        "regime_thresholds=(%.2f/%.2f/%.2f) "
+        "weights=(sma50=%.2f sma200=%.2f sma20=%.2f adv=%.2f highs=%.2f)",
+        min_symbols, min_history, ema_span,
+        regime_strong, regime_moderate, regime_weak,
+        w_sma50, w_sma200, w_sma20, w_adv, w_highs,
+    )
+
+    # ── 1. close-price panel ──────────────────────────────────────────────────
+    close_dict: dict[str, pd.Series] = {}
+    for ticker, df in symbol_frames.items():
+        if df is None or df.empty or "close" not in df.columns:
+            continue
+        if len(df) < min_history:
+            continue
+        close_dict[ticker] = pd.to_numeric(df["close"], errors="coerce")
+
+    if len(close_dict) < min_symbols:
+        logger.warning(
+            "compute_breadth: only %d symbols with >= %d rows (need >= %d)",
+            len(close_dict), min_history, min_symbols,
+        )
+        return pd.DataFrame()
+
+    close = pd.DataFrame(close_dict)
+    n_valid = close.notna().sum(axis=1).replace(0, np.nan)
+    logger.info(
+        "compute_breadth: panel shape=(%d dates, %d symbols)",
+        close.shape[0], close.shape[1],
+    )
+
+    # ── 2. moving-average breadth ─────────────────────────────────────────────
+    sma20 = close.rolling(20, min_periods=15).mean()
+    sma50 = close.rolling(50, min_periods=40).mean()
+    sma200 = close.rolling(200, min_periods=150).mean()
+
+    pct_above_sma20 = (close > sma20).sum(axis=1) / n_valid
+    pct_above_sma50 = (close > sma50).sum(axis=1) / n_valid
+    pct_above_sma200 = (close > sma200).sum(axis=1) / n_valid
+
+    # ── 3. advance / decline ──────────────────────────────────────────────────
+    daily_ret = close.pct_change(fill_method=None)
+    pct_advancing = (daily_ret > 0).sum(axis=1) / n_valid
+
+    # ── 4. new-high / new-low (20-day rolling) ───────────────────────────────
+    high20 = close.rolling(20, min_periods=15).max()
+    low20 = close.rolling(20, min_periods=15).min()
+    at_high = (close >= high20 - 1e-8).sum(axis=1) / n_valid
+    at_low = (close <= low20 + 1e-8).sum(axis=1) / n_valid
+    net_new_highs_pct = at_high - at_low
+
+    # ── 5. cross-sectional dispersion ─────────────────────────────────────────
+    dispersion_daily = daily_ret.std(axis=1, ddof=1)
+    dispersion20 = dispersion_daily.rolling(20, min_periods=15).mean()
+
+    # ── 6. composite score (0-1) — all weights from config ────────────────────
+    raw_score = (
+        w_sma50 * pct_above_sma50.fillna(0.5)
+        + w_sma200 * pct_above_sma200.fillna(0.5)
+        + w_sma20 * pct_above_sma20.fillna(0.5)
+        + w_adv * pct_advancing.fillna(0.5)
+        + w_highs * ((net_new_highs_pct.fillna(0.0) + 1.0) / 2.0)
+    ).clip(0.0, 1.0)
+
+    breadthscore = raw_score.ewm(
+        span=ema_span, min_periods=max(3, ema_span // 2),
+    ).mean()
+
+    # ── 7. regime classification — all thresholds from config ─────────────────
+    classification = pd.Series(
+        np.select(
+            [
+                breadthscore >= regime_strong,
+                breadthscore >= regime_moderate,
+                breadthscore >= regime_weak,
+                breadthscore < regime_weak,
+            ],
+            ["strong", "moderate", "weak", "critical"],
+            default="unknown",
+        ),
+        index=close.index,
+    )
+    breadthregime = classification.where(breadthscore.notna(), "unknown")
+
+    # ── 8. assemble output ────────────────────────────────────────────────────
+    breadth = pd.DataFrame(
+        {
+            "pct_above_sma20": pct_above_sma20,
+            "pct_above_sma50": pct_above_sma50,
+            "pct_above_sma200": pct_above_sma200,
+            "pct_advancing": pct_advancing,
+            "pct_new_high_20": at_high,
+            "pct_new_low_20": at_low,
+            "net_new_highs_pct": net_new_highs_pct,
+            "dispersion_daily": dispersion_daily,
+            "dispersion20": dispersion20,
+            "breadthscore_raw": raw_score,
+            "breadthscore": breadthscore,
+            "breadthregime": breadthregime,
+        },
+        index=close.index,
+    )
+
+    # ── 9. diagnostics ───────────────────────────────────────────────────────
+    if not breadth.empty:
+        last = breadth.iloc[-1]
+        logger.info(
+            "compute_breadth last-date: score=%.4f regime=%s "
+            "above_sma50=%.1f%% above_sma200=%.1f%% advancing=%.1f%% "
+            "net_highs=%.1f%% dispersion20=%.6f",
+            float(last.get("breadthscore", 0)),
+            str(last.get("breadthregime", "unknown")),
+            float(last.get("pct_above_sma50", 0)) * 100,
+            float(last.get("pct_above_sma200", 0)) * 100,
+            float(last.get("pct_advancing", 0)) * 100,
+            float(last.get("net_new_highs_pct", 0)) * 100,
+            float(last.get("dispersion20", 0)),
+        )
+        recent_regimes = breadth["breadthregime"].tail(20).value_counts().to_dict()
+        logger.info("compute_breadth last-20-day regime dist: %s", recent_regimes)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "compute_breadth tail(5):\n%s",
+                breadth[
+                    ["breadthscore", "breadthregime", "pct_above_sma50",
+                     "pct_advancing", "dispersion20"]
+                ].tail(5).to_string(),
+            )
+
+    return breadth
+
+######################################
+"""
+refactor/strategy/portfolio_v2.py
+
+Portfolio construction for the v2 pipeline.
+
+Takes the scored-and-actioned universe and selects a concentrated
+portfolio of up to ``max_positions`` names, subject to:
+
+    1.  Only STRONG_BUY and BUY actions are eligible.
+    2.  Sector concentration caps are *dynamic* — sectors in the
+        ``leading`` or ``improving`` rotation quadrant receive the full
+        ``max_sector_weight``, while ``weakening`` sectors get 60 % of
+        the cap and ``lagging`` sectors get 30 %.
+    3.  Theme diversification: no more than ``max_theme_names`` names
+        from any single theme.
+    4.  Position sizing is inverse-ATR weighted (lower volatility →
+        larger weight), then capped per name at ``max_single_weight``.
+    5.  Total exposure is scaled by a market-regime multiplier derived
+        from the breadth and volatility regime columns already present
+        on every row.
+
+Output
+------
+``build_portfolio_v2`` returns a dict with:
+
+    selected   – DataFrame of the final portfolio with per-name
+                 weights, risk metrics, and selection reasoning.
+    meta       – dict with portfolio-level summary statistics:
+                 selected_count, candidate_count, target_exposure,
+                 breadth_regime, vol_regime, sector_tilt, etc.
+
+Design notes
+------------
+The builder is intentionally *stateless* — it takes a single snapshot
+and produces a target portfolio.  It does not track prior holdings,
+turnover cost, or rebalancing frequency.  Those concerns belong in
+an execution layer that compares today's target with yesterday's
+holdings.
+"""
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_MAX_POSITIONS = 8
+DEFAULT_MAX_SECTOR_WEIGHT = 0.35
+DEFAULT_MAX_THEME_NAMES = 2
+DEFAULT_MAX_SINGLE_WEIGHT = 0.20
+DEFAULT_MIN_WEIGHT = 0.04
+
+# ── Rotation-aware sector cap multipliers ─────────────────────────────────────
+ROTATION_CAP_MULT: dict[str, float] = {
+    "leading":   1.00,
+    "improving": 1.00,
+    "weakening": 0.60,
+    "lagging":   0.30,
+    "unknown":   0.70,
+}
+
+# ── Exposure scaling by market regime ─────────────────────────────────────────
+# The product of breadth and vol multipliers gives target gross
+# exposure.  In a strong/calm environment the portfolio can be fully
+# invested; in a weak/chaotic one it scales down significantly.
+BREADTH_EXPOSURE: dict[str, float] = {
+    "strong": 1.00, "healthy": 0.95, "moderate": 0.88,
+    "neutral": 0.80, "mixed": 0.72, "narrow": 0.65,
+    "weak": 0.50, "critical": 0.35, "unknown": 0.75,
+}
+VOL_EXPOSURE: dict[str, float] = {
+    "calm": 1.00, "low": 0.97, "normal": 0.92, "moderate": 0.85,
+    "elevated": 0.72, "stressed": 0.55, "chaotic": 0.38,
+    "unknown": 0.80,
+}
 
 
-def build_portfolio_v2(latest: pd.DataFrame, max_positions: int = 8, max_sector_weight: float = 0.35, max_theme_names: int = 2) -> dict:
-    df = latest.copy()
-    if df.empty:
-        return {
-            "selected": pd.DataFrame(),
-            "meta": {
-                "target_exposure": 0.0,
-                "reason": "no candidates",
-                "candidate_count": 0,
-                "selected_count": 0,
-                "breadth_regime": "unknown",
-                "vol_regime": "unknown",
-            },
-        }
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    if "ticker" not in df.columns:
-        df["ticker"] = df.index.astype(str)
+def _safe_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        f = float(value)
+        return default if np.isnan(f) else f
+    except (TypeError, ValueError):
+        return default
 
-    candidates = df[df.get("sigconfirmed_v2", pd.Series(0, index=df.index)).eq(1)].copy()
-    if candidates.empty and "action_v2" in df.columns:
-        candidates = df[df["action_v2"].isin(["STRONG_BUY", "BUY"])].copy()
+
+def _effective_sector_cap(
+    sector_regime: str,
+    base_cap: float,
+) -> float:
+    """Return the dynamic sector weight cap given the rotation regime."""
+    mult = ROTATION_CAP_MULT.get(
+        str(sector_regime).lower(),
+        ROTATION_CAP_MULT["unknown"],
+    )
+    return base_cap * mult
+
+
+def _target_exposure(breadth: str, vol: str) -> float:
+    """
+    Compute target gross exposure from breadth and volatility regimes.
+
+    Returns a value in roughly [0.13, 1.00].
+    """
+    b = BREADTH_EXPOSURE.get(str(breadth).lower(), BREADTH_EXPOSURE["unknown"])
+    v = VOL_EXPOSURE.get(str(vol).lower(), VOL_EXPOSURE["unknown"])
+    return round(b * v, 4)
+
+
+def _inverse_atr_weights(atr_pct_series: pd.Series) -> pd.Series:
+    """
+    Compute raw inverse-ATR weights.
+
+    Names with lower ATR% get proportionally larger weights.
+    A floor of 0.005 prevents division by zero for ultra-low-vol names.
+    """
+    clamped = atr_pct_series.clip(lower=0.005).fillna(0.03)
+    inv = 1.0 / clamped
+    total = inv.sum()
+    if total <= 0:
+        return pd.Series(1.0 / len(clamped), index=clamped.index)
+    return inv / total
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_portfolio_v2(
+    action_table: pd.DataFrame,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
+    max_sector_weight: float = DEFAULT_MAX_SECTOR_WEIGHT,
+    max_theme_names: int = DEFAULT_MAX_THEME_NAMES,
+    max_single_weight: float = DEFAULT_MAX_SINGLE_WEIGHT,
+    min_weight: float = DEFAULT_MIN_WEIGHT,
+) -> dict:
+    """
+    Build a concentrated target portfolio from the actioned universe.
+
+    Parameters
+    ----------
+    action_table : DataFrame
+        Output of the action generator.  Must contain ``action_v2``,
+        ``ticker``, and scoring columns.  Expected but optional:
+        ``scoreadjusted_v2``, ``score_percentile_v2``, ``atr14pct``,
+        ``sector``, ``theme``, ``sectrsregime``, ``breadthregime``,
+        ``volregime``, ``conviction_v2``.
+    max_positions : int
+        Maximum number of names in the final portfolio.
+    max_sector_weight : float
+        Base maximum weight for any single GICS sector (before
+        rotation-regime adjustment).
+    max_theme_names : int
+        Maximum number of names from any single theme.
+    max_single_weight : float
+        Hard cap on any individual position.
+    min_weight : float
+        Minimum weight for inclusion.  Names that would receive less
+        than this after all caps are applied are dropped.
+
+    Returns
+    -------
+    dict
+        ``selected`` (DataFrame) and ``meta`` (dict).
+    """
+    # ── 0. empty guard ────────────────────────────────────────────────────────
+    breadth_regime = "unknown"
+    vol_regime = "unknown"
+
+    if action_table.empty or "action_v2" not in action_table.columns:
+        logger.info("build_portfolio_v2: empty action table, returning empty portfolio")
+        return _empty_portfolio(breadth_regime, vol_regime)
+
+    # Resolve market regimes from the first row (uniform across rows)
+    breadth_regime = str(
+        action_table["breadthregime"].iloc[0]
+        if "breadthregime" in action_table.columns
+        else "unknown"
+    ).lower()
+    vol_regime = str(
+        action_table["volregime"].iloc[0]
+        if "volregime" in action_table.columns
+        else "unknown"
+    ).lower()
+
+    # ── 1. filter to eligible actions ─────────────────────────────────────────
+    eligible_mask = action_table["action_v2"].isin(["STRONG_BUY", "BUY"])
+    candidates = action_table.loc[eligible_mask].copy()
 
     if candidates.empty:
-        return {
-            "selected": pd.DataFrame(),
-            "meta": {
-                "target_exposure": 0.0,
-                "reason": "no confirmed names",
-                "candidate_count": 0,
-                "selected_count": 0,
-                "breadth_regime": "unknown",
-                "vol_regime": "unknown",
-            },
-        }
+        logger.info(
+            "build_portfolio_v2: no STRONG_BUY or BUY candidates "
+            "(total rows=%d)",
+            len(action_table),
+        )
+        return _empty_portfolio(breadth_regime, vol_regime)
 
-    breadth = str(candidates["breadthregime"].mode().iloc[0]) if "breadthregime" in candidates.columns and not candidates["breadthregime"].dropna().empty else "unknown"
-    vol = str(candidates["volregime"].mode().iloc[0]) if "volregime" in candidates.columns and not candidates["volregime"].dropna().empty else "calm"
-    target_exposure = BREADTH_EXPOSURE.get(breadth, 0.8) * VOL_MULT.get(vol, 1.0)
+    logger.info(
+        "Portfolio candidates: %d STRONG_BUY + BUY out of %d total",
+        len(candidates), len(action_table),
+    )
 
-    sort_cols = [c for c in ["convergence_tier_v2", "scoreadjusted_v2", "scorecomposite_v2"] if c in candidates.columns]
-    candidates = candidates.sort_values(sort_cols, ascending=[False] * len(sort_cols)) if sort_cols else candidates
+    # ── 2. rank candidates ────────────────────────────────────────────────────
+    # Primary sort: action tier (STRONG_BUY first), then adjusted score
+    tier_map = {"STRONG_BUY": 1, "BUY": 2}
+    candidates["_tier"] = candidates["action_v2"].map(tier_map).fillna(3).astype(int)
 
-    picks = []
-    theme_count = {}
-    for _, row in candidates.iterrows():
-        if len(picks) >= max_positions:
+    score_col = (
+        "scoreadjusted_v2"
+        if "scoreadjusted_v2" in candidates.columns
+        else "scorecomposite_v2"
+    )
+    candidates["_sort_score"] = (
+        pd.to_numeric(candidates.get(score_col, 0.0), errors="coerce")
+        .fillna(0.0)
+    )
+    candidates = candidates.sort_values(
+        ["_tier", "_sort_score"],
+        ascending=[True, False],
+    ).reset_index(drop=True)
+
+    # ── 3. greedy selection with constraints ──────────────────────────────────
+    selected_indices: list[int] = []
+    sector_weight_used: dict[str, float] = {}
+    theme_count: dict[str, int] = {}
+
+    # Pre-compute inverse-ATR raw weights for the full candidate pool
+    atr_col = (
+        pd.to_numeric(candidates.get("atr14pct", 0.03), errors="coerce")
+        .fillna(0.03)
+    )
+    raw_weights = _inverse_atr_weights(atr_col)
+
+    for idx in candidates.index:
+        if len(selected_indices) >= max_positions:
             break
-        theme = row.get("theme", "Unknown")
-        if theme_count.get(theme, 0) >= max_theme_names:
-            continue
-        picks.append(row)
-        theme_count[theme] = theme_count.get(theme, 0) + 1
 
-    selected = pd.DataFrame(picks)
-    if selected.empty:
-        return {
-            "selected": pd.DataFrame(),
-            "meta": {
-                "target_exposure": 0.0,
-                "reason": "all candidates clipped by diversification",
-                "candidate_count": int(len(candidates)),
-                "selected_count": 0,
-                "breadth_regime": breadth,
-                "vol_regime": vol,
-            },
-        }
+        row = candidates.loc[idx]
+        ticker = str(row.get("ticker", ""))
+        sector = str(row.get("sector", "Unknown"))
+        theme = str(row.get("theme", "Unknown"))
+        sect_regime = str(row.get("sectrsregime", "unknown")).lower()
+        raw_w = float(raw_weights.loc[idx])
 
-    score_col = "scoreadjusted_v2" if "scoreadjusted_v2" in selected.columns else "scorecomposite_v2"
-    pos_col = "sigpositionpct_v2" if "sigpositionpct_v2" in selected.columns else None
+        # ── sector cap (rotation-aware) ───────────────────────────────────
+        effective_cap = _effective_sector_cap(sect_regime, max_sector_weight)
+        current_sector_w = sector_weight_used.get(sector, 0.0)
+        proposed_w = min(raw_w, max_single_weight)
 
-    raw = pd.to_numeric(selected[score_col], errors="coerce").fillna(0).clip(lower=0)
-    if pos_col is not None:
-        raw = raw * pd.to_numeric(selected[pos_col], errors="coerce").fillna(0.001).clip(lower=0.001)
+        if current_sector_w + proposed_w > effective_cap:
+            room = effective_cap - current_sector_w
+            if room < min_weight:
+                logger.debug(
+                    "Portfolio: skipping %s — sector %s at %.1f%% "
+                    "(cap %.1f%% for %s regime)",
+                    ticker, sector,
+                    current_sector_w * 100, effective_cap * 100,
+                    sect_regime,
+                )
+                continue
+            proposed_w = room
 
-    weights = _cap_weights(raw, min(0.20, max_sector_weight)) * target_exposure
-    selected = selected.assign(target_weight=weights.values)
+        # ── theme diversification ─────────────────────────────────────────
+        if theme != "Unknown":
+            current_theme_n = theme_count.get(theme, 0)
+            if current_theme_n >= max_theme_names:
+                logger.debug(
+                    "Portfolio: skipping %s — theme %s already has %d names",
+                    ticker, theme, current_theme_n,
+                )
+                continue
 
-    if "sector" in selected.columns:
-        for sector, idx in selected.groupby("sector").groups.items():
-            sector_sum = selected.loc[idx, "target_weight"].sum()
-            if sector_sum > max_sector_weight and sector_sum > 0:
-                selected.loc[idx, "target_weight"] *= max_sector_weight / sector_sum
+        # ── accept ────────────────────────────────────────────────────────
+        selected_indices.append(idx)
+        sector_weight_used[sector] = current_sector_w + proposed_w
+        if theme != "Unknown":
+            theme_count[theme] = theme_count.get(theme, 0) + 1
 
-    if selected["target_weight"].sum() > 0:
-        selected["target_weight"] *= target_exposure / selected["target_weight"].sum()
+    if not selected_indices:
+        logger.info("build_portfolio_v2: all candidates filtered by constraints")
+        return _empty_portfolio(breadth_regime, vol_regime)
 
+    selected = candidates.loc[selected_indices].copy()
+
+    # ── 4. final weight calculation ───────────────────────────────────────────
+    # Re-derive inverse-ATR weights among selected names only
+    sel_atr = (
+        pd.to_numeric(selected.get("atr14pct", 0.03), errors="coerce")
+        .fillna(0.03)
+    )
+    sel_raw_w = _inverse_atr_weights(sel_atr)
+
+    # Apply per-name and per-sector caps iteratively
+    final_w = sel_raw_w.clip(upper=max_single_weight).copy()
+
+    for _ in range(5):  # iterate to redistribute excess
+        # enforce rotation-aware sector caps
+        for sector in selected["sector"].unique():
+            sect_mask = selected["sector"] == sector
+            sector_total = float(final_w.loc[sect_mask].sum())
+            # all names in this sector share the same regime in practice,
+            # but take the mode for safety
+            regimes = (
+                selected.loc[sect_mask, "sectrsregime"]
+                .astype(str).str.lower()
+            )
+            regime_mode = regimes.mode().iloc[0] if not regimes.empty else "unknown"
+            cap = _effective_sector_cap(regime_mode, max_sector_weight)
+
+            if sector_total > cap and sector_total > 0:
+                scale = cap / sector_total
+                final_w.loc[sect_mask] *= scale
+
+        # enforce single-name cap
+        final_w = final_w.clip(upper=max_single_weight)
+
+        # renormalise so total = 1
+        total = final_w.sum()
+        if total > 0:
+            final_w = final_w / total
+        else:
+            final_w = pd.Series(
+                1.0 / len(final_w), index=final_w.index,
+            )
+
+    # ── 5. apply exposure scaling ─────────────────────────────────────────────
+    gross_target = _target_exposure(breadth_regime, vol_regime)
+    final_w = final_w * gross_target
+
+    # Drop names below minimum weight
+    keep_mask = final_w >= min_weight
+    if not keep_mask.all():
+        dropped = selected.loc[~keep_mask, "ticker"].tolist()
+        logger.info(
+            "Portfolio: dropping %d names below min_weight %.2f%%: %s",
+            len(dropped), min_weight * 100, dropped,
+        )
+        selected = selected.loc[keep_mask].copy()
+        final_w = final_w.loc[keep_mask]
+
+        # Renormalise to target exposure
+        if final_w.sum() > 0:
+            final_w = final_w / final_w.sum() * gross_target
+
+    selected["portfolio_weight"] = final_w.values
+    selected["portfolio_weight_pct"] = (final_w.values * 100).round(2)
+
+    # ── 6. enrich with selection metadata ─────────────────────────────────────
+    selected["selection_rank"] = range(1, len(selected) + 1)
+
+    # per-name effective sector cap for transparency
+    selected["effective_sector_cap"] = selected.apply(
+        lambda r: _effective_sector_cap(
+            str(r.get("sectrsregime", "unknown")).lower(),
+            max_sector_weight,
+        ),
+        axis=1,
+    )
+
+    # selection reason
+    def _reason(r):
+        parts = [
+            str(r.get("action_v2", "")),
+            f"score={_safe_float(r.get(score_col), 0):.3f}",
+            f"atr={_safe_float(r.get('atr14pct'), 0):.4f}",
+            f"sect={r.get('sector', 'Unknown')}({r.get('sectrsregime', 'unknown')})",
+            f"w={r.get('portfolio_weight_pct', 0):.1f}%",
+        ]
+        return " | ".join(parts)
+
+    selected["selection_reason"] = selected.apply(_reason, axis=1)
+
+    # Clean up internal sort columns
+    selected = selected.drop(columns=["_tier", "_sort_score"], errors="ignore")
+    selected = selected.reset_index(drop=True)
+
+    # ── 7. build sector tilt summary ──────────────────────────────────────────
+    sector_tilt = _build_sector_tilt(selected, max_sector_weight)
+
+    # ── 8. build rotation exposure summary ────────────────────────────────────
+    rotation_exposure = _build_rotation_exposure(selected)
+
+    # ── 9. meta ───────────────────────────────────────────────────────────────
     meta = {
-        "target_exposure": float(target_exposure),
-        "breadth_regime": breadth,
-        "vol_regime": vol,
-        "candidate_count": int(len(candidates)),
-        "selected_count": int(len(selected)),
+        "selected_count": len(selected),
+        "candidate_count": len(candidates),
+        "total_universe": len(action_table),
+        "target_exposure": gross_target,
+        "actual_exposure": round(float(selected["portfolio_weight"].sum()), 4),
+        "cash_reserve": round(
+            1.0 - float(selected["portfolio_weight"].sum()), 4,
+        ),
+        "breadth_regime": breadth_regime,
+        "vol_regime": vol_regime,
+        "max_positions": max_positions,
+        "max_sector_weight_base": max_sector_weight,
+        "max_single_weight": max_single_weight,
+        "max_theme_names": max_theme_names,
+        "sector_tilt": sector_tilt,
+        "rotation_exposure": rotation_exposure,
     }
-    return {"selected": selected.sort_values("target_weight", ascending=False), "meta": meta}
 
-############################################################
-""" refactor/strategy/regime_v2.py """
+    # ── 10. logging ───────────────────────────────────────────────────────────
+    logger.info(
+        "Portfolio built: %d names  exposure=%.1f%%  cash=%.1f%%  "
+        "breadth=%s  vol=%s",
+        meta["selected_count"],
+        meta["actual_exposure"] * 100,
+        meta["cash_reserve"] * 100,
+        breadth_regime,
+        vol_regime,
+    )
+
+    if sector_tilt:
+        logger.info("Sector tilt:")
+        for entry in sector_tilt:
+            logger.info(
+                "  %-20s  regime=%-10s  weight=%5.1f%%  cap=%5.1f%%  "
+                "names=%d",
+                entry["sector"],
+                entry["regime"],
+                entry["weight_pct"],
+                entry["effective_cap_pct"],
+                entry["count"],
+            )
+
+    if rotation_exposure:
+        logger.info("Rotation quadrant exposure:")
+        for entry in rotation_exposure:
+            logger.info(
+                "  %-10s  weight=%5.1f%%  names=%d",
+                entry["quadrant"],
+                entry["weight_pct"],
+                entry["count"],
+            )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        preview_cols = [c for c in [
+            "selection_rank", "ticker", "action_v2", "portfolio_weight_pct",
+            score_col, "atr14pct", "sector", "sectrsregime",
+            "effective_sector_cap", "theme", "conviction_v2",
+            "selection_reason",
+        ] if c in selected.columns]
+        logger.debug(
+            "Portfolio detail:\n%s",
+            selected[preview_cols].to_string(index=False),
+        )
+
+    return {
+        "selected": selected,
+        "meta": meta,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sector tilt summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_sector_tilt(
+    selected: pd.DataFrame,
+    base_cap: float,
+) -> list[dict]:
+    """
+    Build a summary of portfolio weight by sector, including the
+    effective rotation-adjusted cap for each.
+    """
+    if selected.empty or "sector" not in selected.columns:
+        return []
+
+    rows = []
+    for sector in sorted(selected["sector"].unique()):
+        mask = selected["sector"] == sector
+        subset = selected.loc[mask]
+        weight = float(subset["portfolio_weight"].sum())
+        count = len(subset)
+
+        # Determine the sector's rotation regime (mode among selected names)
+        if "sectrsregime" in subset.columns:
+            regimes = subset["sectrsregime"].astype(str).str.lower()
+            regime = regimes.mode().iloc[0] if not regimes.empty else "unknown"
+        else:
+            regime = "unknown"
+
+        cap = _effective_sector_cap(regime, base_cap)
+
+        rows.append({
+            "sector": sector,
+            "regime": regime,
+            "weight": round(weight, 4),
+            "weight_pct": round(weight * 100, 1),
+            "effective_cap": round(cap, 4),
+            "effective_cap_pct": round(cap * 100, 1),
+            "count": count,
+            "headroom_pct": round((cap - weight) * 100, 1),
+        })
+
+    return sorted(rows, key=lambda r: r["weight"], reverse=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Rotation exposure summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_rotation_exposure(selected: pd.DataFrame) -> list[dict]:
+    """
+    Summarise portfolio weight by rotation quadrant.
+
+    This gives a single-glance view of how the portfolio is positioned
+    relative to the sector rotation cycle.
+    """
+    if selected.empty or "sectrsregime" not in selected.columns:
+        return []
+
+    rows = []
+    for quadrant in ("leading", "improving", "weakening", "lagging", "unknown"):
+        mask = selected["sectrsregime"].astype(str).str.lower() == quadrant
+        subset = selected.loc[mask]
+        if subset.empty:
+            continue
+        weight = float(subset["portfolio_weight"].sum())
+        rows.append({
+            "quadrant": quadrant,
+            "weight": round(weight, 4),
+            "weight_pct": round(weight * 100, 1),
+            "count": len(subset),
+            "tickers": sorted(subset["ticker"].tolist()),
+        })
+
+    return sorted(rows, key=lambda r: r["weight"], reverse=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Empty result
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _empty_portfolio(breadth_regime: str, vol_regime: str) -> dict:
+    return {
+        "selected": pd.DataFrame(),
+        "meta": {
+            "selected_count": 0,
+            "candidate_count": 0,
+            "total_universe": 0,
+            "target_exposure": _target_exposure(breadth_regime, vol_regime),
+            "actual_exposure": 0.0,
+            "cash_reserve": 1.0,
+            "breadth_regime": breadth_regime,
+            "vol_regime": vol_regime,
+            "max_positions": DEFAULT_MAX_POSITIONS,
+            "max_sector_weight_base": DEFAULT_MAX_SECTOR_WEIGHT,
+            "max_single_weight": DEFAULT_MAX_SINGLE_WEIGHT,
+            "max_theme_names": DEFAULT_MAX_THEME_NAMES,
+            "sector_tilt": [],
+            "rotation_exposure": [],
+        },
+    }
+
+##########################################
+"""refactor/strategy/regime_v2.py"""
 from __future__ import annotations
 
 import numpy as np
@@ -671,13 +1187,17 @@ def _clip01(x):
     return np.clip(x, 0.0, 1.0)
 
 
-def classify_volatility_regime(bench: pd.DataFrame, dispersion: pd.Series | None = None) -> pd.DataFrame:
+def classify_volatility_regime(
+    bench: pd.DataFrame,
+    dispersion: pd.Series | None = None,
+    params: dict | None = None,
+) -> pd.DataFrame:
     if bench is None or bench.empty:
         raise ValueError("Benchmark dataframe cannot be empty")
     if "close" not in bench.columns:
         raise ValueError("Benchmark dataframe must contain a close column")
 
-    p = VOLREGIMEPARAMS
+    p = params if params is not None else VOLREGIMEPARAMS
     df = bench.copy()
     close = pd.to_numeric(df["close"], errors="coerce")
     high = pd.to_numeric(df.get("high", close), errors="coerce")
@@ -703,7 +1223,15 @@ def classify_volatility_regime(bench: pd.DataFrame, dispersion: pd.Series | None
         + w["dispersion"] * pd.Series(disp_s, index=df.index).fillna(0)
     )
 
-    label = np.select([score >= 0.75, score >= 0.35], ["chaotic", "volatile"], default="calm")
+    # FIX: regime label thresholds from config instead of hardcoded
+    chaotic_thresh = p.get("chaotic_threshold", 0.75)
+    volatile_thresh = p.get("volatile_threshold", 0.35)
+
+    label = np.select(
+        [score >= chaotic_thresh, score >= volatile_thresh],
+        ["chaotic", "volatile"],
+        default="calm",
+    )
     return pd.DataFrame(
         {
             "volregime": label,
@@ -716,483 +1244,818 @@ def classify_volatility_regime(bench: pd.DataFrame, dispersion: pd.Series | None
         index=df.index,
     )
 
-###############################################################
-"""refactor/strategy/scoring_v2.py """
+#################################
+"""
+refactor/strategy/rotation_v2.py
 
+Rotation engine with RRG-style quadrant classification.
+
+US market  (sector-ETF mode)
+----------------------------
+Computes relative strength of the 11 GICS sector ETFs versus SPY and
+classifies each sector into a rotation quadrant.  Every stock in the
+universe inherits its parent sector's regime via TICKER_SECTOR_MAP.
+
+HK / IN markets  (per-stock mode)
+----------------------------------
+No sector ETFs are available, so the engine computes per-stock relative
+strength versus the market benchmark (2800.HK for HK, NIFTYBEES.NS for
+IN) and classifies each stock directly into a rotation quadrant.
+
+Quadrants (classic clockwise RRG rotation)
+------------------------------------------
+    leading    - RS above its trend AND accelerating
+    improving  - RS below its trend BUT accelerating
+    weakening  - RS above its trend BUT decelerating
+    lagging    - RS below its trend AND decelerating
+
+Output
+------
+``compute_sector_rotation`` returns a dict with:
+
+    sector_summary  - DataFrame with rotation metrics and regime.
+    sector_regimes  - dict[str, str]  sector -> regime
+    ticker_regimes  - dict[str, str]  ticker -> regime
+
+All RS computation parameters are configurable via params dict.
+"""
 from __future__ import annotations
 
 import logging
+
 import numpy as np
 import pandas as pd
 
-from refactor.common.config_refactor import SCORINGPARAMS_V2, SCORINGWEIGHTS_V2
-from .adapters_v2 import ensure_columns
+logger = logging.getLogger(__name__)
+
+# ── US sector map (imported if available) ─────────────────────────────────────
+try:
+    from common.sector_map import (
+        SECTOR_ETFS as _US_SECTOR_ETFS,
+        TICKER_SECTOR_MAP as _US_TICKER_SECTOR_MAP,
+    )
+except ImportError:
+    _US_SECTOR_ETFS: dict[str, str] = {}
+    _US_TICKER_SECTOR_MAP: dict[str, str] = {}
+    logger.debug(
+        "common.sector_map not available; US sector-ETF rotation disabled"
+    )
+
+MARKET_SECTOR_ETFS: dict[str, dict[str, str]] = {
+    "US": dict(_US_SECTOR_ETFS) if _US_SECTOR_ETFS else {},
+    "HK": {},
+    "IN": {},
+}
+
+MARKET_TICKER_SECTOR_MAP: dict[str, dict[str, str]] = {
+    "US": dict(_US_TICKER_SECTOR_MAP) if _US_TICKER_SECTOR_MAP else {},
+    "HK": {},
+    "IN": {},
+}
+
+# ── Module-level defaults (used when no params dict is supplied) ──────────────
+RS_SMA_PERIOD = 50
+RS_MOMENTUM_PERIOD = 20
+RS_SMOOTH_SPAN = 10
+MIN_HISTORY = 60
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Market auto-detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _detect_market(symbol_frames: dict[str, pd.DataFrame]) -> str:
+    hk = 0
+    india = 0
+    other = 0
+    for ticker in symbol_frames:
+        t = ticker.upper()
+        if t.endswith(".HK"):
+            hk += 1
+        elif t.endswith(".NS") or t.endswith(".BO"):
+            india += 1
+        else:
+            other += 1
+    total = hk + india + other
+    if total == 0:
+        return "US"
+    if hk > total * 0.5:
+        return "HK"
+    if india > total * 0.5:
+        return "IN"
+    return "US"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API  (FIX 9: accepts params dict)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_sector_rotation(
+    symbol_frames: dict[str, pd.DataFrame],
+    bench_df: pd.DataFrame,
+    market: str | None = None,
+    params: dict | None = None,
+) -> dict:
+    """
+    Compute rotation quadrants.
+
+    Parameters
+    ----------
+    symbol_frames : dict
+        Ticker -> OHLCV DataFrame.
+    bench_df : DataFrame
+        Benchmark OHLCV data.
+    market : str, optional
+        Market code ("US", "HK", "IN").  Auto-detected if None.
+    params : dict, optional
+        Configuration overrides.  Recognised keys:
+            rs_sma_period, rs_momentum_period, smooth_span, min_history
+    """
+    # ── unpack config ─────────────────────────────────────────────────────
+    p = params or {}
+    rs_sma_period = p.get("rs_sma_period", RS_SMA_PERIOD)
+    rs_momentum_period = p.get("rs_momentum_period", RS_MOMENTUM_PERIOD)
+    smooth_span = p.get("smooth_span", RS_SMOOTH_SPAN)
+    min_history = p.get("min_history", MIN_HISTORY)
+
+    logger.info(
+        "compute_sector_rotation params: rs_sma=%d rs_mom=%d smooth=%d min_hist=%d",
+        rs_sma_period, rs_momentum_period, smooth_span, min_history,
+    )
+
+    if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
+        logger.warning("compute_sector_rotation: benchmark missing or empty")
+        return _empty_result()
+
+    bench_close = pd.to_numeric(bench_df["close"], errors="coerce")
+    if int(bench_close.notna().sum()) < min_history:
+        logger.warning(
+            "compute_sector_rotation: insufficient benchmark history (%d rows)",
+            int(bench_close.notna().sum()),
+        )
+        return _empty_result()
+
+    # ── resolve market ────────────────────────────────────────────────────
+    if market is None:
+        market = _detect_market(symbol_frames)
+        logger.debug(
+            "Sector rotation: auto-detected market=%s from %d tickers",
+            market, len(symbol_frames),
+        )
+
+    market = market.upper()
+    sector_etfs = MARKET_SECTOR_ETFS.get(market, {})
+
+    # ── sector-ETF mode (US) ──────────────────────────────────────────────
+    if sector_etfs:
+        available = sum(
+            1 for etf in sector_etfs.values()
+            if etf in symbol_frames
+            and symbol_frames[etf] is not None
+            and not symbol_frames[etf].empty
+        )
+        if available > 0:
+            logger.debug(
+                "Sector rotation: sector-ETF mode  market=%s  "
+                "etfs_available=%d/%d",
+                market, available, len(sector_etfs),
+            )
+            result = _compute_sector_etf_rotation(
+                symbol_frames=symbol_frames,
+                bench_close=bench_close,
+                sector_etfs=sector_etfs,
+                ticker_sector_map=MARKET_TICKER_SECTOR_MAP.get(market, {}),
+                rs_sma_period=rs_sma_period,
+                rs_momentum_period=rs_momentum_period,
+                smooth_span=smooth_span,
+                min_history=min_history,
+            )
+            if result["ticker_regimes"]:
+                return result
+            logger.warning(
+                "Sector rotation: sector-ETF mode produced empty results; "
+                "falling back to per-stock mode"
+            )
+        else:
+            logger.debug(
+                "Sector rotation: market=%s but 0/%d sector ETFs "
+                "present in symbol_frames; falling back to per-stock mode",
+                market, len(sector_etfs),
+            )
+
+    # ── per-stock mode (HK, IN, or fallback) ─────────────────────────────
+    logger.debug(
+        "Sector rotation: per-stock mode  market=%s  "
+        "(%d tickers vs benchmark)",
+        market, len(symbol_frames),
+    )
+    return _compute_per_stock_rotation(
+        symbol_frames=symbol_frames,
+        bench_close=bench_close,
+        rs_sma_period=rs_sma_period,
+        rs_momentum_period=rs_momentum_period,
+        smooth_span=smooth_span,
+        min_history=min_history,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_rs_for_one(
+    target_close: pd.Series,
+    bench_close: pd.Series,
+    rs_sma_period: int,
+    rs_momentum_period: int,
+    smooth_span: int,
+    min_history: int,
+) -> dict | None:
+    combined = pd.DataFrame(
+        {"target": target_close, "bench": bench_close},
+    ).dropna()
+
+    if len(combined) < min_history:
+        return None
+
+    rs_raw = combined["target"] / combined["bench"]
+    rs = rs_raw.ewm(
+        span=smooth_span,
+        min_periods=max(3, smooth_span // 2),
+    ).mean()
+
+    rs_sma = rs.rolling(
+        rs_sma_period,
+        min_periods=int(rs_sma_period * 0.7),
+    ).mean()
+    rs_level = rs / rs_sma - 1.0
+
+    rs_mom = rs.pct_change(rs_momentum_period)
+
+    rs_roc_5 = rs.pct_change(5)
+    excess_20 = (
+        combined["target"].pct_change(20)
+        - combined["bench"].pct_change(20)
+    )
+
+    last_level = rs_level.iloc[-1]
+    last_mom = rs_mom.iloc[-1]
+
+    if pd.isna(last_level) or pd.isna(last_mom):
+        return None
+
+    return {
+        "rs_level": float(last_level),
+        "rs_momentum": float(last_mom),
+        "rs_roc_5d": (
+            float(rs_roc_5.iloc[-1])
+            if pd.notna(rs_roc_5.iloc[-1])
+            else None
+        ),
+        "excess_return_20d": (
+            float(excess_20.iloc[-1])
+            if pd.notna(excess_20.iloc[-1])
+            else None
+        ),
+        "rs_ratio_last": float(rs.iloc[-1]),
+    }
+
+
+def _classify_and_rank(summary: pd.DataFrame) -> pd.DataFrame:
+    summary["regime"] = np.select(
+        [
+            (summary["rs_level"] > 0) & (summary["rs_momentum"] > 0),
+            (summary["rs_level"] <= 0) & (summary["rs_momentum"] > 0),
+            (summary["rs_level"] > 0) & (summary["rs_momentum"] <= 0),
+        ],
+        ["leading", "improving", "weakening"],
+        default="lagging",
+    )
+
+    summary["rs_rank"] = (
+        summary["rs_level"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
+    summary["momentum_rank"] = (
+        summary["rs_momentum"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
+
+    return summary.sort_values("rs_rank").reset_index(drop=True)
+
+
+def _log_regime_distribution(
+    summary: pd.DataFrame,
+    label_col: str,
+    max_display: int = 20,
+) -> None:
+    regime_dist = summary["regime"].value_counts().to_dict()
+    logger.debug("Rotation regime distribution: %s", regime_dist)
+
+    for regime in ("leading", "improving", "weakening", "lagging"):
+        members = summary.loc[
+            summary["regime"] == regime, label_col
+        ].tolist()
+        display = members[:max_display]
+        suffix = (
+            f" ... (+{len(members) - max_display})"
+            if len(members) > max_display
+            else ""
+        )
+        logger.debug(
+            "  %-12s: %s%s",
+            regime.title(),
+            display or ["none"],
+            suffix,
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        display_cols = [
+            label_col, "regime", "rs_rank", "momentum_rank",
+            "rs_level", "rs_momentum", "excess_return_20d",
+        ]
+        cols = [c for c in display_cols if c in summary.columns]
+        logger.debug(
+            "Rotation summary:\n%s",
+            summary[cols].to_string(index=False),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sector-ETF mode (US)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_sector_etf_rotation(
+    symbol_frames: dict[str, pd.DataFrame],
+    bench_close: pd.Series,
+    sector_etfs: dict[str, str],
+    ticker_sector_map: dict[str, str],
+    rs_sma_period: int,
+    rs_momentum_period: int,
+    smooth_span: int,
+    min_history: int,
+) -> dict:
+    rows: list[dict] = []
+    skipped_missing = 0
+    skipped_short = 0
+
+    for sector_name, etf_ticker in sector_etfs.items():
+        etf_df = symbol_frames.get(etf_ticker)
+        if etf_df is None or etf_df.empty or "close" not in etf_df.columns:
+            skipped_missing += 1
+            continue
+
+        etf_close = pd.to_numeric(etf_df["close"], errors="coerce")
+        metrics = _compute_rs_for_one(
+            etf_close, bench_close,
+            rs_sma_period, rs_momentum_period, smooth_span, min_history,
+        )
+
+        if metrics is None:
+            skipped_short += 1
+            continue
+
+        rows.append({"sector": sector_name, "etf": etf_ticker, **metrics})
+
+    logger.debug(
+        "Sector rotation: computed=%d  skipped_missing=%d  skipped_short=%d",
+        len(rows), skipped_missing, skipped_short,
+    )
+
+    if not rows:
+        logger.warning("compute_sector_rotation: no sectors could be computed")
+        return _empty_result()
+
+    summary = _classify_and_rank(pd.DataFrame(rows))
+
+    sector_regimes: dict[str, str] = dict(
+        zip(summary["sector"], summary["regime"]),
+    )
+    ticker_regimes: dict[str, str] = {
+        ticker: sector_regimes.get(sector, "unknown")
+        for ticker, sector in ticker_sector_map.items()
+    }
+
+    _log_regime_distribution(summary, "sector")
+
+    return {
+        "sector_summary": summary,
+        "sector_regimes": sector_regimes,
+        "ticker_regimes": ticker_regimes,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-stock mode (HK, IN, or any market without sector ETFs)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_per_stock_rotation(
+    symbol_frames: dict[str, pd.DataFrame],
+    bench_close: pd.Series,
+    rs_sma_period: int,
+    rs_momentum_period: int,
+    smooth_span: int,
+    min_history: int,
+) -> dict:
+    rows: list[dict] = []
+    skipped = 0
+
+    for ticker, df in symbol_frames.items():
+        if df is None or df.empty or "close" not in df.columns:
+            skipped += 1
+            continue
+
+        stock_close = pd.to_numeric(df["close"], errors="coerce")
+        metrics = _compute_rs_for_one(
+            stock_close, bench_close,
+            rs_sma_period, rs_momentum_period, smooth_span, min_history,
+        )
+
+        if metrics is None:
+            skipped += 1
+            continue
+
+        rows.append({"ticker": ticker, "sector": ticker, **metrics})
+
+    logger.debug(
+        "Per-stock rotation: computed=%d  skipped=%d  total=%d",
+        len(rows), skipped, len(symbol_frames),
+    )
+
+    if not rows:
+        logger.warning(
+            "compute_sector_rotation: no stocks could be computed "
+            "(per-stock mode)"
+        )
+        return _empty_result()
+
+    summary = _classify_and_rank(pd.DataFrame(rows))
+
+    ticker_regimes: dict[str, str] = dict(
+        zip(summary["ticker"], summary["regime"]),
+    )
+    sector_regimes: dict[str, str] = dict(ticker_regimes)
+
+    _log_regime_distribution(summary, "ticker")
+
+    return {
+        "sector_summary": summary,
+        "sector_regimes": sector_regimes,
+        "ticker_regimes": ticker_regimes,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _empty_result() -> dict:
+    return {
+        "sector_summary": pd.DataFrame(),
+        "sector_regimes": {},
+        "ticker_regimes": {},
+    }
+
+############################################
+"""
+refactor/strategy/rs_v2.py
+
+Cross-sectional relative-strength z-score computation and RRG-style regime classification.
+
+Step 1 – compute_rs_zscores():
+    Builds a date × symbol panel of rolling log returns, subtracts the
+    benchmark return to get relative returns, then z-scores across the
+    full cross-section on every date.  Writes rszscore, rsaccel20, and
+    sectrszscore back into each per-symbol frame.
+
+Step 2 – enrich_rs_regimes():
+    Applies quadrant logic (level × momentum) to classify each symbol's
+    rszscore trajectory into one of four regimes: leading, improving,
+    weakening, lagging.  Same for sectrszscore → sectrsregime.
+"""
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-
-def _s(x, lo, hi):
-    denom = max(hi - lo, 1e-9)
-    return pd.Series(np.clip((x - lo) / denom, 0.0, 1.0), index=x.index)
-
-
-def _inv(x, lo, hi):
-    return 1.0 - _s(x, lo, hi)
+# ── Defaults ──────────────────────────────────────────────────────────────────
+RS_RETURN_LOOKBACK = 20     # rolling return window (trading days)
+RS_ACCEL_DIFF = 5           # window for Δ(rszscore) → rsaccel20
+RS_REGIME_MA_WINDOW = 10    # rolling-MA window for quadrant classification
+RS_MIN_HISTORY = 30         # minimum rows for a symbol to enter the panel
 
 
-def _log_score_distribution(out: pd.DataFrame) -> None:
-    if out.empty:
-        logger.info("scoring_v2 distribution skipped because dataframe is empty")
-        return
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 1 – cross-sectional z-scores
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_rs_zscores(
+    symbol_frames: dict[str, pd.DataFrame],
+    bench_df: pd.DataFrame,
+    lookback: int = RS_RETURN_LOOKBACK,
+    accel_diff: int = RS_ACCEL_DIFF,
+    min_history: int = RS_MIN_HISTORY,
+) -> dict[str, pd.DataFrame]:
+    """
+    Compute cross-sectional relative-strength z-scores for every symbol.
+
+    For each trading date with sufficient data:
+      1. Compute ``lookback``-period log return for the benchmark.
+      2. Compute ``lookback``-period log return for each symbol.
+      3. relative_return = symbol_return − benchmark_return
+      4. Z-score relative returns across the symbol cross-section.
+      5. rsaccel20 = diff(rszscore, ``accel_diff``) — short-term RS momentum.
+      6. If ≥ 2 real sectors exist, compute sector-level z-scores.
+
+    Returns a new dict with the same keys.  Each frame is a copy of the
+    original with ``rszscore``, ``rsaccel20``, and ``sectrszscore``
+    columns added or overwritten.
+    """
+    if not symbol_frames:
+        logger.warning("compute_rs_zscores: no symbol frames provided; returning unchanged")
+        return symbol_frames
+
+    # ── 1. benchmark return series ────────────────────────────────────────────
+    bench_close = pd.to_numeric(bench_df["close"], errors="coerce")
+    bench_ret = np.log(bench_close / bench_close.shift(lookback))
     logger.info(
-        "Composite distribution: min=%.4f p25=%.4f median=%.4f p75=%.4f max=%.4f mean=%.4f",
-        float(out["scorecomposite_v2"].min()),
-        float(out["scorecomposite_v2"].quantile(0.25)),
-        float(out["scorecomposite_v2"].median()),
-        float(out["scorecomposite_v2"].quantile(0.75)),
-        float(out["scorecomposite_v2"].max()),
-        float(out["scorecomposite_v2"].mean()),
-    )
-    logger.info(
-        "Bucket counts: >=0.80=%d >=0.70=%d >=0.62=%d >=0.50=%d <0.50=%d",
-        int((out["scorecomposite_v2"] >= 0.80).sum()),
-        int((out["scorecomposite_v2"] >= 0.70).sum()),
-        int((out["scorecomposite_v2"] >= 0.62).sum()),
-        int((out["scorecomposite_v2"] >= 0.50).sum()),
-        int((out["scorecomposite_v2"] < 0.50).sum()),
-    )
-
-
-def _log_component_summary(out: pd.DataFrame) -> None:
-    if out.empty:
-        return
-    logger.info(
-        "Component means: trend=%.4f participation=%.4f risk=%.4f regime=%.4f penalty=%.4f",
-        float(out["scoretrend"].mean()),
-        float(out["scoreparticipation"].mean()),
-        float(out["scorerisk"].mean()),
-        float(out["scoreregime"].mean()),
-        float(out["scorepenalty"].mean()),
-    )
-    logger.info(
-        "Penalty counts: penalty>0=%d rsi_penalty>0=%d adx_penalty>0=%d",
-        int((out["scorepenalty"] > 0).sum()),
-        int((out["rsi_penalty_v2"] > 0).sum()) if "rsi_penalty_v2" in out.columns else 0,
-        int((out["adx_penalty_v2"] > 0).sum()) if "adx_penalty_v2" in out.columns else 0,
+        "compute_rs_zscores: bench_rows=%d lookback=%d bench_ret_valid=%d",
+        len(bench_df), lookback, int(bench_ret.notna().sum()),
     )
 
+    # ── 2. build close-price panel and sector map ─────────────────────────────
+    close_dict: dict[str, pd.Series] = {}
+    sector_dict: dict[str, str] = {}
 
-def _log_debug_views(out: pd.DataFrame) -> None:
-    if out.empty or not logger.isEnabledFor(logging.DEBUG):
-        return
-    top_cols = [c for c in [
-        "ticker", "scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorepenalty", "scorecomposite_v2",
-        "stock_rs_v2", "sector_rs_v2", "rs_accel_v2", "trend_confirm_v2", "rvol_v2", "obv_v2", "adl_v2", "dvol_v2",
-        "vol_pen_v2", "liq_pen_v2", "gap_pen_v2", "ext_pen_v2", "breadthscore", "volregimescore", "rsi14", "adx14",
-        "rsi_penalty_v2", "adx_penalty_v2"
-    ] if c in out.columns]
-    logger.debug("Top composite rows:\n%s", out.sort_values("scorecomposite_v2", ascending=False)[top_cols].head(30).to_string(index=False))
-    logger.debug("Bottom composite rows:\n%s", out.sort_values("scorecomposite_v2", ascending=True)[top_cols].head(30).to_string(index=False))
-    near_cut = out[(out["scorecomposite_v2"] >= 0.45) & (out["scorecomposite_v2"] <= 0.70)]
-    if not near_cut.empty:
-        logger.debug("Near-threshold composite rows:\n%s", near_cut.sort_values("scorecomposite_v2", ascending=False)[top_cols].head(40).to_string(index=False))
+    for ticker, df in symbol_frames.items():
+        if df is None or df.empty or "close" not in df.columns:
+            continue
+        if len(df) < min_history:
+            logger.debug(
+                "compute_rs_zscores: excluding %s (rows=%d < min_history=%d)",
+                ticker, len(df), min_history,
+            )
+            continue
+        close_dict[ticker] = pd.to_numeric(df["close"], errors="coerce")
+        if "sector" in df.columns:
+            vals = df["sector"].dropna().astype(str)
+            sector_dict[ticker] = str(vals.iloc[-1]) if not vals.empty else "Unknown"
+        else:
+            sector_dict[ticker] = "Unknown"
+
+    if not close_dict:
+        logger.warning("compute_rs_zscores: no symbols with valid close data; returning unchanged")
+        return {t: f.copy() for t, f in symbol_frames.items()}
+
+    close_panel = pd.DataFrame(close_dict)
+    logger.info(
+        "compute_rs_zscores: close_panel shape=(%d dates, %d symbols)",
+        close_panel.shape[0], close_panel.shape[1],
+    )
+
+    # ── 3. symbol log-returns and relative returns ────────────────────────────
+    symbol_ret = np.log(close_panel / close_panel.shift(lookback))
+    bench_ret_aligned = bench_ret.reindex(symbol_ret.index)
+    relative_ret = symbol_ret.sub(bench_ret_aligned, axis=0)
+
+    # ── 4. cross-sectional z-score per date ───────────────────────────────────
+    cross_mean = relative_ret.mean(axis=1)
+    cross_std = relative_ret.std(axis=1, ddof=1)
+    cross_std = cross_std.where(cross_std > 1e-10, np.nan)
+    zscore_panel = relative_ret.sub(cross_mean, axis=0).div(cross_std, axis=0)
+
+    # ── 5. RS acceleration ────────────────────────────────────────────────────
+    rs_accel_panel = zscore_panel.diff(accel_diff)
+
+    # ── 6. sector-level z-scores ──────────────────────────────────────────────
+    sector_zscore_panel = _compute_sector_zscores(relative_ret, sector_dict)
+
+    # ── 7. write back into per-symbol frames ──────────────────────────────────
+    enriched: dict[str, pd.DataFrame] = {}
+    for ticker, df in symbol_frames.items():
+        out = df.copy()
+        if ticker in zscore_panel.columns:
+            out["rszscore"] = zscore_panel[ticker].reindex(out.index)
+            out["rsaccel20"] = rs_accel_panel[ticker].reindex(out.index)
+        else:
+            if "rszscore" not in out.columns:
+                out["rszscore"] = np.nan
+            if "rsaccel20" not in out.columns:
+                out["rsaccel20"] = 0.0
+
+        if sector_zscore_panel is not None and ticker in sector_zscore_panel.columns:
+            out["sectrszscore"] = sector_zscore_panel[ticker].reindex(out.index)
+        elif "sectrszscore" not in out.columns:
+            out["sectrszscore"] = np.nan
+
+        enriched[ticker] = out
+
+    # ── diagnostics ───────────────────────────────────────────────────────────
+    valid_per_date = zscore_panel.notna().sum(axis=1)
+    last_zscores = (
+        zscore_panel.iloc[-1].dropna()
+        if not zscore_panel.empty
+        else pd.Series(dtype=float)
+    )
+    logger.info(
+        "compute_rs_zscores: panel_dates=%d symbols_in_panel=%d "
+        "avg_valid_per_date=%.1f last_date_valid=%d",
+        len(zscore_panel),
+        len(close_dict),
+        float(valid_per_date.mean()) if not valid_per_date.empty else 0.0,
+        len(last_zscores),
+    )
+    if not last_zscores.empty:
+        logger.info(
+            "compute_rs_zscores last-date z-scores: "
+            "min=%.4f p25=%.4f median=%.4f p75=%.4f max=%.4f std=%.4f",
+            float(last_zscores.min()),
+            float(last_zscores.quantile(0.25)),
+            float(last_zscores.median()),
+            float(last_zscores.quantile(0.75)),
+            float(last_zscores.max()),
+            float(last_zscores.std()),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            ranked = last_zscores.sort_values(ascending=False)
+            logger.debug("compute_rs_zscores top-10 RS:\n%s", ranked.head(10).to_string())
+            logger.debug("compute_rs_zscores bottom-10 RS:\n%s", ranked.tail(10).to_string())
+
+    last_accel = (
+        rs_accel_panel.iloc[-1].dropna()
+        if not rs_accel_panel.empty
+        else pd.Series(dtype=float)
+    )
+    if not last_accel.empty:
+        logger.info(
+            "compute_rs_zscores last-date rsaccel: "
+            "min=%.4f median=%.4f max=%.4f",
+            float(last_accel.min()),
+            float(last_accel.median()),
+            float(last_accel.max()),
+        )
+
+    return enriched
 
 
-def compute_composite_v2(df: pd.DataFrame) -> pd.DataFrame:
-    out = ensure_columns(df)
-    if out.empty:
-        out["scoretrend"] = []
-        out["scoreparticipation"] = []
-        out["scorerisk"] = []
-        out["scoreregime"] = []
-        out["scorepenalty"] = []
-        out["scorecomposite_v2"] = []
+def _compute_sector_zscores(
+    relative_ret: pd.DataFrame,
+    sector_dict: dict[str, str],
+) -> pd.DataFrame | None:
+    """
+    For each date, average the relative returns within each sector, then
+    z-score the sector averages across sectors.  Map each symbol to its
+    sector's z-score.
+
+    Returns ``None`` if fewer than 2 real (non-Unknown) sectors exist.
+    """
+    if not sector_dict:
+        return None
+
+    sectors = pd.Series(sector_dict)
+    real_sectors = sorted(
+        s for s in sectors.unique() if s not in ("Unknown", "unknown", "")
+    )
+    if len(real_sectors) < 2:
+        logger.info(
+            "_compute_sector_zscores: %d real sector(s) found; need >= 2, skipping",
+            len(real_sectors),
+        )
+        return None
+
+    # per-sector average relative return per date
+    sector_avg_dict: dict[str, pd.Series] = {}
+    for sector in sectors.unique():
+        members = sectors[sectors == sector].index.tolist()
+        members_in_panel = [m for m in members if m in relative_ret.columns]
+        if members_in_panel:
+            sector_avg_dict[sector] = relative_ret[members_in_panel].mean(axis=1)
+
+    sector_avg = pd.DataFrame(sector_avg_dict)
+    if sector_avg.shape[1] < 2:
+        return None
+
+    sect_mean = sector_avg.mean(axis=1)
+    sect_std = sector_avg.std(axis=1, ddof=1).replace(0, np.nan)
+    sector_zscore = sector_avg.sub(sect_mean, axis=0).div(sect_std, axis=0)
+
+    # map each symbol to its sector's z-score
+    result = pd.DataFrame(index=relative_ret.index)
+    for ticker, sector in sector_dict.items():
+        if sector in sector_zscore.columns:
+            result[ticker] = sector_zscore[sector]
+        else:
+            result[ticker] = np.nan
+
+    logger.info(
+        "_compute_sector_zscores: sectors=%d symbols_mapped=%d",
+        len(sector_zscore.columns), len(result.columns),
+    )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 2 – RRG-style regime classification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def classify_rs_regime(
+    df: pd.DataFrame,
+    rs_col: str = "rszscore",
+    regime_col: str = "rsregime",
+    ma_window: int = RS_REGIME_MA_WINDOW,
+) -> pd.DataFrame:
+    """
+    Classify a single symbol's RS trajectory using quadrant logic.
+
+    The two axes are *level* (above/below zero) and *momentum*
+    (above/below a rolling MA of the z-score):
+
+    ============  =============================  ==============================
+    Quadrant      Condition                      Interpretation
+    ============  =============================  ==============================
+    leading       rs > 0  AND  rs > MA(rs)       strong & strengthening
+    improving     rs <= 0 AND  rs > MA(rs)       weak but strengthening
+    weakening     rs > 0  AND  rs <= MA(rs)      strong but fading
+    lagging       rs <= 0 AND  rs <= MA(rs)      weak & fading
+    ============  =============================  ==============================
+
+    Rows where the z-score or its MA is NaN are labelled ``'unknown'``.
+    """
+    out = df.copy()
+
+    if rs_col not in out.columns:
+        out[regime_col] = "unknown"
         return out
 
-    p = SCORINGPARAMS_V2
-    w = SCORINGWEIGHTS_V2
-    logger.info("compute_composite_v2 start: rows=%d", len(out))
-    logger.info("Scoring weights=%s", dict(w))
-    logger.info("Scoring params trend=%s participation=%s risk=%s regime=%s penalties=%s", p.get("trend"), p.get("participation"), p.get("risk"), p.get("regime"), p.get("penalties"))
+    rs = pd.to_numeric(out[rs_col], errors="coerce")
+    rs_ma = rs.rolling(ma_window, min_periods=max(3, ma_window // 2)).mean()
 
-    stock_rs = _s(pd.to_numeric(out["rszscore"], errors="coerce").fillna(0), -1.0, 2.0)
-    sector_rs = _s(pd.to_numeric(out.get("sectrszscore", pd.Series(0, index=out.index)), errors="coerce").fillna(0), -1.0, 2.0)
-    rs_accel = _s(pd.to_numeric(out.get("rsaccel20", pd.Series(0, index=out.index)), errors="coerce").fillna(0), -0.10, 0.15)
-    trend_confirm = _s(pd.to_numeric(out.get("closevsema30pct", pd.Series(0, index=out.index)), errors="coerce").fillna(0), -0.03, 0.10)
+    above_zero = rs > 0
+    above_ma = rs > rs_ma
 
-    out["stock_rs_v2"] = stock_rs
-    out["sector_rs_v2"] = sector_rs
-    out["rs_accel_v2"] = rs_accel
-    out["trend_confirm_v2"] = trend_confirm
-
-    out["scoretrend"] = (
-        p["trend"]["w_stock_rs"] * stock_rs
-        + p["trend"]["w_sector_rs"] * sector_rs
-        + p["trend"]["w_rs_accel"] * rs_accel
-        + p["trend"]["w_trend_confirm"] * trend_confirm
-    ).clip(0, 1)
-
-    rvol = _s(pd.to_numeric(out.get("relativevolume", pd.Series(1, index=out.index)), errors="coerce").fillna(1), 0.8, 2.2)
-    obv = _s(pd.to_numeric(out.get("obvslope10d", pd.Series(0, index=out.index)), errors="coerce").fillna(0), -0.05, 0.12)
-    adl = _s(pd.to_numeric(out.get("adlineslope10d", pd.Series(0, index=out.index)), errors="coerce").fillna(0), -0.05, 0.12)
-    dvol = _s(np.log1p(pd.to_numeric(out.get("dollarvolume20d", pd.Series(0, index=out.index)), errors="coerce").fillna(0)), 10, 18)
-
-    out["rvol_v2"] = rvol
-    out["obv_v2"] = obv
-    out["adl_v2"] = adl
-    out["dvol_v2"] = dvol
-
-    out["scoreparticipation"] = (
-        p["participation"]["w_rvol"] * rvol
-        + p["participation"]["w_obv"] * obv
-        + p["participation"]["w_adline"] * adl
-        + p["participation"]["w_dollar_volume"] * dvol
-    ).clip(0, 1)
-
-    atrp = pd.to_numeric(out.get("atr14pct", pd.Series(0, index=out.index)), errors="coerce").fillna(0)
-    illiq = pd.to_numeric(out.get("amihud20", pd.Series(0, index=out.index)), errors="coerce").fillna(0)
-    gap = pd.to_numeric(out.get("gaprate20", pd.Series(0, index=out.index)), errors="coerce").fillna(0)
-    extension = pd.to_numeric(out.get("closevssma50pct", pd.Series(0, index=out.index)), errors="coerce").fillna(0).abs()
-
-    vol_pen = _inv(atrp, 0.02, p["penalties"]["atrp_high"])
-    liq_pen = _inv(illiq, 0.0, p["penalties"]["illiquidity_bad"])
-    gap_pen = _inv(gap, 0.05, 0.30)
-    ext_pen = 1.0 - pd.Series(
+    regime = pd.Series(
         np.select(
             [
-                extension >= p["penalties"]["extension_bad"],
-                extension >= p["penalties"]["extension_warn"],
+                above_zero & above_ma,
+                ~above_zero & above_ma,
+                above_zero & ~above_ma,
+                ~above_zero & ~above_ma,
             ],
-            [1.0, 0.5],
-            default=0.0,
+            ["leading", "improving", "weakening", "lagging"],
+            default="unknown",
         ),
         index=out.index,
     )
 
-    out["vol_pen_v2"] = vol_pen
-    out["liq_pen_v2"] = liq_pen
-    out["gap_pen_v2"] = gap_pen
-    out["ext_pen_v2"] = ext_pen
+    # rows where the underlying data isn't ready → unknown
+    regime = regime.where(rs.notna(), "unknown")
+    regime = regime.where(rs_ma.notna(), "unknown")
 
-    out["scorerisk"] = (
-        p["risk"]["w_vol_penalty"] * vol_pen
-        + p["risk"]["w_liquidity_penalty"] * liq_pen
-        + p["risk"]["w_gap_penalty"] * gap_pen
-        + p["risk"]["w_extension_penalty"] * ext_pen
-    ).clip(0, 1)
-
-    breadth = pd.to_numeric(out.get("breadthscore", pd.Series(0.5, index=out.index)), errors="coerce").fillna(0.5)
-    volreg = pd.to_numeric(out.get("volregimescore", pd.Series(0.0, index=out.index)), errors="coerce").fillna(0.0)
-
-    out["scoreregime"] = (
-        p["regime"]["w_breadth"] * breadth
-        + p["regime"]["w_vol_regime"] * (1.0 - volreg)
-    ).clip(0, 1)
-
-    composite = (
-        w["trend"] * out["scoretrend"]
-        + w["participation"] * out["scoreparticipation"]
-        + w["risk"] * out["scorerisk"]
-        + w["regime"] * out["scoreregime"]
-    )
-
-    out["score_raw_v2"] = composite.clip(0, 1)
-
-    rsi = pd.to_numeric(out.get("rsi14", pd.Series(50, index=out.index)), errors="coerce").fillna(50)
-    adx = pd.to_numeric(out.get("adx14", pd.Series(20, index=out.index)), errors="coerce").fillna(20)
-    rsi_low = p["penalties"]["rsi_soft_low"]
-    rsi_high = p["penalties"]["rsi_soft_high"]
-
-    rsi_penalty = pd.Series(
-        np.where(
-            rsi < rsi_low,
-            (rsi_low - rsi) / 30.0,
-            np.where(rsi > rsi_high, (rsi - rsi_high) / 30.0, 0.0),
-        ),
-        index=out.index,
-    ).clip(0, 0.15)
-
-    adx_penalty = pd.Series(
-        np.where(adx < p["penalties"]["adx_soft_min"], (p["penalties"]["adx_soft_min"] - adx) / 30.0, 0.0),
-        index=out.index,
-    ).clip(0, 0.10)
-
-    out["rsi_penalty_v2"] = rsi_penalty
-    out["adx_penalty_v2"] = adx_penalty
-    out["scorepenalty"] = (rsi_penalty + adx_penalty).clip(0, 0.20)
-    out["scorecomposite_v2"] = (composite - out["scorepenalty"]).clip(0, 1)
-
-    _log_component_summary(out)
-    _log_score_distribution(out)
-    _log_debug_views(out)
+    out[regime_col] = regime
     return out
+
+
+def enrich_rs_regimes(
+    symbol_frames: dict[str, pd.DataFrame],
+    ma_window: int = RS_REGIME_MA_WINDOW,
+) -> dict[str, pd.DataFrame]:
+    """
+    Apply RS regime classification to every symbol frame.
+
+    Adds / overwrites:
+        rsregime      — stock-level RS quadrant   (from rszscore)
+        sectrsregime  — sector-level RS quadrant   (from sectrszscore)
+    """
+    enriched: dict[str, pd.DataFrame] = {}
+    rs_counts: dict[str, int] = {}
+    sect_counts: dict[str, int] = {}
+
+    for ticker, df in symbol_frames.items():
+        out = classify_rs_regime(
+            df, rs_col="rszscore", regime_col="rsregime", ma_window=ma_window,
+        )
+        out = classify_rs_regime(
+            out, rs_col="sectrszscore", regime_col="sectrsregime", ma_window=ma_window,
+        )
+        enriched[ticker] = out
+
+        if not out.empty:
+            last_rs = str(out["rsregime"].iloc[-1])
+            last_sect = str(out["sectrsregime"].iloc[-1])
+            rs_counts[last_rs] = rs_counts.get(last_rs, 0) + 1
+            sect_counts[last_sect] = sect_counts.get(last_sect, 0) + 1
+
+    logger.info(
+        "enrich_rs_regimes: symbols=%d last-row rsregime=%s",
+        len(enriched), rs_counts,
+    )
+    logger.info("enrich_rs_regimes: last-row sectrsregime=%s", sect_counts)
+    return enriched
 
 ##################################
-""" refactor/strategy/signals_v2.py """
-from __future__ import annotations
-
-import logging
-import numpy as np
-import pandas as pd
-
-from refactor.common.config_refactor import CONVERGENCEPARAMS_V2, SIGNALPARAMS_V2
-from .adapters_v2 import ensure_columns
-
-logger = logging.getLogger(__name__)
-
-
-def _log_bool_counts(out: pd.DataFrame, cols: list[str], prefix: str) -> None:
-    vals = {c: int(out[c].sum()) if c in out.columns else 0 for c in cols}
-    logger.info("%s counts=%s", prefix, vals)
-
-
-def _log_preview(out: pd.DataFrame, cols: list[str], label: str, n: int = 40) -> None:
-    if out.empty or not logger.isEnabledFor(logging.DEBUG):
-        return
-    cols = [c for c in cols if c in out.columns]
-    if cols:
-        logger.debug("%s:\n%s", label, out[cols].head(n).to_string(index=False))
-
-
-def apply_signals_v2(df: pd.DataFrame) -> pd.DataFrame:
-    out = ensure_columns(df)
-    if out.empty:
-        out["sig_vol_ok"] = []
-        out["sig_breadth_ok"] = []
-        out["sig_rs_ok"] = []
-        out["sig_sector_ok"] = []
-        out["sigeffectiveentrymin_v2"] = []
-        out["sig_setup_continuation"] = []
-        out["sig_setup_pullback"] = []
-        out["sig_setup_any"] = []
-        out["sigconfirmed_v2"] = []
-        out["sigpositionpct_v2"] = []
-        out["sigexit_v2"] = []
-        return out
-
-    p = SIGNALPARAMS_V2
-    logger.info("apply_signals_v2 start: rows=%d", len(out))
-    logger.info(
-        "Signal params: base_entry=%.4f base_exit=%.4f pullback_min_trend=%.4f continuation_min_trend=%.4f",
-        float(p.get("base_entry_threshold", 0.0)),
-        float(p.get("base_exit_threshold", 0.0)),
-        float(p.get("pullback_min_trend", 0.0)),
-        float(p.get("continuation_min_trend", 0.0)),
-    )
-
-    volreg = out.get("volregime", pd.Series("calm", index=out.index))
-    breadthreg = out.get("breadthregime", pd.Series("unknown", index=out.index))
-    rsreg = out.get("rsregime", pd.Series("unknown", index=out.index))
-    sectreg = out.get("sectrsregime", pd.Series("unknown", index=out.index))
-
-    out["sig_vol_ok"] = ~volreg.isin(p["hard_block_vol_regimes"])
-    out["sig_breadth_ok"] = ~breadthreg.isin(p["hard_block_breadth_regimes"])
-    out["sig_rs_ok"] = rsreg.isin(p["allowed_rs_regimes"])
-    out["sig_sector_ok"] = ~sectreg.isin(p["blocked_sector_regimes"])
-
-    vol_adj = volreg.map(p["regime_entry_adjustment"]).fillna(0)
-    breadth_adj = breadthreg.map(p["breadth_entry_adjustment"]).fillna(0)
-    out["sigeffectiveentrymin_v2"] = p["base_entry_threshold"] + vol_adj + breadth_adj
-
-    pullback_shape = (
-        (out.get("scoretrend", pd.Series(0, index=out.index)) >= p["pullback_min_trend"])
-        & (out.get("closevsema30pct", pd.Series(0, index=out.index)).between(-0.05, p["pullback_max_short_extension"]))
-        & (out.get("rsi14", pd.Series(50, index=out.index)) <= p["pullback_rsi_max"])
-    )
-    continuation_shape = (
-        (out.get("scoretrend", pd.Series(0, index=out.index)) >= p["continuation_min_trend"])
-        & (out.get("scoreparticipation", pd.Series(0, index=out.index)) >= 0.50)
-    )
-
-    out["sig_setup_continuation"] = continuation_shape
-    out["sig_setup_pullback"] = pullback_shape & volreg.isin(["volatile", "chaotic"])
-    out["sig_setup_any"] = out["sig_setup_continuation"] | out["sig_setup_pullback"]
-
-    base_ok = out["sig_vol_ok"] & out["sig_breadth_ok"] & out["sig_rs_ok"] & out["sig_sector_ok"] & out["sig_setup_any"]
-    out["sigconfirmed_v2"] = (base_ok & (out["scorecomposite_v2"] >= out["sigeffectiveentrymin_v2"])).astype(int)
-
-    size_mult = volreg.map(p["size_multipliers"]).fillna(1.0)
-    raw_size = 0.04 + 0.08 * ((out["scorecomposite_v2"] - p["base_entry_threshold"]) / max(1 - p["base_entry_threshold"], 1e-9))
-    out["sigpositionpct_v2"] = np.where(out["sigconfirmed_v2"].eq(1), np.clip(raw_size, 0.0, 0.12) * size_mult, 0.0)
-
-    out["sigexit_v2"] = (
-        (out["scorecomposite_v2"] <= p["base_exit_threshold"])
-        | (volreg == "chaotic")
-        | (sectreg == "lagging")
-    ).astype(int)
-
-    logger.info(
-        "Signal summary: vol_ok=%d breadth_ok=%d rs_ok=%d sector_ok=%d any_setup=%d confirmed=%d exits=%d",
-        int(out["sig_vol_ok"].sum()),
-        int(out["sig_breadth_ok"].sum()),
-        int(out["sig_rs_ok"].sum()),
-        int(out["sig_sector_ok"].sum()),
-        int(out["sig_setup_any"].sum()),
-        int(out["sigconfirmed_v2"].sum()),
-        int(out["sigexit_v2"].sum()),
-    )
-    logger.info(
-        "Signal setup counts: continuation=%d pullback=%d any=%d",
-        int(out["sig_setup_continuation"].sum()),
-        int(out["sig_setup_pullback"].sum()),
-        int(out["sig_setup_any"].sum()),
-    )
-    logger.info(
-        "sigeffectiveentrymin_v2 stats: min=%.4f median=%.4f max=%.4f",
-        float(out["sigeffectiveentrymin_v2"].min()),
-        float(out["sigeffectiveentrymin_v2"].median()),
-        float(out["sigeffectiveentrymin_v2"].max()),
-    )
-    _log_bool_counts(
-        out,
-        [
-            "sig_vol_ok",
-            "sig_breadth_ok",
-            "sig_rs_ok",
-            "sig_sector_ok",
-            "sig_setup_continuation",
-            "sig_setup_pullback",
-            "sig_setup_any",
-            "sigconfirmed_v2",
-            "sigexit_v2",
-        ],
-        "Signal bool",
-    )
-
-    _log_preview(
-        out,
-        [
-            "ticker",
-            "sig_vol_ok",
-            "sig_breadth_ok",
-            "sig_rs_ok",
-            "sig_sector_ok",
-            "sig_setup_continuation",
-            "sig_setup_pullback",
-            "sig_setup_any",
-            "scoretrend",
-            "scoreparticipation",
-            "scorecomposite_v2",
-            "sigeffectiveentrymin_v2",
-            "sigconfirmed_v2",
-            "sigpositionpct_v2",
-            "sigexit_v2",
-            "volregime",
-            "breadthregime",
-            "rsregime",
-            "sectrsregime",
-            "rsi14",
-            "adx14",
-            "closevsema30pct",
-        ],
-        "Signal preview",
-    )
-
-    if logger.isEnabledFor(logging.DEBUG):
-        failed = out[~out["sigconfirmed_v2"].eq(1)].copy()
-        if not failed.empty:
-            reasons = []
-            for _, row in failed.iterrows():
-                r = []
-                if not row.get("sig_vol_ok", False):
-                    r.append("vol_block")
-                if not row.get("sig_breadth_ok", False):
-                    r.append("breadth_block")
-                if not row.get("sig_rs_ok", False):
-                    r.append("rs_block")
-                if not row.get("sig_sector_ok", False):
-                    r.append("sector_block")
-                if not row.get("sig_setup_any", False):
-                    r.append("no_setup")
-                if row.get("scorecomposite_v2", 0.0) < row.get("sigeffectiveentrymin_v2", 0.0):
-                    r.append("below_entry")
-                reasons.append(";".join(r))
-            failed = failed.assign(rejection_reasons=reasons)
-            logger.debug(
-                "Signal rejects preview:\n%s",
-                failed[
-                    [
-                        c
-                        for c in [
-                            "ticker",
-                            "scorecomposite_v2",
-                            "sigeffectiveentrymin_v2",
-                            "sig_vol_ok",
-                            "sig_breadth_ok",
-                            "sig_rs_ok",
-                            "sig_sector_ok",
-                            "sig_setup_any",
-                            "rejection_reasons",
-                        ]
-                        if c in failed.columns
-                    ]
-                ]
-                .head(80)
-                .to_string(index=False)
-            )
-    return out
-
-
-def apply_convergence_v2(df: pd.DataFrame) -> pd.DataFrame:
-    out = ensure_columns(df)
-    if out.empty:
-        out["convergence_label_v2"] = []
-        out["convergence_tier_v2"] = []
-        out["scoreadjusted_v2"] = []
-        return out
-
-    p = CONVERGENCEPARAMS_V2
-    logger.info("apply_convergence_v2 start: rows=%d", len(out))
-    logger.info("Convergence params tiers=%s adjustments=%s", p.get("tiers"), p.get("adjustments"))
-
-    rotationrec = out.get("rotationrec", pd.Series("HOLD", index=out.index))
-    rotation_long = rotationrec.isin(["BUY", "STRONGBUY", "HOLD"])
-    score_long = out.get("sigconfirmed_v2", pd.Series(0, index=out.index)).eq(1)
-
-    labels = np.select(
-        [
-            rotation_long & score_long,
-            rotation_long & ~score_long,
-            ~rotation_long & score_long,
-            rotationrec.eq("CONFLICT"),
-        ],
-        ["aligned_long", "rotation_long_only", "score_long_only", "mixed"],
-        default="avoid",
-    )
-
-    out["convergence_label_v2"] = labels
-    out["convergence_tier_v2"] = pd.Series(labels, index=out.index).map(p["tiers"]).fillna(0)
-
-    adj = out.get("volregime", pd.Series("calm", index=out.index)).map(p["adjustments"]).fillna(0)
-    boost = np.where(
-        out["convergence_label_v2"] == "aligned_long",
-        adj,
-        np.where(out["convergence_label_v2"] == "mixed", -adj, 0.0),
-    )
-    out["scoreadjusted_v2"] = (out["scorecomposite_v2"] + boost).clip(0, 1)
-
-    logger.info(
-        "Convergence summary: aligned_long=%d rotation_long_only=%d score_long_only=%d mixed=%d avoid=%d",
-        int((out["convergence_label_v2"] == "aligned_long").sum()),
-        int((out["convergence_label_v2"] == "rotation_long_only").sum()),
-        int((out["convergence_label_v2"] == "score_long_only").sum()),
-        int((out["convergence_label_v2"] == "mixed").sum()),
-        int((out["convergence_label_v2"] == "avoid").sum()),
-    )
-    logger.info("Convergence tiers: %s", out["convergence_tier_v2"].value_counts(dropna=False).to_dict())
-    logger.info(
-        "scoreadjusted_v2 stats: min=%.4f median=%.4f max=%.4f",
-        float(out["scoreadjusted_v2"].min()),
-        float(out["scoreadjusted_v2"].median()),
-        float(out["scoreadjusted_v2"].max()),
-    )
-
-    if logger.isEnabledFor(logging.DEBUG):
-        cols = [c for c in ["ticker", "rotationrec", "sigconfirmed_v2", "convergence_label_v2", "convergence_tier_v2", "scorecomposite_v2", "scoreadjusted_v2", "volregime"] if c in out.columns]
-        logger.debug("Convergence preview:\n%s", out[cols].head(50).to_string(index=False))
-        logger.debug("Highest adjusted scores:\n%s", out.sort_values("scoreadjusted_v2", ascending=False)[cols].head(50).to_string(index=False))
-        logger.debug("Lowest adjusted scores:\n%s", out.sort_values("scoreadjusted_v2", ascending=True)[cols].head(50).to_string(index=False))
-
-    return out.sort_values(["convergence_tier_v2", "scoreadjusted_v2"], ascending=[False, False])
-
-#############################################
