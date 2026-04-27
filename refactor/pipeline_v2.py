@@ -1,5 +1,38 @@
 """refactor/pipeline_v2.py"""
 from __future__ import annotations
+"""
+D1. SCORING
+    scoretrend, scoreparticipation, scorerisk, scoreregime
+    scorerotation = binary (old: 1.0 if sector=="leading" else 0.0)
+    scorecomposite_v2 = weighted sum (first pass)
+              │
+              ▼
+D2. SECTOR ROTATION (rotation_v2.py)
+    ├── RS analysis per sector ETF vs SPY
+    ├── ETF universe composite scoring (SOXX, AIQ, XLK, etc.)
+    ├── Blended regime per sector (RRG 65% + ETF composite 35%)
+    └── Returns: sector_regimes, ticker_regimes, sector_summary, etf_ranking
+              │
+              ▼
+D3. ENRICHMENT (enrich_v2.py)          ◄── THIS IS THE NEW STEP
+    ├── Maps each ticker → its sector regime
+    ├── scorerotation = graded (leading=1.0, improving=0.65, weakening=0.30, lagging=0.0)
+    ├── etf_boost = ±0.10 from sector ETF composite vs universe median
+    ├── scorerotation = base + etf_boost, clamped [0, 1]
+    └── scorecomposite_v2 = recomputed with updated scorerotation
+              │
+              ▼
+E. ACTION ASSIGNMENT
+    Uses enriched scorecomposite_v2 → STRONG_BUY / BUY / HOLD / SELL
+              │
+              ▼
+F. PORTFOLIO CONSTRUCTION
+              │
+              ▼
+G. RETURN DICT
+    includes: sector_summary, etf_ranking (for runner display)
+"""
+
 
 import logging
 import math
@@ -9,11 +42,12 @@ import pandas as pd
 
 from compute.indicators import compute_all_indicators
 
-from common.sector_map import get_sector_or_class
-
-from .strategy.adapters_v2 import ensure_columns
-from .strategy.breadth_v2 import compute_breadth
-from .strategy.portfolio_v2 import (
+from common.sector_map import get_sector_or_class, get_theme          # ── CHANGED: added get_theme
+# At the top of pipeline_v2.py, add the import:
+from refactor.strategy.enrich_v2 import enrich_with_rotation
+from refactor.strategy.adapters_v2 import ensure_columns
+from refactor.strategy.breadth_v2 import compute_breadth
+from refactor.strategy.portfolio_v2 import (
     build_portfolio_v2,
     DEFAULT_MAX_POSITIONS,
     DEFAULT_MAX_SECTOR_WEIGHT,
@@ -21,11 +55,11 @@ from .strategy.portfolio_v2 import (
     DEFAULT_MAX_SINGLE_WEIGHT,
     DEFAULT_MIN_WEIGHT,
 )
-from .strategy.regime_v2 import classify_volatility_regime
-from .strategy.rotation_v2 import compute_sector_rotation
-from .strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
-from .strategy.scoring_v2 import compute_composite_v2
-from .strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
+from refactor.strategy.regime_v2 import classify_volatility_regime
+from refactor.strategy.rotation_v2 import compute_sector_rotation
+from refactor.strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
+from refactor.strategy.scoring_v2 import compute_composite_v2
+from refactor.strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
 from refactor.common.config_refactor import (
     VOLREGIMEPARAMS,
     SCORINGWEIGHTS_V2,
@@ -230,6 +264,9 @@ def _build_leadership_snapshot(leadership_frames: dict[str, pd.DataFrame]) -> pd
         if not row.get("sector") or row["sector"] == "Unknown":
             row["sector"] = get_sector_or_class(ticker)
         row["sector"] = row.get("sector") or "Unknown"
+        # ── CHANGED: enrich theme in leadership snapshot ──────────────────────
+        if not row.get("theme") or row["theme"] == "Unknown":
+            row["theme"] = get_theme(ticker) or "Unknown"
         rows.append(row)
     snap = pd.DataFrame(rows)
     if snap.empty:
@@ -333,18 +370,6 @@ def _add_score_percentiles(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CHANGED: _log_action_diagnostics REMOVED (was only called by old
-#    _generate_actions; the simplified version below does not need it)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CHANGED: _generate_actions completely replaced with simplified logic.
-#    Only three gates: score floor, percentile rank, and score-vs-entry.
-#    No momentum / confirmation / context / overextension boolean cascades.
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     ap = params if params is not None else ACTIONPARAMS_V2
 
@@ -372,7 +397,6 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         "sigeffectiveentrymin_v2", pd.Series(0.50, index=out.index),
     ).fillna(0.50)
 
-    # Thresholds from config
     sell_floor = se.get("floor_score", 0.35)
     sell_pct_floor = se.get("floor_percentile", 0.10)
     sb_min_pct = sb.get("min_percentile", 0.85)
@@ -406,27 +430,18 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         pv = float(pct.loc[i])
         e = float(entry.loc[i])
 
-        # ── 1. SELL: below absolute floor ─────────────────────
         if s < sell_floor or pv <= sell_pct_floor:
             action = "SELL"
             reason = "Below sell floor"
-
-        # ── 2. STRONG_BUY: top tier ──────────────────────────
         elif pv >= sb_min_pct and s >= max(sb_min_score, e + sb_above):
             action = "STRONG_BUY"
             reason = "Top-tier score and percentile"
-
-        # ── 3. BUY: above buy threshold ──────────────────────
         elif pv >= bu_min_pct and s >= max(bu_min_score, e + bu_above):
             action = "BUY"
             reason = "Above buy threshold"
-
-        # ── 4. HOLD: in hold band ────────────────────────────
         elif pv >= ho_min_pct and s >= max(ho_min_score, e - ho_below):
             action = "HOLD"
             reason = "In hold band"
-
-        # ── 5. SELL: everything else ─────────────────────────
         else:
             action = "SELL"
             reason = "Below hold band"
@@ -459,10 +474,6 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         ["action_sort_key_v2", sort_col], ascending=[False, False]
     ).reset_index(drop=True)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _build_review_table — UNCHANGED
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_review_table(action_table: pd.DataFrame, action_params: dict | None = None) -> pd.DataFrame:
     if action_table.empty:
@@ -518,10 +529,6 @@ def _build_review_table(action_table: pd.DataFrame, action_params: dict | None =
     return review
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _build_selling_exhaustion_table — UNCHANGED
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], breadth_regime: str, vol_regime: str, leadership_snapshot: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for ticker, df in tradable_frames.items():
@@ -555,8 +562,12 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
         vol_down_streak = int((vol_col.diff().dropna() < 0).tail(3).sum()) if vol_col.notna().all() else 0
         price_5d_change = float(close_col.iloc[-1] / close_col.iloc[0] - 1.0) if close_col.notna().all() and close_col.iloc[0] != 0 else None
 
+        # ── CHANGED: enrich sector and theme for exhaustion candidates ────────
+        sector = get_sector_or_class(ticker) or "Unknown"
+        theme = get_theme(ticker) or "Unknown"
+
         leadership = _lookup_group_strength(
-            pd.Series({"ticker": ticker, "sector": tail.iloc[-1].get("sector", "Unknown"), "theme": tail.iloc[-1].get("theme", "Unknown")}),
+            pd.Series({"ticker": ticker, "sector": sector, "theme": theme}),
             leadership_snapshot,
         )
 
@@ -611,8 +622,8 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
             "price_vs_ema30_pct": last_ext, "atr_14_pct": last_atr,
             "gap_rate_20": last_gap, "leadership_strength": leadership,
             "breadthregime": breadth_regime, "volregime": vol_regime,
-            "sector": tail.iloc[-1].get("sector", "Unknown"),
-            "theme": tail.iloc[-1].get("theme", "Unknown"),
+            "sector": sector,                                              # ── CHANGED: was tail.iloc[-1].get(...)
+            "theme": theme,                                                # ── CHANGED: was tail.iloc[-1].get(...)
             "decision_hint": "Use only with confirmation; stronger when RSI turns up, price firms, and volume re-expands",
         })
 
@@ -623,10 +634,6 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
     logger.info("Selling exhaustion table built: rows=%d", len(out))
     return out.sort_values(["reversal_trigger_score", "selling_exhaustion_score", "rsi_14", "price_5d_change"], ascending=[False, False, True, True]).reset_index(drop=True)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _build_skipped_table — UNCHANGED
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_skipped_table(skipped_rows: list[dict]) -> pd.DataFrame:
     if not skipped_rows:
@@ -642,7 +649,6 @@ def _build_skipped_table(skipped_rows: list[dict]) -> pd.DataFrame:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main pipeline entry point
-# ── CHANGED: added precomputed parameter + fast-path guards
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline_v2(
@@ -653,14 +659,13 @@ def run_pipeline_v2(
     leadership_frames: dict[str, pd.DataFrame] | None = None,
     portfolio_params: dict | None = None,
     config: dict | None = None,
-    precomputed: bool = False,                                         # ── NEW
+    precomputed: bool = False,
 ) -> dict:
     if bench_df is None or bench_df.empty:
         raise ValueError("bench_df is required and cannot be empty")
 
     config = config or {}
 
-    # ── unpack ALL config blocks ──────────────────────────────────────────────
     vol_regime_params  = config.get("vol_regime_params")   or config.get("VOLREGIMEPARAMS", None)
     scoring_weights    = config.get("scoring_weights")     or config.get("SCORINGWEIGHTS_V2", None)
     scoring_params     = config.get("scoring_params")      or config.get("SCORINGPARAMS_V2", None)
@@ -675,10 +680,10 @@ def run_pipeline_v2(
         market, len(tradable_frames), len(leadership_frames or {}), precomputed,
     )
 
-    # ── A. volatility regime from benchmark (always runs — single ticker) ─────
+    # ── A. volatility regime from benchmark ───────────────────────────────────
     regime_df = classify_volatility_regime(bench_df, params=vol_regime_params)
 
-    # ── B. merge all symbol frames into one working universe ──────────────────
+    # ── B. merge all symbol frames ────────────────────────────────────────────
     all_symbol_frames: dict[str, pd.DataFrame] = {}
     if leadership_frames:
         all_symbol_frames.update(leadership_frames)
@@ -692,7 +697,7 @@ def run_pipeline_v2(
         len(set(tradable_frames) & set(leadership_frames or {})),
     )
 
-    # ── C. BREADTH (always runs — lightweight aggregation) ────────────────────
+    # ── C. BREADTH ────────────────────────────────────────────────────────────
     breadth_computed_df = compute_breadth(all_symbol_frames, params=breadth_params)
 
     if (
@@ -723,7 +728,6 @@ def run_pipeline_v2(
     )
 
     # ── D. CROSS-SECTIONAL RS ─────────────────────────────────────────────────
-    # ── CHANGED: skip when precomputed (already in frames from engine) ────────
     if not precomputed:
         all_symbol_frames = compute_rs_zscores(all_symbol_frames, bench_df)
         all_symbol_frames = enrich_rs_regimes(all_symbol_frames)
@@ -741,7 +745,7 @@ def run_pipeline_v2(
         if k in all_symbol_frames
     }
 
-    # ── D2. SECTOR ROTATION (always runs — reads RS from frames) ─────────────
+    # ── D2. SECTOR ROTATION ──────────────────────────────────────────────────
     rotation_result = compute_sector_rotation(
         all_symbol_frames,
         bench_df,
@@ -751,9 +755,9 @@ def run_pipeline_v2(
     sector_regimes = rotation_result["sector_regimes"]
     ticker_regimes = rotation_result["ticker_regimes"]
     sector_summary = rotation_result["sector_summary"]
+    etf_ranking    = rotation_result.get("etf_ranking", pd.DataFrame())   # ── NEW
 
     # ── E. leadership snapshot ────────────────────────────────────────────────
-    # ── CHANGED: skip expensive leadership build in precomputed mode ──────────
     if precomputed:
         leadership_snapshot = pd.DataFrame()
         logger.info("Skipping leadership snapshot build (precomputed=True)")
@@ -783,7 +787,6 @@ def run_pipeline_v2(
         lagging_sectors or ["none"],
     )
 
-    # ── rotation recommendation mapping ───────────────────────────────────────
     _cp = convergence_params if convergence_params is not None else CONVERGENCEPARAMS_V2
     _sect_to_rec = _cp.get("rotation_rec_map", {
         "leading":   "STRONGBUY",
@@ -808,7 +811,6 @@ def run_pipeline_v2(
             logger.debug("Skipping empty tradable frame for %s", ticker)
             continue
 
-        # ── CHANGED: skip _prepare_frame when precomputed ─────────────────────
         if precomputed:
             row = df.iloc[-1].to_dict()
         else:
@@ -818,7 +820,6 @@ def run_pipeline_v2(
         row["ticker"] = ticker
         row["instrument_type"] = _instrument_type(ticker)
 
-        # ── attach pipeline-level context (UNCHANGED) ─────────────────────────
         _row_vol = row.get("volregime")
         if _row_vol is None or str(_row_vol).lower() in ("unknown", "nan", ""):
             row["volregime"] = last_vol.get("volregime", "calm")
@@ -844,6 +845,10 @@ def run_pipeline_v2(
             row["sector"] = get_sector_or_class(ticker)
         row["sector"] = row.get("sector") or "Unknown"
 
+        # ── CHANGED: enrich theme from sector_map ─────────────────────────────
+        if not row.get("theme") or row["theme"] == "Unknown":
+            row["theme"] = get_theme(ticker) or "Unknown"
+
         _row_sr = row.get("sectrsregime")
         if _row_sr is None or str(_row_sr).lower() in ("unknown", "nan", ""):
             row["sectrsregime"] = ticker_regimes.get(ticker, "unknown")
@@ -854,8 +859,6 @@ def run_pipeline_v2(
                 str(row.get("sectrsregime", "unknown")).lower(),
                 _sect_to_rec_default,
             )
-
-        row["theme"] = row.get("theme") or "Unknown"
 
         is_scoreable = bool(row.get("scoreable_v2", True))
         if not is_scoreable:
@@ -887,7 +890,7 @@ def run_pipeline_v2(
             logger.debug(
                 "Prepared %s last-row snapshot: close=%.4f rsi14=%.2f adx14=%.2f "
                 "atr14pct=%.4f rvol=%.2f rszscore=%s rsregime=%s sectrsregime=%s "
-                "rotationrec=%s breadth=%s vol=%s dispersion20=%s sector=%s",
+                "rotationrec=%s breadth=%s vol=%s dispersion20=%s sector=%s theme=%s",
                 ticker,
                 float(row.get("close", 0.0) or 0.0),
                 float(row.get("rsi14", 50.0) or 50.0),
@@ -902,6 +905,7 @@ def run_pipeline_v2(
                 row.get("volregime", "unknown"),
                 row.get("dispersion20", "missing"),
                 row.get("sector", "Unknown"),
+                row.get("theme", "Unknown"),                               # ── CHANGED: log theme
             )
             prep_logged += 1
 
@@ -934,6 +938,11 @@ def run_pipeline_v2(
             sr_dist = latest["sectrsregime"].value_counts().to_dict()
             logger.info("Scoreable set sectrsregime distribution: %s", sr_dist)
 
+        # ── CHANGED: log theme distribution ───────────────────────────────────
+        if "theme" in latest.columns:
+            theme_dist = latest["theme"].value_counts().to_dict()
+            logger.info("Scoreable set theme distribution: %s", theme_dist)
+
         if logger.isEnabledFor(logging.DEBUG):
             cols = [c for c in [
                 "ticker", "close", "rsi14", "adx14", "atr14pct", "relativevolume",
@@ -954,6 +963,38 @@ def run_pipeline_v2(
             + _lead_w * scored.get("leadership_strength", 0.0)
         ).clip(0, 1)
 
+            # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────────
+        #   This replaces the binary scorerotation (0 or 1) with a graded
+        #   value (0.0–1.0) based on blended regime + ETF composite boost,
+        #   then recomputes scorecomposite_v2.
+        #
+        #   Must run AFTER scoring (D1) and rotation (D2),
+        #   but BEFORE action assignment (E) and portfolio construction (F).
+
+        enrich_params = {
+            "regime_scores": {
+                "leading":    1.00,
+                "improving":  0.65,
+                "weakening":  0.30,
+                "lagging":    0.00,
+                "unknown":    0.15,
+            },
+            "apply_etf_boost": True,
+            "recompute_composite": True,
+            "composite_weights": {
+                "scoretrend":         0.30,
+                "scoreparticipation": 0.20,
+                "scorerisk":          0.15,
+                "scoreregime":        0.15,
+                "scorerotation":      0.20,
+            },
+        }
+
+        scored = enrich_with_rotation(
+            scored_df=scored,          # your scored DataFrame from step D1
+            rotation_result=rotation_result,
+            params=enrich_params,
+        )
         _sp = signal_params if signal_params is not None else SIGNALPARAMS_V2
         _diag_entry = _sp.get("base_entry_threshold", 0.55)
         logger.info(
@@ -966,7 +1007,8 @@ def run_pipeline_v2(
             int((scored["scorecomposite_v2"] >= 0.50).sum()),
         )
         if logger.isEnabledFor(logging.DEBUG):
-            cols = [c for c in ["ticker", "scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorepenalty", "scorecomposite_v2", "rsi14", "adx14", "relativevolume"] if c in scored.columns]
+            # ── CHANGED: added scorerotation to debug preview ─────────────────
+            cols = [c for c in ["ticker", "scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorerotation", "scorepenalty", "scorecomposite_v2", "rsi14", "adx14", "relativevolume", "sectrsregime"] if c in scored.columns]
             logger.debug("Top scored names:\n%s", scored.sort_values("scorecomposite_v2", ascending=False)[cols].head(30).to_string(index=False))
 
     signaled = apply_signals_v2(scored, params=signal_params) if not scored.empty else pd.DataFrame()
@@ -993,7 +1035,6 @@ def run_pipeline_v2(
             cols = [c for c in ["ticker", "action_v2", "conviction_v2", "scorecomposite_v2", "scoreadjusted_v2", "score_percentile_v2", "rsi14", "adx14", "relativevolume", "sectrsregime", "rotationrec", "convergence_label_v2", "action_reason_v2"] if c in action_table.columns]
             logger.debug("Action table preview:\n%s", action_table[cols].head(50).to_string(index=False))
 
-    # ── CHANGED: skip review + exhaustion tables in precomputed mode ──────────
     if precomputed:
         review_table = pd.DataFrame()
         selling_exhaustion_table = pd.DataFrame()
@@ -1007,8 +1048,6 @@ def run_pipeline_v2(
             leadership_snapshot,
         )
 
-    # ── CHANGED: skip portfolio construction in precomputed mode ──────────────
-    #    (backtest engine only needs action_table to extract BUY/SELL signals)
     if precomputed:
         portfolio = {
             "selected": pd.DataFrame(),
@@ -1067,5 +1106,6 @@ def run_pipeline_v2(
         "breadth_df": breadth_computed_df,
         "sector_summary": sector_summary,
         "sector_regimes": sector_regimes,
+        "etf_ranking": etf_ranking,
         "leadership_snapshot": leadership_snapshot,
     }

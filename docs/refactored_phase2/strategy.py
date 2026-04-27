@@ -1,4 +1,3 @@
-""" Strategy Files """
 """
 refactor/strategy/adapters_v2.py
 
@@ -374,7 +373,7 @@ def validate_frame(
     }
 
 
-############################
+################
 """
 refactor/strategy/breadth_v2.py
 
@@ -609,7 +608,302 @@ def compute_breadth(
 
     return breadth
 
-######################################
+
+#####################################
+"""refactor/strategy/enrich_v2.py – Enrich scored tickers with blended rotation data."""
+from __future__ import annotations
+
+import logging
+import math
+from typing import Any
+
+import pandas as pd
+
+from common.sector_map import get_sector_or_class
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REGIME → scorerotation mapping
+# ═══════════════════════════════════════════════════════════════
+#  Old behaviour: leading=1.0, everything else=0.0
+#  New behaviour: graded so "improving" and "weakening" get partial credit
+
+DEFAULT_REGIME_SCORES: dict[str, float] = {
+    "leading":    1.00,
+    "improving":  0.65,
+    "weakening":  0.30,
+    "lagging":    0.00,
+    "unknown":    0.15,   # no rotation data available for this sector
+}
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        return default if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Sector lookup helper
+# ═══════════════════════════════════════════════════════════════
+
+def _resolve_sector(row: dict | pd.Series, ticker: str) -> str:
+    """
+    Try multiple column names to find the sector for a ticker row.
+    Falls back to the common.sector_map lookup.
+    """
+    for col in ("sector", "gics_sector", "industry_sector", "sector_name"):
+        val = row.get(col) if isinstance(row, dict) else getattr(row, col, None)
+        if val is not None and str(val).strip() and str(val).strip().lower() != "nan":
+            return str(val).strip()
+    # Fallback to static map
+    mapped = get_sector_or_class(ticker)
+    if mapped:
+        return mapped
+    return "Unknown"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ETF composite boost
+# ═══════════════════════════════════════════════════════════════
+
+def _compute_etf_boost(
+    sector: str,
+    sector_summary: pd.DataFrame,
+    etf_ranking: pd.DataFrame,
+) -> float:
+    """
+    Optional small boost/penalty from the ETF composite score for the
+    sector's canonical ETF.  Returns a value in [-0.10, +0.10] that
+    can be added to scorerotation.
+
+    If the sector ETF composite is above the universe median → positive.
+    If below → negative.  Magnitude scaled by distance from median.
+    """
+    if sector_summary is None or sector_summary.empty:
+        return 0.0
+
+    # Find this sector's row in sector_summary
+    match = sector_summary[sector_summary["sector"] == sector]
+    if match.empty:
+        return 0.0
+
+    etf_composite = _safe_float(match.iloc[0].get("etf_composite"), 0.5)
+
+    # Universe median from etf_ranking
+    if etf_ranking is not None and not etf_ranking.empty and "etf_composite" in etf_ranking.columns:
+        median = etf_ranking["etf_composite"].median()
+    else:
+        median = 0.50
+
+    # Scale: distance from median, capped at ±0.10
+    raw = (etf_composite - median) * 0.50  # half the distance
+    return max(-0.10, min(0.10, raw))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Main enrichment function
+# ═══════════════════════════════════════════════════════════════
+
+def enrich_with_rotation(
+    scored_df: pd.DataFrame,
+    rotation_result: dict[str, Any],
+    params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Enrich a scored DataFrame with blended sector rotation data.
+
+    Reads from rotation_result:
+      - sector_regimes   : {sector_name: regime_str}
+      - ticker_regimes   : {ticker: regime_str}
+      - sector_summary   : DataFrame with per-sector detail
+      - etf_ranking      : DataFrame with per-ETF scores
+
+    Updates / adds columns on scored_df:
+      - rotation_regime      : str  ("leading", "improving", …)
+      - scorerotation        : float (graded 0.0–1.0, replaces old binary)
+      - etf_boost            : float (±0.10 from ETF composite vs median)
+      - rotation_blended     : float (blended score from sector_summary)
+      - scorecomposite_v2    : float (recomputed if weight columns present)
+
+    Returns the enriched DataFrame (modified in place for efficiency,
+    but also returned for chaining).
+    """
+    params = params or {}
+    regime_scores = params.get("regime_scores", DEFAULT_REGIME_SCORES)
+    apply_etf_boost = params.get("apply_etf_boost", True)
+    recompute_composite = params.get("recompute_composite", True)
+
+    sector_regimes: dict[str, str] = rotation_result.get("sector_regimes", {})
+    ticker_regimes: dict[str, str] = rotation_result.get("ticker_regimes", {})
+    sector_summary: pd.DataFrame = rotation_result.get("sector_summary", pd.DataFrame())
+    etf_ranking: pd.DataFrame = rotation_result.get("etf_ranking", pd.DataFrame())
+
+    if scored_df is None or scored_df.empty:
+        logger.warning("enrich_with_rotation: scored_df is empty, nothing to enrich")
+        return scored_df
+
+    n = len(scored_df)
+    ticker_col = None
+    for col in ("ticker", "symbol"):
+        if col in scored_df.columns:
+            ticker_col = col
+            break
+    if ticker_col is None:
+        logger.warning("enrich_with_rotation: no ticker column found in scored_df")
+        return scored_df
+
+    # ── Pre-enrichment stats ──────────────────────────────────────────────
+    old_rotation_col = "scorerotation"
+    had_old = old_rotation_col in scored_df.columns
+    if had_old:
+        old_mean = scored_df[old_rotation_col].mean()
+        old_median = scored_df[old_rotation_col].median()
+    else:
+        old_mean = old_median = 0.0
+
+    # ── Build sector lookup from sector_summary for ETF boost ─────────────
+    sector_etf_composite: dict[str, float] = {}
+    if isinstance(sector_summary, pd.DataFrame) and not sector_summary.empty:
+        for _, srow in sector_summary.iterrows():
+            sec = str(srow.get("sector", ""))
+            if sec:
+                sector_etf_composite[sec] = _safe_float(srow.get("etf_composite"), 0.5)
+
+    # ── Enrich each row ───────────────────────────────────────────────────
+    regimes: list[str] = []
+    rot_scores: list[float] = []
+    etf_boosts: list[float] = []
+    blended_vals: list[float] = []
+
+    for _, row in scored_df.iterrows():
+        ticker = str(row[ticker_col])
+
+        # 1. Resolve regime
+        regime = ticker_regimes.get(ticker)
+        if regime is None:
+            sector = _resolve_sector(row, ticker)
+            regime = sector_regimes.get(sector, "unknown")
+        regimes.append(regime)
+
+        # 2. Graded scorerotation
+        base_score = regime_scores.get(regime, regime_scores.get("unknown", 0.15))
+
+        # 3. ETF composite boost
+        if apply_etf_boost:
+            sector = _resolve_sector(row, ticker)
+            boost = _compute_etf_boost(sector, sector_summary, etf_ranking)
+        else:
+            boost = 0.0
+        etf_boosts.append(round(boost, 4))
+
+        final_rot = max(0.0, min(1.0, base_score + boost))
+        rot_scores.append(round(final_rot, 4))
+
+        # 4. Blended score from sector_summary (for diagnostics)
+        sector = _resolve_sector(row, ticker)
+        blended = 0.0
+        if isinstance(sector_summary, pd.DataFrame) and not sector_summary.empty:
+            match = sector_summary[sector_summary["sector"] == sector]
+            if not match.empty:
+                blended = _safe_float(match.iloc[0].get("blended_score"), 0.0)
+        blended_vals.append(round(blended, 4))
+
+    scored_df["rotation_regime"] = regimes
+    scored_df["scorerotation"] = rot_scores
+    scored_df["etf_boost"] = etf_boosts
+    scored_df["rotation_blended"] = blended_vals
+
+    # ── Recompute composite if weights are available ──────────────────────
+    if recompute_composite:
+        _recompute_composite(scored_df, params)
+
+    # ── Post-enrichment stats ─────────────────────────────────────────────
+    new_mean = scored_df["scorerotation"].mean()
+    new_median = scored_df["scorerotation"].median()
+
+    regime_dist: dict[str, int] = {}
+    for r in regimes:
+        regime_dist[r] = regime_dist.get(r, 0) + 1
+
+    logger.info(
+        "enrich_with_rotation: n=%d  "
+        "scorerotation old(mean=%.3f median=%.3f) → new(mean=%.3f median=%.3f)  "
+        "regime_dist=%s  etf_boost(mean=%.4f)",
+        n,
+        old_mean, old_median,
+        new_mean, new_median,
+        regime_dist,
+        sum(etf_boosts) / max(len(etf_boosts), 1),
+    )
+
+    return scored_df
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Composite recomputation
+# ═══════════════════════════════════════════════════════════════
+
+def _recompute_composite(scored_df: pd.DataFrame, params: dict) -> None:
+    """
+    Recompute scorecomposite_v2 using the updated scorerotation.
+
+    Only runs if all required sub-score columns are present.
+    Uses the same weights as the original composite calculator.
+    """
+    required = ["scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorerotation"]
+    missing = [c for c in required if c not in scored_df.columns]
+    if missing:
+        logger.debug(
+            "enrich_with_rotation: skipping composite recompute — missing columns: %s",
+            missing,
+        )
+        return
+
+    # Default weights (should match scoring_v2 weights)
+    weights = params.get("composite_weights", {
+        "scoretrend":         0.30,
+        "scoreparticipation": 0.20,
+        "scorerisk":          0.15,
+        "scoreregime":        0.15,
+        "scorerotation":      0.20,
+    })
+
+    old_composite_col = "scorecomposite_v2"
+    had_old = old_composite_col in scored_df.columns
+    if had_old:
+        old_mean = scored_df[old_composite_col].mean()
+    else:
+        old_mean = 0.0
+
+    composite = pd.Series(0.0, index=scored_df.index)
+    for col, weight in weights.items():
+        if col in scored_df.columns:
+            composite += scored_df[col].fillna(0.0).astype(float) * weight
+
+    # Apply penalty if present
+    if "scorepenalty" in scored_df.columns:
+        composite = composite - scored_df["scorepenalty"].fillna(0.0).astype(float)
+
+    composite = composite.clip(0.0, 1.0)
+    scored_df[old_composite_col] = composite.round(4)
+
+    new_mean = scored_df[old_composite_col].mean()
+    logger.info(
+        "enrich_with_rotation: recomputed %s  mean %.4f → %.4f  (delta=%+.4f)",
+        old_composite_col,
+        old_mean,
+        new_mean,
+        new_mean - old_mean,
+    )
+
+#####################################################
 """
 refactor/strategy/portfolio_v2.py
 
@@ -1174,7 +1468,8 @@ def _empty_portfolio(breadth_regime: str, vol_regime: str) -> dict:
         },
     }
 
-##########################################
+
+####################################
 """refactor/strategy/regime_v2.py"""
 from __future__ import annotations
 
@@ -1245,481 +1540,896 @@ def classify_volatility_regime(
         index=df.index,
     )
 
-#################################
-"""
-refactor/strategy/rotation_v2.py
-
-Rotation engine with RRG-style quadrant classification.
-
-US market  (sector-ETF mode)
-----------------------------
-Computes relative strength of the 11 GICS sector ETFs versus SPY and
-classifies each sector into a rotation quadrant.  Every stock in the
-universe inherits its parent sector's regime via TICKER_SECTOR_MAP.
-
-HK / IN markets  (per-stock mode)
-----------------------------------
-No sector ETFs are available, so the engine computes per-stock relative
-strength versus the market benchmark (2800.HK for HK, NIFTYBEES.NS for
-IN) and classifies each stock directly into a rotation quadrant.
-
-Quadrants (classic clockwise RRG rotation)
-------------------------------------------
-    leading    - RS above its trend AND accelerating
-    improving  - RS below its trend BUT accelerating
-    weakening  - RS above its trend BUT decelerating
-    lagging    - RS below its trend AND decelerating
-
-Output
-------
-``compute_sector_rotation`` returns a dict with:
-
-    sector_summary  - DataFrame with rotation metrics and regime.
-    sector_regimes  - dict[str, str]  sector -> regime
-    ticker_regimes  - dict[str, str]  ticker -> regime
-
-All RS computation parameters are configurable via params dict.
-"""
+############################
+"""refactor/strategy/rotation_v2.py – Sector rotation with ETF composite scoring."""
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import pandas as pd
 
+from common.sector_map import get_sector_or_class
+
+from refactor.common.config_refactor import ROTATIONPARAMS
+
 logger = logging.getLogger(__name__)
 
-# ── US sector map (imported if available) ─────────────────────────────────────
-try:
-    from common.sector_map import (
-        SECTOR_ETFS as _US_SECTOR_ETFS,
-        TICKER_SECTOR_MAP as _US_TICKER_SECTOR_MAP,
-    )
-except ImportError:
-    _US_SECTOR_ETFS: dict[str, str] = {}
-    _US_TICKER_SECTOR_MAP: dict[str, str] = {}
-    logger.debug(
-        "common.sector_map not available; US sector-ETF rotation disabled"
-    )
+# ═══════════════════════════════════════════════════════════════════════════════
+# ETF ↔ Sector / Theme mappings
+# ═══════════════════════════════════════════════════════════════════════════════
 
-MARKET_SECTOR_ETFS: dict[str, dict[str, str]] = {
-    "US": dict(_US_SECTOR_ETFS) if _US_SECTOR_ETFS else {},
-    "HK": {},
-    "IN": {},
+SECTOR_ETF = {
+    "Technology":              "XLK",
+    "Financials":              "XLF",
+    "Energy":                  "XLE",
+    "Healthcare":              "XLV",
+    "Industrials":             "XLI",
+    "Communication Services":  "XLC",
+    "Consumer Discretionary":  "XLY",
+    "Consumer Staples":        "XLP",
+    "Utilities":               "XLU",
+    "Real Estate":             "XLRE",
+    "Materials":               "XLB",
 }
 
-MARKET_TICKER_SECTOR_MAP: dict[str, dict[str, str]] = {
-    "US": dict(_US_TICKER_SECTOR_MAP) if _US_TICKER_SECTOR_MAP else {},
-    "HK": {},
-    "IN": {},
+ETF_TO_SECTOR = {v: k for k, v in SECTOR_ETF.items()}
+
+THEMATIC_ETF_SECTOR = {
+    "SOXX": "Technology",   "SMH": "Technology",
+    "IGV": "Technology",    "SKYY": "Technology",
+    "HACK": "Technology",   "CIBR": "Technology",
+    "BOTZ": "Technology",   "AIQ": "Technology",
+    "QTUM": "Technology",   "FINX": "Financials",
+    "XBI": "Healthcare",    "IBB": "Healthcare",
+    "ARKG": "Healthcare",
+    "TAN": "Energy",        "ICLN": "Energy",
+    "URA": "Energy",        "NLR": "Energy",
+    "URNM": "Energy",       "LIT": "Materials",
+    "DRIV": "Consumer Discretionary",
+    "IBIT": "Financials",   "BLOK": "Technology",
+    "MTUM": "Broad",        "ITA": "Industrials",
+    "ARKK": "Technology",
 }
 
-# ── Module-level defaults (used when no params dict is supplied) ──────────────
-RS_SMA_PERIOD = 50
-RS_MOMENTUM_PERIOD = 20
-RS_SMOOTH_SPAN = 10
-MIN_HISTORY = 60
+ETF_THEME = {
+    "SOXX": "Semiconductors",    "SMH": "Semiconductors",
+    "IGV": "Software",           "SKYY": "Cloud Computing",
+    "HACK": "Cybersecurity",     "CIBR": "Cybersecurity",
+    "BOTZ": "Robotics & AI",     "AIQ": "AI & Big Data",
+    "QTUM": "Quantum Computing", "FINX": "Fintech",
+    "XBI": "Biotech",            "IBB": "Biotech",
+    "ARKG": "Genomics",
+    "TAN": "Solar",              "ICLN": "Clean Energy",
+    "LIT": "Lithium & Battery",  "URA": "Uranium",
+    "NLR": "Nuclear",            "URNM": "Uranium",
+    "DRIV": "Autonomous & EV",
+    "IBIT": "Bitcoin",           "BLOK": "Blockchain",
+    "MTUM": "Momentum Factor",   "ITA": "Defense & Aerospace",
+    "ARKK": "Innovation",
+    "XLK": "Technology",         "XLF": "Financials",
+    "XLE": "Energy",             "XLV": "Healthcare",
+    "XLI": "Industrials",        "XLC": "Communication Services",
+    "XLY": "Consumer Discretionary", "XLP": "Consumer Staples",
+    "XLU": "Utilities",          "XLRE": "Real Estate",
+    "XLB": "Materials",
+}
 
+BROAD_ETFS = {"SPY", "QQQ", "IWM", "DIA", "MDY"}
+REGIONAL_ETFS = {
+    "KWEB", "EEM", "EFA", "VWO", "FXI", "EWJ",
+    "EWZ", "INDA", "EWG", "EWT", "EWY",
+}
+FIXED_INCOME_ETFS = {"TLT", "IEF", "HYG", "LQD", "TIP", "AGG"}
+COMMODITY_ETFS = {"GLD", "SLV", "USO", "UNG", "DBA", "DBC"}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Market auto-detection
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _detect_market(symbol_frames: dict[str, pd.DataFrame]) -> str:
-    hk = 0
-    india = 0
-    other = 0
-    for ticker in symbol_frames:
-        t = ticker.upper()
-        if t.endswith(".HK"):
-            hk += 1
-        elif t.endswith(".NS") or t.endswith(".BO"):
-            india += 1
-        else:
-            other += 1
-    total = hk + india + other
-    if total == 0:
-        return "US"
-    if hk > total * 0.5:
-        return "HK"
-    if india > total * 0.5:
-        return "IN"
-    return "US"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Public API  (FIX 9: accepts params dict)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def compute_sector_rotation(
-    symbol_frames: dict[str, pd.DataFrame],
-    bench_df: pd.DataFrame,
-    market: str | None = None,
-    params: dict | None = None,
-) -> dict:
-    """
-    Compute rotation quadrants.
-
-    Parameters
-    ----------
-    symbol_frames : dict
-        Ticker -> OHLCV DataFrame.
-    bench_df : DataFrame
-        Benchmark OHLCV data.
-    market : str, optional
-        Market code ("US", "HK", "IN").  Auto-detected if None.
-    params : dict, optional
-        Configuration overrides.  Recognised keys:
-            rs_sma_period, rs_momentum_period, smooth_span, min_history
-    """
-    # ── unpack config ─────────────────────────────────────────────────────
-    p = params or {}
-    rs_sma_period = p.get("rs_sma_period", RS_SMA_PERIOD)
-    rs_momentum_period = p.get("rs_momentum_period", RS_MOMENTUM_PERIOD)
-    smooth_span = p.get("smooth_span", RS_SMOOTH_SPAN)
-    min_history = p.get("min_history", MIN_HISTORY)
-
-    logger.info(
-        "compute_sector_rotation params: rs_sma=%d rs_mom=%d smooth=%d min_hist=%d",
-        rs_sma_period, rs_momentum_period, smooth_span, min_history,
-    )
-
-    if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
-        logger.warning("compute_sector_rotation: benchmark missing or empty")
-        return _empty_result()
-
-    bench_close = pd.to_numeric(bench_df["close"], errors="coerce")
-    if int(bench_close.notna().sum()) < min_history:
-        logger.warning(
-            "compute_sector_rotation: insufficient benchmark history (%d rows)",
-            int(bench_close.notna().sum()),
-        )
-        return _empty_result()
-
-    # ── resolve market ────────────────────────────────────────────────────
-    if market is None:
-        market = _detect_market(symbol_frames)
-        logger.debug(
-            "Sector rotation: auto-detected market=%s from %d tickers",
-            market, len(symbol_frames),
-        )
-
-    market = market.upper()
-    sector_etfs = MARKET_SECTOR_ETFS.get(market, {})
-
-    # ── sector-ETF mode (US) ──────────────────────────────────────────────
-    if sector_etfs:
-        available = sum(
-            1 for etf in sector_etfs.values()
-            if etf in symbol_frames
-            and symbol_frames[etf] is not None
-            and not symbol_frames[etf].empty
-        )
-        if available > 0:
-            logger.debug(
-                "Sector rotation: sector-ETF mode  market=%s  "
-                "etfs_available=%d/%d",
-                market, available, len(sector_etfs),
-            )
-            result = _compute_sector_etf_rotation(
-                symbol_frames=symbol_frames,
-                bench_close=bench_close,
-                sector_etfs=sector_etfs,
-                ticker_sector_map=MARKET_TICKER_SECTOR_MAP.get(market, {}),
-                rs_sma_period=rs_sma_period,
-                rs_momentum_period=rs_momentum_period,
-                smooth_span=smooth_span,
-                min_history=min_history,
-            )
-            if result["ticker_regimes"]:
-                return result
-            logger.warning(
-                "Sector rotation: sector-ETF mode produced empty results; "
-                "falling back to per-stock mode"
-            )
-        else:
-            logger.debug(
-                "Sector rotation: market=%s but 0/%d sector ETFs "
-                "present in symbol_frames; falling back to per-stock mode",
-                market, len(sector_etfs),
-            )
-
-    # ── per-stock mode (HK, IN, or fallback) ─────────────────────────────
-    logger.debug(
-        "Sector rotation: per-stock mode  market=%s  "
-        "(%d tickers vs benchmark)",
-        market, len(symbol_frames),
-    )
-    return _compute_per_stock_rotation(
-        symbol_frames=symbol_frames,
-        bench_close=bench_close,
-        rs_sma_period=rs_sma_period,
-        rs_momentum_period=rs_momentum_period,
-        smooth_span=smooth_span,
-        min_history=min_history,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Shared helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _compute_rs_for_one(
-    target_close: pd.Series,
-    bench_close: pd.Series,
-    rs_sma_period: int,
-    rs_momentum_period: int,
-    smooth_span: int,
-    min_history: int,
-) -> dict | None:
-    combined = pd.DataFrame(
-        {"target": target_close, "bench": bench_close},
-    ).dropna()
-
-    if len(combined) < min_history:
-        return None
-
-    rs_raw = combined["target"] / combined["bench"]
-    rs = rs_raw.ewm(
-        span=smooth_span,
-        min_periods=max(3, smooth_span // 2),
-    ).mean()
-
-    rs_sma = rs.rolling(
-        rs_sma_period,
-        min_periods=int(rs_sma_period * 0.7),
-    ).mean()
-    rs_level = rs / rs_sma - 1.0
-
-    rs_mom = rs.pct_change(rs_momentum_period)
-
-    rs_roc_5 = rs.pct_change(5)
-    excess_20 = (
-        combined["target"].pct_change(20)
-        - combined["bench"].pct_change(20)
-    )
-
-    last_level = rs_level.iloc[-1]
-    last_mom = rs_mom.iloc[-1]
-
-    if pd.isna(last_level) or pd.isna(last_mom):
-        return None
-
-    return {
-        "rs_level": float(last_level),
-        "rs_momentum": float(last_mom),
-        "rs_roc_5d": (
-            float(rs_roc_5.iloc[-1])
-            if pd.notna(rs_roc_5.iloc[-1])
-            else None
-        ),
-        "excess_return_20d": (
-            float(excess_20.iloc[-1])
-            if pd.notna(excess_20.iloc[-1])
-            else None
-        ),
-        "rs_ratio_last": float(rs.iloc[-1]),
-    }
-
-
-def _classify_and_rank(summary: pd.DataFrame) -> pd.DataFrame:
-    summary["regime"] = np.select(
-        [
-            (summary["rs_level"] > 0) & (summary["rs_momentum"] > 0),
-            (summary["rs_level"] <= 0) & (summary["rs_momentum"] > 0),
-            (summary["rs_level"] > 0) & (summary["rs_momentum"] <= 0),
-        ],
-        ["leading", "improving", "weakening"],
-        default="lagging",
-    )
-
-    summary["rs_rank"] = (
-        summary["rs_level"]
-        .rank(ascending=False, method="min")
-        .astype(int)
-    )
-    summary["momentum_rank"] = (
-        summary["rs_momentum"]
-        .rank(ascending=False, method="min")
-        .astype(int)
-    )
-
-    return summary.sort_values("rs_rank").reset_index(drop=True)
-
-
-def _log_regime_distribution(
-    summary: pd.DataFrame,
-    label_col: str,
-    max_display: int = 20,
-) -> None:
-    regime_dist = summary["regime"].value_counts().to_dict()
-    logger.debug("Rotation regime distribution: %s", regime_dist)
-
-    for regime in ("leading", "improving", "weakening", "lagging"):
-        members = summary.loc[
-            summary["regime"] == regime, label_col
-        ].tolist()
-        display = members[:max_display]
-        suffix = (
-            f" ... (+{len(members) - max_display})"
-            if len(members) > max_display
-            else ""
-        )
-        logger.debug(
-            "  %-12s: %s%s",
-            regime.title(),
-            display or ["none"],
-            suffix,
-        )
-
-    if logger.isEnabledFor(logging.DEBUG):
-        display_cols = [
-            label_col, "regime", "rs_rank", "momentum_rank",
-            "rs_level", "rs_momentum", "excess_return_20d",
-        ]
-        cols = [c for c in display_cols if c in summary.columns]
-        logger.debug(
-            "Rotation summary:\n%s",
-            summary[cols].to_string(index=False),
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Sector-ETF mode (US)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _compute_sector_etf_rotation(
-    symbol_frames: dict[str, pd.DataFrame],
-    bench_close: pd.Series,
-    sector_etfs: dict[str, str],
-    ticker_sector_map: dict[str, str],
-    rs_sma_period: int,
-    rs_momentum_period: int,
-    smooth_span: int,
-    min_history: int,
-) -> dict:
-    rows: list[dict] = []
-    skipped_missing = 0
-    skipped_short = 0
-
-    for sector_name, etf_ticker in sector_etfs.items():
-        etf_df = symbol_frames.get(etf_ticker)
-        if etf_df is None or etf_df.empty or "close" not in etf_df.columns:
-            skipped_missing += 1
-            continue
-
-        etf_close = pd.to_numeric(etf_df["close"], errors="coerce")
-        metrics = _compute_rs_for_one(
-            etf_close, bench_close,
-            rs_sma_period, rs_momentum_period, smooth_span, min_history,
-        )
-
-        if metrics is None:
-            skipped_short += 1
-            continue
-
-        rows.append({"sector": sector_name, "etf": etf_ticker, **metrics})
-
-    logger.debug(
-        "Sector rotation: computed=%d  skipped_missing=%d  skipped_short=%d",
-        len(rows), skipped_missing, skipped_short,
-    )
-
-    if not rows:
-        logger.warning("compute_sector_rotation: no sectors could be computed")
-        return _empty_result()
-
-    summary = _classify_and_rank(pd.DataFrame(rows))
-
-    sector_regimes: dict[str, str] = dict(
-        zip(summary["sector"], summary["regime"]),
-    )
-    ticker_regimes: dict[str, str] = {
-        ticker: sector_regimes.get(sector, "unknown")
-        for ticker, sector in ticker_sector_map.items()
-    }
-
-    _log_regime_distribution(summary, "sector")
-
-    return {
-        "sector_summary": summary,
-        "sector_regimes": sector_regimes,
-        "ticker_regimes": ticker_regimes,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Per-stock mode (HK, IN, or any market without sector ETFs)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _compute_per_stock_rotation(
-    symbol_frames: dict[str, pd.DataFrame],
-    bench_close: pd.Series,
-    rs_sma_period: int,
-    rs_momentum_period: int,
-    smooth_span: int,
-    min_history: int,
-) -> dict:
-    rows: list[dict] = []
-    skipped = 0
-
-    for ticker, df in symbol_frames.items():
-        if df is None or df.empty or "close" not in df.columns:
-            skipped += 1
-            continue
-
-        stock_close = pd.to_numeric(df["close"], errors="coerce")
-        metrics = _compute_rs_for_one(
-            stock_close, bench_close,
-            rs_sma_period, rs_momentum_period, smooth_span, min_history,
-        )
-
-        if metrics is None:
-            skipped += 1
-            continue
-
-        rows.append({"ticker": ticker, "sector": ticker, **metrics})
-
-    logger.debug(
-        "Per-stock rotation: computed=%d  skipped=%d  total=%d",
-        len(rows), skipped, len(symbol_frames),
-    )
-
-    if not rows:
-        logger.warning(
-            "compute_sector_rotation: no stocks could be computed "
-            "(per-stock mode)"
-        )
-        return _empty_result()
-
-    summary = _classify_and_rank(pd.DataFrame(rows))
-
-    ticker_regimes: dict[str, str] = dict(
-        zip(summary["ticker"], summary["regime"]),
-    )
-    sector_regimes: dict[str, str] = dict(ticker_regimes)
-
-    _log_regime_distribution(summary, "ticker")
-
-    return {
-        "sector_summary": summary,
-        "sector_regimes": sector_regimes,
-        "ticker_regimes": ticker_regimes,
-    }
+ROTATION_ETFS = set(ETF_TO_SECTOR) | set(THEMATIC_ETF_SECTOR)
+ALL_TRACKED_ETFS = ROTATION_ETFS | BROAD_ETFS | REGIONAL_ETFS
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _empty_result() -> dict:
+def _safe_float(val, default: float = 0.0) -> float:
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        return default if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
+def _get(row: dict, *keys, default=None):
+    """Return the first non-null value found among *keys*."""
+    for k in keys:
+        v = row.get(k)
+        if v is not None:
+            try:
+                if not math.isnan(float(v)):
+                    return v
+            except (TypeError, ValueError):
+                return v
+    return default
+
+
+def _normalize(val: float, lo: float, hi: float) -> float:
+    if hi <= lo:
+        return 0.5
+    return max(0.0, min(1.0, (val - lo) / (hi - lo)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inline indicator computation for ETF frames (OHLCV → indicators)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_etf_indicators(df: pd.DataFrame) -> dict:
+    """
+    Compute technical indicators from a raw OHLCV DataFrame.
+
+    Called when ETF frames have not been through the stock indicator pipeline.
+    Returns dict keyed by the canonical column names that _compute_etf_composite
+    expects: rsi14, adx14, closevsema30pct, closevssma50pct, macdhist,
+    relativevolume, realizedvol20d, gaprate20, atr14pct.
+    """
+    out: dict[str, float] = {}
+    if df is None or len(df) < 2:
+        return out
+
+    close = pd.to_numeric(df["close"], errors="coerce") if "close" in df.columns else None
+    if close is None or close.dropna().empty:
+        return out
+
+    high = (
+        pd.to_numeric(df["high"], errors="coerce")
+        if "high" in df.columns
+        else close
+    )
+    low = (
+        pd.to_numeric(df["low"], errors="coerce")
+        if "low" in df.columns
+        else close
+    )
+    open_ = (
+        pd.to_numeric(df["open"], errors="coerce")
+        if "open" in df.columns
+        else close
+    )
+    volume = (
+        pd.to_numeric(df["volume"], errors="coerce")
+        if "volume" in df.columns
+        else None
+    )
+
+    n = len(close)
+    alpha14 = 1.0 / 14
+
+    # ── RSI-14 (Wilder smoothing) ─────────────────────────────────────────
+    if n >= 16:
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + rs)
+        val = rsi.iloc[-1]
+        if pd.notna(val):
+            out["rsi14"] = float(np.clip(val, 0, 100))
+
+    # ── ADX-14 + ATR-14 pct ──────────────────────────────────────────────
+    if n >= 30:
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+            axis=1,
+        ).max(axis=1)
+
+        up_move = high - high.shift(1)
+        dn_move = low.shift(1) - low
+
+        plus_dm = pd.Series(
+            np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0),
+            index=close.index,
+        )
+        minus_dm = pd.Series(
+            np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0),
+            index=close.index,
+        )
+
+        atr_s = tr.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+        plus_di = (
+            100
+            * plus_dm.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+            / atr_s.replace(0, np.nan)
+        )
+        minus_di = (
+            100
+            * minus_dm.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+            / atr_s.replace(0, np.nan)
+        )
+
+        di_sum = plus_di + minus_di
+        dx = 100 * (plus_di - minus_di).abs() / di_sum.replace(0, np.nan)
+        adx = dx.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+
+        adx_val = adx.iloc[-1]
+        if pd.notna(adx_val):
+            out["adx14"] = float(np.clip(adx_val, 0, 100))
+
+        atr_val = atr_s.iloc[-1]
+        c_val = close.iloc[-1]
+        if pd.notna(atr_val) and pd.notna(c_val) and c_val > 0:
+            out["atr14pct"] = float(atr_val / c_val)
+
+    # ── Close vs EMA-30 % ────────────────────────────────────────────────
+    if n >= 30:
+        ema30 = close.ewm(span=30, min_periods=30, adjust=False).mean()
+        e_val = ema30.iloc[-1]
+        c_val = close.iloc[-1]
+        if pd.notna(e_val) and pd.notna(c_val) and e_val > 0:
+            out["closevsema30pct"] = float(c_val / e_val - 1.0)
+
+    # ── Close vs SMA-50 % ────────────────────────────────────────────────
+    if n >= 50:
+        sma50 = close.rolling(50).mean()
+        s_val = sma50.iloc[-1]
+        c_val = close.iloc[-1]
+        if pd.notna(s_val) and pd.notna(c_val) and s_val > 0:
+            out["closevssma50pct"] = float(c_val / s_val - 1.0)
+
+    # ── MACD histogram (12, 26, 9) ───────────────────────────────────────
+    if n >= 35:
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        signal = macd_line.ewm(span=9, adjust=False).mean()
+        hist = macd_line - signal
+        val = hist.iloc[-1]
+        if pd.notna(val):
+            out["macdhist"] = float(val)
+
+    # ── Relative volume (current bar vs 20d average) ─────────────────────
+    if volume is not None and n >= 21:
+        vol_clean = volume.dropna()
+        if len(vol_clean) >= 21:
+            avg_20 = vol_clean.iloc[-21:-1].mean()
+            cur = vol_clean.iloc[-1]
+            if pd.notna(avg_20) and avg_20 > 0 and pd.notna(cur):
+                out["relativevolume"] = float(cur / avg_20)
+
+    # ── Realized volatility 20d (annualized) ─────────────────────────────
+    if n >= 22:
+        log_ret = np.log(close / close.shift(1)).dropna()
+        if len(log_ret) >= 20:
+            out["realizedvol20d"] = float(log_ret.iloc[-20:].std() * np.sqrt(252))
+
+    # ── Gap rate 20 (fraction of days with |gap| > 1%) ───────────────────
+    if n >= 22 and "open" in df.columns:
+        prev_c = close.shift(1)
+        gap_pct = ((open_ - prev_c) / prev_c.replace(0, np.nan)).abs()
+        last_20 = gap_pct.iloc[-20:]
+        valid = last_20.dropna()
+        if len(valid) > 0:
+            out["gaprate20"] = float((valid > 0.01).sum() / len(valid))
+
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ETF composite scoring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_etf_composite(row: dict, params: dict) -> dict[str, float]:
+    """
+    Score a single ETF on a 0-1 composite from its latest-bar indicators.
+
+    Returns dict with sub-scores and the final composite for diagnostics.
+    """
+    sp = params.get("etf_scoring", {})
+    w_trend = sp.get("trend_weight", 0.35)
+    w_mom   = sp.get("momentum_weight", 0.30)
+    w_part  = sp.get("participation_weight", 0.20)
+    w_risk  = sp.get("risk_weight", 0.15)
+
+    # ── trend ─────────────────────────────────────────────────────────────────
+    rsi     = _safe_float(_get(row, "rsi14", "rsi_14"), 50.0)
+    adx     = _safe_float(_get(row, "adx14", "adx_14"), 15.0)
+    ema_pct = _safe_float(_get(row, "closevsema30pct", "close_vs_ema_30_pct"), 0.0)
+    sma_pct = _safe_float(_get(row, "closevssma50pct", "close_vs_sma_50_pct"), 0.0)
+
+    rsi_sc = _normalize(rsi, 30.0, 70.0)
+    adx_sc = _normalize(adx, 10.0, 40.0)
+    ema_sc = _normalize(ema_pct, -0.05, 0.10)
+    sma_sc = _normalize(sma_pct, -0.08, 0.15)
+
+    trend = 0.35 * rsi_sc + 0.30 * adx_sc + 0.20 * ema_sc + 0.15 * sma_sc
+
+    # ── momentum ──────────────────────────────────────────────────────────────
+    rs_z      = _safe_float(_get(row, "rszscore"), 0.0)
+    ret_20d   = _safe_float(_get(row, "return20d"), 0.0)
+    macd_hist = _safe_float(_get(row, "macdhist", "macd_hist"), 0.0)
+
+    rs_z_sc  = _normalize(rs_z, -2.0, 2.0)
+    ret_sc   = _normalize(ret_20d, -0.10, 0.15)
+    macd_sc  = _normalize(macd_hist, -0.5, 0.5)
+
+    momentum = 0.50 * rs_z_sc + 0.30 * ret_sc + 0.20 * macd_sc
+
+    # ── participation ─────────────────────────────────────────────────────────
+    rvol = _safe_float(_get(row, "relativevolume", "relative_volume"), 1.0)
+    participation = _normalize(rvol, 0.5, 2.0)
+
+    # ── risk adjustment (higher = lower risk = better) ────────────────────────
+    real_vol = _safe_float(_get(row, "realizedvol20d", "realized_vol_20d"), 0.20)
+    gap_rate = _safe_float(_get(row, "gaprate20", "gap_rate_20"), 0.30)
+    atr_pct  = _safe_float(_get(row, "atr14pct", "atr_14_pct"), 0.02)
+
+    vol_sc = 1.0 - _normalize(real_vol, 0.10, 0.50)
+    gap_sc = 1.0 - _normalize(gap_rate, 0.10, 0.70)
+    atr_sc = 1.0 - _normalize(atr_pct, 0.01, 0.05)
+
+    risk_adj = 0.40 * vol_sc + 0.30 * gap_sc + 0.30 * atr_sc
+
+    composite = w_trend * trend + w_mom * momentum + w_part * participation + w_risk * risk_adj
+    composite = max(0.0, min(1.0, composite))
+
     return {
-        "sector_summary": pd.DataFrame(),
-        "sector_regimes": {},
-        "ticker_regimes": {},
+        "trend": round(trend, 4),
+        "momentum": round(momentum, 4),
+        "participation": round(participation, 4),
+        "risk_adj": round(risk_adj, 4),
+        "composite": round(composite, 4),
     }
 
-############################################
+
+def _extract_etf_row(df: pd.DataFrame) -> dict | None:
+    """
+    Extract the last row of an ETF frame as a dict.
+
+    If key indicator columns are absent (i.e. the frame was never run through
+    the stock indicator pipeline), compute them inline from OHLCV so that
+    _compute_etf_composite gets real values instead of defaults.
+    """
+    if df is None or df.empty:
+        return None
+    row = df.iloc[-1].to_dict()
+
+    # ── 20d return (always computed from close) ───────────────────────────
+    if "close" in df.columns and len(df) >= 20:
+        close = pd.to_numeric(df["close"], errors="coerce")
+        c_now = close.iloc[-1]
+        c_20 = close.iloc[-20] if len(close) >= 20 else close.iloc[0]
+        if pd.notna(c_now) and pd.notna(c_20) and c_20 > 0:
+            row["return20d"] = float(c_now / c_20 - 1.0)
+
+    # ── Inline indicator computation if upstream didn't provide them ──────
+    # Check for ANY of the canonical indicator names
+    has_rsi = _get(row, "rsi14", "rsi_14") is not None
+    has_adx = _get(row, "adx14", "adx_14") is not None
+    has_rvol = _get(row, "relativevolume", "relative_volume") is not None
+    has_ema = _get(row, "closevsema30pct", "close_vs_ema_30_pct") is not None
+
+    if not (has_rsi and has_adx and has_rvol and has_ema):
+        computed = _compute_etf_indicators(df)
+        n_filled = 0
+        for k, v in computed.items():
+            if row.get(k) is None:
+                row[k] = v
+                n_filled += 1
+        ticker = row.get("ticker", row.get("symbol", "?"))
+        if n_filled > 0:
+            logger.debug(
+                "_extract_etf_row(%s): computed %d indicators inline "
+                "(rsi=%.1f adx=%.1f rvol=%.2f ema_pct=%.4f)",
+                ticker, n_filled,
+                _safe_float(row.get("rsi14"), 50.0),
+                _safe_float(row.get("adx14"), 15.0),
+                _safe_float(row.get("relativevolume"), 1.0),
+                _safe_float(row.get("closevsema30pct"), 0.0),
+            )
+
+    return row
+
+
+def score_etf_universe(
+    all_frames: dict[str, pd.DataFrame],
+    bench_df: pd.DataFrame,
+    params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Score every ETF found in *all_frames* on a 0-1 composite.
+
+    Returns DataFrame sorted descending by etf_composite with columns:
+      ticker, theme, parent_sector, is_sector_etf, is_broad, etf_composite,
+      sub_trend, sub_momentum, sub_participation, sub_risk_adj,
+      rsi14, adx14, rszscore, relativevolume, closevsema30pct, return20d,
+      realizedvol20d
+    """
+    params = params or {}
+    scoreable = ALL_TRACKED_ETFS
+
+    # ── Optionally compute RS z-score for each ETF vs benchmark ───────────
+    # This gives the momentum sub-score its full signal rather than
+    # defaulting rszscore to 0.0 for every ETF.
+    etf_rs_z: dict[str, float] = {}
+    if bench_df is not None and not bench_df.empty and "close" in bench_df.columns:
+        bench_close = pd.to_numeric(bench_df["close"], errors="coerce").dropna()
+        if len(bench_close) >= 60:
+            bench_ret_20 = bench_close.iloc[-1] / bench_close.iloc[-20] - 1.0
+            bench_ret_60 = bench_close.iloc[-1] / bench_close.iloc[-60] - 1.0
+            rets_20 = {}
+            rets_60 = {}
+            for tk in scoreable:
+                if tk not in all_frames:
+                    continue
+                edf = all_frames[tk]
+                if edf is None or edf.empty or "close" not in edf.columns:
+                    continue
+                ec = pd.to_numeric(edf["close"], errors="coerce").dropna()
+                if len(ec) >= 60:
+                    rets_20[tk] = float(ec.iloc[-1] / ec.iloc[-20] - 1.0)
+                    rets_60[tk] = float(ec.iloc[-1] / ec.iloc[-60] - 1.0)
+
+            if len(rets_20) >= 5:
+                excess_20 = {t: r - bench_ret_20 for t, r in rets_20.items()}
+                excess_60 = {t: r - bench_ret_60 for t, r in rets_60.items()}
+                # Blend 60% short + 40% long, then z-score
+                blended = {
+                    t: 0.6 * excess_20.get(t, 0) + 0.4 * excess_60.get(t, 0)
+                    for t in excess_20
+                }
+                vals = list(blended.values())
+                mu = np.mean(vals)
+                sigma = np.std(vals)
+                if sigma > 1e-8:
+                    etf_rs_z = {t: (v - mu) / sigma for t, v in blended.items()}
+
+    rows = []
+    default_counts = {"rsi14": 0, "adx14": 0, "relativevolume": 0}
+    for ticker in scoreable:
+        if ticker not in all_frames:
+            continue
+        raw = _extract_etf_row(all_frames[ticker])
+        if raw is None:
+            continue
+
+        # Inject computed RS z-score if available and not already present
+        if ticker in etf_rs_z and _get(raw, "rszscore") is None:
+            raw["rszscore"] = etf_rs_z[ticker]
+
+        # Track how many ETFs still fall back to defaults
+        if _get(raw, "rsi14", "rsi_14") is None:
+            default_counts["rsi14"] += 1
+        if _get(raw, "adx14", "adx_14") is None:
+            default_counts["adx14"] += 1
+        if _get(raw, "relativevolume", "relative_volume") is None:
+            default_counts["relativevolume"] += 1
+
+        scores = _compute_etf_composite(raw, params)
+        parent_sector = ETF_TO_SECTOR.get(
+            ticker, THEMATIC_ETF_SECTOR.get(ticker, "Other")
+        )
+        theme = ETF_THEME.get(ticker, "Other")
+
+        rows.append({
+            "ticker":            ticker,
+            "theme":             theme,
+            "parent_sector":     parent_sector,
+            "is_sector_etf":     ticker in ETF_TO_SECTOR,
+            "is_broad":          ticker in BROAD_ETFS,
+            "is_regional":       ticker in REGIONAL_ETFS,
+            "etf_composite":     scores["composite"],
+            "sub_trend":         scores["trend"],
+            "sub_momentum":      scores["momentum"],
+            "sub_participation": scores["participation"],
+            "sub_risk_adj":      scores["risk_adj"],
+            "rsi14":             _safe_float(_get(raw, "rsi14", "rsi_14"), 50.0),
+            "adx14":             _safe_float(_get(raw, "adx14", "adx_14"), 15.0),
+            "rszscore":          _safe_float(_get(raw, "rszscore"), 0.0),
+            "relativevolume":    _safe_float(
+                _get(raw, "relativevolume", "relative_volume"), 1.0
+            ),
+            "closevsema30pct":   _safe_float(
+                _get(raw, "closevsema30pct", "close_vs_ema_30_pct"), 0.0
+            ),
+            "return20d":         _safe_float(_get(raw, "return20d"), 0.0),
+            "realizedvol20d":    _safe_float(
+                _get(raw, "realizedvol20d", "realized_vol_20d"), 0.20
+            ),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        logger.warning("score_etf_universe: no ETFs found in frames")
+        return df
+
+    # ── Data quality check ────────────────────────────────────────────────
+    n_etfs = len(df)
+    for col, cnt in default_counts.items():
+        if cnt == n_etfs:
+            logger.error(
+                "⚠️  score_etf_universe: %s is DEFAULT for all %d ETFs — "
+                "inline computation failed or frames have <16 bars",
+                col, n_etfs,
+            )
+        elif cnt > 0:
+            logger.warning(
+                "score_etf_universe: %s defaulted for %d / %d ETFs",
+                col, cnt, n_etfs,
+            )
+
+    # Check for constant sub-scores (the symptom from the previous run)
+    for sub in ("sub_trend", "sub_participation", "sub_risk_adj"):
+        if sub in df.columns and df[sub].std() < 1e-6:
+            logger.error(
+                "⚠️  score_etf_universe: %s is constant (%.4f) across "
+                "all ETFs — composite is effectively blind on this dimension",
+                sub, df[sub].iloc[0],
+            )
+
+    df = df.sort_values("etf_composite", ascending=False).reset_index(drop=True)
+    logger.info(
+        "ETF universe scored: n=%d  top=%s(%.3f)  bottom=%s(%.3f)  mean=%.3f",
+        len(df),
+        df.iloc[0]["ticker"],  df.iloc[0]["etf_composite"],
+        df.iloc[-1]["ticker"], df.iloc[-1]["etf_composite"],
+        df["etf_composite"].mean(),
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        preview_cols = [
+            "ticker", "theme", "parent_sector", "etf_composite",
+            "sub_trend", "sub_momentum", "sub_participation", "sub_risk_adj",
+            "rsi14", "adx14", "rszscore", "relativevolume", "return20d",
+        ]
+        logger.debug(
+            "ETF ranking:\n%s",
+            df[[c for c in preview_cols if c in df.columns]]
+            .head(30)
+            .to_string(index=False),
+        )
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RS-based analysis (traditional RRG)  –  DATE-ALIGNED
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _align_close_series(
+    etf_df: pd.DataFrame,
+    bench_df: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series] | None:
+    """
+    Extract 'close' from both frames and align by date index.
+
+    Returns (etf_close, bench_close) on the common DatetimeIndex,
+    or None if alignment produces fewer than 2 rows.
+    """
+    if etf_df is None or etf_df.empty or bench_df is None or bench_df.empty:
+        return None
+    if "close" not in etf_df.columns or "close" not in bench_df.columns:
+        return None
+
+    etf_close = pd.to_numeric(etf_df["close"], errors="coerce").dropna()
+    bench_close = pd.to_numeric(bench_df["close"], errors="coerce").dropna()
+
+    if etf_close.empty or bench_close.empty:
+        return None
+
+    common_idx = etf_close.index.intersection(bench_close.index)
+    if len(common_idx) < 2:
+        return None
+
+    common_idx = common_idx.sort_values()
+    return etf_close.loc[common_idx], bench_close.loc[common_idx]
+
+
+def _compute_sector_rs(
+    sector_etf_ticker: str,
+    all_frames: dict[str, pd.DataFrame],
+    bench_df: pd.DataFrame,
+    lookback: int = 20,
+    smooth: int = 5,
+) -> dict[str, float]:
+    """
+    Compute RS level, RS momentum, and excess return for a sector ETF.
+
+    Uses DATE-ALIGNED close series to prevent positional misalignment
+    when frames have different row counts or trading calendars.
+    """
+    null = {"rs_level": 0.0, "rs_mom": 0.0, "excess_20d": 0.0}
+
+    etf_df = all_frames.get(sector_etf_ticker)
+    aligned = _align_close_series(etf_df, bench_df)
+    if aligned is None:
+        logger.warning(
+            "_compute_sector_rs(%s): date alignment failed — "
+            "etf_rows=%s bench_rows=%s",
+            sector_etf_ticker,
+            len(etf_df) if etf_df is not None else 0,
+            len(bench_df) if bench_df is not None else 0,
+        )
+        return null
+
+    etf_c, bench_c = aligned
+    n = len(etf_c)
+    min_required = lookback + smooth
+
+    if n < min_required:
+        logger.warning(
+            "_compute_sector_rs(%s): too few aligned bars: "
+            "n=%d required=%d",
+            sector_etf_ticker, n, min_required,
+        )
+        return null
+
+    # Operate on numpy to avoid any pandas index re-alignment
+    etf_vals = etf_c.values.astype(float)
+    bench_vals = bench_c.values.astype(float)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs_raw = etf_vals / bench_vals
+
+    rs_ratio = pd.Series(rs_raw).replace([np.inf, -np.inf], np.nan).ffill().bfill()
+    rs_smooth = rs_ratio.rolling(smooth, min_periods=1).mean()
+    rs_mean = rs_smooth.rolling(lookback, min_periods=max(lookback // 2, 3)).mean()
+
+    if pd.isna(rs_mean.iloc[-1]) or rs_mean.iloc[-1] <= 0:
+        logger.warning(
+            "_compute_sector_rs(%s): rs_mean[-1] invalid (%.6f)",
+            sector_etf_ticker,
+            float(rs_mean.iloc[-1]) if pd.notna(rs_mean.iloc[-1]) else float("nan"),
+        )
+        return null
+
+    rs_level = float(rs_smooth.iloc[-1] / rs_mean.iloc[-1] - 1.0)
+
+    # ── RS Momentum ───────────────────────────────────────────────────────
+    half = max(lookback // 2, 3)
+    rs_mom = 0.0
+    if (
+        n > half
+        and pd.notna(rs_mean.iloc[-half])
+        and rs_mean.iloc[-half] > 0
+    ):
+        rs_level_prev = float(rs_smooth.iloc[-half] / rs_mean.iloc[-half] - 1.0)
+        rs_mom = rs_level - rs_level_prev
+    else:
+        logger.warning(
+            "_compute_sector_rs(%s): rs_mom fallback — n=%d half=%d",
+            sector_etf_ticker, n, half,
+        )
+
+    # ── Excess return ─────────────────────────────────────────────────────
+    excess = 0.0
+    if n >= lookback:
+        e_ret = etf_vals[-1] / etf_vals[-lookback] - 1.0
+        b_ret = bench_vals[-1] / bench_vals[-lookback] - 1.0
+        if np.isfinite(e_ret) and np.isfinite(b_ret):
+            excess = e_ret - b_ret
+
+    logger.debug(
+        "_compute_sector_rs(%s): n=%d rs_level=%.6f rs_mom=%.6f excess=%.6f",
+        sector_etf_ticker, n, rs_level, rs_mom, excess,
+    )
+
+    return {"rs_level": rs_level, "rs_mom": rs_mom, "excess_20d": excess}
+
+
+def _rrg_quadrant(rs_level: float, rs_mom: float) -> str:
+    """Classic RRG quadrant from sign of RS level and momentum."""
+    if rs_level >= 0 and rs_mom >= 0:
+        return "leading"
+    if rs_level < 0 and rs_mom >= 0:
+        return "improving"
+    if rs_level >= 0 and rs_mom < 0:
+        return "weakening"
+    return "lagging"
+
+
+def _rrg_to_score(rs_level: float, rs_mom: float) -> float:
+    """Map RS level + momentum to a 0-1 score for blending with ETF composite."""
+    level_norm = _normalize(rs_level, -0.08, 0.08)
+    mom_norm   = _normalize(rs_mom,   -0.05, 0.05)
+    return 0.60 * level_norm + 0.40 * mom_norm
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Blended regime classification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _classify_blended_regime(
+    blended: float,
+    rs_mom: float,
+    etf_composite: float,
+    thresholds: dict,
+) -> str:
+    """
+    Strength × Direction matrix:
+
+        strength tier      accelerating    decelerating
+        ─────────────      ────────────    ────────────
+        strong  (≥0.60)    leading         weakening
+        moderate(≥0.42)    improving       weakening
+        weak    (≥0.30)    improving       weakening
+        very_weak(<0.30)   lagging         lagging
+    """
+    leading_min  = thresholds.get("leading_min",  0.60)
+    moderate_min = thresholds.get("moderate_min",  0.42)
+    weak_min     = thresholds.get("weak_min",      0.30)
+    mom_thresh   = thresholds.get("mom_threshold", -0.008)
+    etf_override = thresholds.get("etf_accel_override", 0.55)
+
+    accelerating = rs_mom >= mom_thresh or (
+        rs_mom >= -0.02 and etf_composite >= etf_override
+    )
+
+    if blended >= leading_min:
+        return "leading" if accelerating else "weakening"
+    if blended >= moderate_min:
+        return "improving" if accelerating else "weakening"
+    if blended >= weak_min:
+        return "improving" if accelerating else "weakening"
+    return "lagging"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_sector_rotation(
+    all_symbol_frames: dict[str, pd.DataFrame],
+    bench_df: pd.DataFrame,
+    market: str = "US",
+    params: dict | None = None,
+) -> dict:
+    """
+    Enhanced sector rotation combining:
+      1. Traditional RRG-style RS analysis per sector ETF
+      2. Composite scoring of the full ETF universe
+      3. Blended regime classification via strength × direction matrix
+
+    Returns dict with keys:
+      sector_regimes  – {sector: regime_str}
+      ticker_regimes  – {ticker: regime_str}
+      sector_summary  – DataFrame with full detail per sector
+      etf_ranking     – DataFrame with every ETF scored and ranked
+    """
+    params = params or ROTATIONPARAMS or {}
+    lookback   = params.get("rs_lookback", 20)
+    smooth     = params.get("rs_smooth", 5)
+    etf_weight = params.get("etf_score_weight", 0.35)
+    rs_weight  = params.get("rs_weight", 0.65)
+    thresholds = params.get("regime_thresholds", {})
+
+    logger.info(
+        "compute_sector_rotation: market=%s lookback=%d smooth=%d "
+        "rs_weight=%.2f etf_weight=%.2f bench_rows=%d",
+        market, lookback, smooth, rs_weight, etf_weight,
+        len(bench_df) if bench_df is not None else 0,
+    )
+
+    # ── 1. Score the full ETF universe ────────────────────────────────────────
+    etf_ranking = score_etf_universe(all_symbol_frames, bench_df, params)
+
+    etf_score_map: dict[str, float] = {}
+    if not etf_ranking.empty:
+        etf_score_map = dict(
+            zip(etf_ranking["ticker"], etf_ranking["etf_composite"])
+        )
+
+    # Average thematic-ETF composite per parent sector
+    sector_theme_avg: dict[str, float] = {}
+    if not etf_ranking.empty:
+        thematic = etf_ranking[
+            ~etf_ranking["is_broad"]
+            & ~etf_ranking["is_sector_etf"]
+            & ~etf_ranking["is_regional"]
+        ]
+        if not thematic.empty:
+            sector_theme_avg = (
+                thematic.groupby("parent_sector")["etf_composite"]
+                .mean()
+                .to_dict()
+            )
+
+    logger.info(
+        "Sector theme-ETF averages: %s",
+        {k: round(v, 3) for k, v in sector_theme_avg.items()},
+    )
+
+    # ── 2. Per-sector: RS + ETF composite → blended regime ───────────────────
+    sector_rows = []
+    sector_regimes: dict[str, str] = {}
+    zero_mom_count = 0
+
+    for sector, etf_ticker in SECTOR_ETF.items():
+        rs = _compute_sector_rs(
+            etf_ticker, all_symbol_frames, bench_df, lookback, smooth
+        )
+        rrg_quad  = _rrg_quadrant(rs["rs_level"], rs["rs_mom"])
+        rrg_score = _rrg_to_score(rs["rs_level"], rs["rs_mom"])
+
+        etf_own   = etf_score_map.get(etf_ticker, 0.50)
+        theme_avg = sector_theme_avg.get(sector, etf_own)
+
+        etf_signal = 0.65 * etf_own + 0.35 * theme_avg
+
+        blended = rs_weight * rrg_score + etf_weight * etf_signal
+
+        regime = _classify_blended_regime(
+            blended, rs["rs_mom"], etf_own, thresholds
+        )
+        sector_regimes[sector] = regime
+
+        if rs["rs_mom"] == 0.0:
+            zero_mom_count += 1
+
+        sector_rows.append({
+            "sector":          sector,
+            "etf":             etf_ticker,
+            "regime":          regime,
+            "rrg_quadrant":    rrg_quad,
+            "blended_score":   round(blended, 4),
+            "rs_level":        round(rs["rs_level"], 4),
+            "rs_mom":          round(rs["rs_mom"], 4),
+            "excess_20d":      round(rs["excess_20d"], 4),
+            "etf_composite":   round(etf_own, 4),
+            "theme_avg_score": round(theme_avg, 4),
+        })
+
+    n_sectors = len(SECTOR_ETF)
+    if zero_mom_count == n_sectors and n_sectors > 0:
+        logger.error(
+            "⚠️  ALL %d sectors have rs_mom=0.0 — check frame alignment",
+            n_sectors,
+        )
+
+    sector_summary = pd.DataFrame(sector_rows)
+    if not sector_summary.empty:
+        sector_summary = sector_summary.sort_values(
+            "blended_score", ascending=False
+        ).reset_index(drop=True)
+
+    # ── 3. Map every ticker to its sector regime ──────────────────────────────
+    ticker_regimes: dict[str, str] = {}
+    for ticker in all_symbol_frames:
+        if ticker in ETF_TO_SECTOR:
+            sec = ETF_TO_SECTOR[ticker]
+        elif ticker in THEMATIC_ETF_SECTOR:
+            sec = THEMATIC_ETF_SECTOR[ticker]
+        else:
+            sec = get_sector_or_class(ticker) or "Unknown"
+        ticker_regimes[ticker] = sector_regimes.get(sec, "unknown")
+
+    # ── 4. Logging ────────────────────────────────────────────────────────────
+    regime_counts: dict[str, int] = {}
+    for r in sector_regimes.values():
+        regime_counts[r] = regime_counts.get(r, 0) + 1
+    logger.info(
+        "Sector rotation regimes: %s  (rs_weight=%.2f etf_weight=%.2f)",
+        regime_counts, rs_weight, etf_weight,
+    )
+
+    if not sector_summary.empty:
+        logger.info(
+            "Sector summary:\n%s",
+            sector_summary[[
+                "sector", "etf", "regime", "rrg_quadrant", "blended_score",
+                "rs_level", "rs_mom", "etf_composite", "theme_avg_score",
+            ]].to_string(index=False),
+        )
+
+    return {
+        "sector_regimes": sector_regimes,
+        "ticker_regimes": ticker_regimes,
+        "sector_summary": sector_summary,
+        "etf_ranking":    etf_ranking,
+    }
+
+################
 """
 refactor/strategy/rs_v2.py
 
@@ -2059,4 +2769,175 @@ def enrich_rs_regimes(
     logger.info("enrich_rs_regimes: last-row sectrsregime=%s", sect_counts)
     return enriched
 
-##################################
+###################
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from refactor.common.config_refactor import SCORINGWEIGHTS_V2, SCORINGPARAMS_V2
+
+def _s(x, lo, hi): return pd.Series(np.clip((x-lo)/(hi-lo), 0.0, 1.0), index=x.index)
+def _inv(x, lo, hi): return 1.0 - _s(x, lo, hi)
+
+def compute_composite_v2(
+    df: pd.DataFrame,
+    weights=None,
+    params=None,
+) -> pd.DataFrame:
+    p = params if params is not None else SCORINGPARAMS_V2
+    w = weights if weights is not None else SCORINGWEIGHTS_V2
+    out = df.copy()
+
+    # ── Trend ─────────────────────────────────────────────────────────────
+    stock_rs = _s(out["rszscore"].fillna(0), -1.0, 2.0)
+    sector_rs = _s(
+        out.get("sectrszscore", pd.Series(0, index=out.index)).fillna(0),
+        -1.0, 2.0,
+    )
+    rs_accel = _s(
+        out.get("rsaccel20", pd.Series(0, index=out.index)).fillna(0),
+        -0.10, 0.15,
+    )
+    trend_confirm = _s(
+        out.get("closevsema30pct", pd.Series(0, index=out.index)).fillna(0),
+        -0.03, 0.10,
+    )
+    out["scoretrend"] = (
+        p["trend"]["w_stock_rs"] * stock_rs
+        + p["trend"]["w_sector_rs"] * sector_rs
+        + p["trend"]["w_rs_accel"] * rs_accel
+        + p["trend"]["w_trend_confirm"] * trend_confirm
+    ).clip(0, 1)
+
+    # ── Participation ─────────────────────────────────────────────────────
+    rvol = _s(
+        out.get("relativevolume", pd.Series(1, index=out.index)).fillna(1),
+        0.8, 2.2,
+    )
+    obv = _s(
+        out.get("obvslope10d", pd.Series(0, index=out.index)).fillna(0),
+        -0.05, 0.12,
+    )
+    adl = _s(
+        out.get("adlineslope10d", pd.Series(0, index=out.index)).fillna(0),
+        -0.05, 0.12,
+    )
+    dvol = _s(
+        np.log1p(
+            out.get("dollarvolume20d", pd.Series(0, index=out.index)).fillna(0)
+        ),
+        10, 18,
+    )
+    out["scoreparticipation"] = (
+        p["participation"]["w_rvol"] * rvol
+        + p["participation"]["w_obv"] * obv
+        + p["participation"]["w_adline"] * adl
+        + p["participation"]["w_dollar_volume"] * dvol
+    ).clip(0, 1)
+
+    # ── Risk ──────────────────────────────────────────────────────────────
+    atrp = out.get("atr14pct", pd.Series(0, index=out.index)).fillna(0)
+    illiq = out.get("amihud20", pd.Series(0, index=out.index)).fillna(0)
+    gap = out.get("gaprate20", pd.Series(0, index=out.index)).fillna(0)
+    extension = (
+        out.get("closevssma50pct", pd.Series(0, index=out.index))
+        .fillna(0).abs()
+    )
+    vol_pen = _inv(atrp, 0.02, p["penalties"]["atrp_high"])
+    liq_pen = _inv(illiq, 0.0, p["penalties"]["illiquidity_bad"])
+    gap_pen = _inv(gap, 0.05, 0.30)
+    ext_pen = 1.0 - pd.Series(
+        np.select(
+            [
+                extension >= p["penalties"]["extension_bad"],
+                extension >= p["penalties"]["extension_warn"],
+            ],
+            [1.0, 0.5],
+            default=0.0,
+        ),
+        index=out.index,
+    )
+    out["scorerisk"] = (
+        p["risk"]["w_vol_penalty"] * vol_pen
+        + p["risk"]["w_liquidity_penalty"] * liq_pen
+        + p["risk"]["w_gap_penalty"] * gap_pen
+        + p["risk"]["w_extension_penalty"] * ext_pen
+    ).clip(0, 1)
+
+    # ── Regime ────────────────────────────────────────────────────────────
+    breadth = out.get("breadthscore", pd.Series(0.5, index=out.index)).fillna(0.5)
+    volreg = out.get("volregimescore", pd.Series(0.0, index=out.index)).fillna(0.0)
+    out["scoreregime"] = (
+        p["regime"]["w_breadth"] * breadth
+        + p["regime"]["w_vol_regime"] * (1.0 - volreg)
+    ).clip(0, 1)
+
+    # ── Rotation (NEW) ───────────────────────────────────────────────────
+    # Maps the sector rotation quadrant to a 0-1 score.
+    # "leading" sectors get the full bonus; "lagging" gets zero.
+    # "unknown" gets a modest 0.30 so unmapped names aren't hammered
+    # but don't benefit from rotation either.
+    sect_regime = (
+        out.get("sectrsregime", pd.Series("unknown", index=out.index))
+        .fillna("unknown")
+        .astype(str)
+        .str.lower()
+        .str.strip()
+    )
+    out["scorerotation"] = pd.Series(
+        np.select(
+            [
+                sect_regime == "leading",
+                sect_regime == "improving",
+                sect_regime == "weakening",
+                sect_regime == "lagging",
+            ],
+            [1.0, 0.65, 0.35, 0.0],
+            default=0.30,
+        ),
+        index=out.index,
+    )
+
+    # ── Composite ─────────────────────────────────────────────────────────
+    rotation_weight = w.get("rotation", 0.0)
+    if rotation_weight == 0.0:
+        logger.warning(
+            "compute_composite_v2: rotation weight is 0.0 — "
+            "scorerotation will not affect composite.  "
+            "Add 'rotation' to SCORINGWEIGHTS_V2."
+        )
+
+    composite = (
+        w["trend"] * out["scoretrend"]
+        + w["participation"] * out["scoreparticipation"]
+        + w["risk"] * out["scorerisk"]
+        + w["regime"] * out["scoreregime"]
+        + rotation_weight * out["scorerotation"]
+    )
+
+    # ── Penalties ─────────────────────────────────────────────────────────
+    rsi = out.get("rsi14", pd.Series(50, index=out.index)).fillna(50)
+    adx = out.get("adx14", pd.Series(20, index=out.index)).fillna(20)
+    rsi_low = p["penalties"]["rsi_soft_low"]
+    rsi_high = p["penalties"]["rsi_soft_high"]
+
+    rsi_penalty = pd.Series(
+        np.where(
+            rsi < rsi_low,
+            (rsi_low - rsi) / 30.0,
+            np.where(rsi > rsi_high, (rsi - rsi_high) / 30.0, 0.0),
+        ),
+        index=out.index,
+    ).clip(0, 0.15)
+    adx_penalty = pd.Series(
+        np.where(
+            adx < p["penalties"]["adx_soft_min"],
+            (p["penalties"]["adx_soft_min"] - adx) / 30.0,
+            0.0,
+        ),
+        index=out.index,
+    ).clip(0, 0.10)
+
+    out["scorepenalty"] = (rsi_penalty + adx_penalty).clip(0, 0.20)
+    out["scorecomposite_v2"] = (composite - out["scorepenalty"]).clip(0, 1)
+
+    return out

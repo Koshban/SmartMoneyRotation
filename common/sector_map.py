@@ -57,7 +57,7 @@ _SECTOR_TICKERS: dict[str, list[str]] = {
         "AAPL", "MSFT", "NVDA", "AVGO", "AMD", "QCOM", "INTC", "TSM", "ASML",
         "ORCL", "ADBE", "CRM", "ACN", "ADI",
         # Semis / equipment
-        "AMAT", "LRCX", "KLAC", "MU", "MRVL", "ARM", "SMCI", "MBLY",
+        "AMAT", "LRCX", "KLAC", "MU", "MRVL", "ARM", "SMCI", "MBLY","SIMO", "SNDK",
         # Software / cloud / SaaS / infra
         "NOW", "SNOW", "NET", "PLTR", "PATH", "CRWD", "PANW", "TWLO",
         "CLS", "ANET", "TSSI", "TTD", "TOST", "PGY", "GLBE", "DDOG",

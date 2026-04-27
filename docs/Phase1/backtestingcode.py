@@ -145,7 +145,7 @@ def _build_equity_curves(runs: list[BacktestRun]) -> pd.DataFrame:
         if run.ok and run.backtest_result:
             eq = run.backtest_result.equity_curve
             if not eq.empty:
-                curves[run.strategy.name] = eq
+                curves[runrefactor.strategy.name] = eq
     if not curves:
         return pd.DataFrame()
     return pd.DataFrame(curves)
@@ -159,8 +159,8 @@ def _build_comparison_table(
     for run in runs:
         m = run.metrics
         rows.append({
-            "strategy":       run.strategy.name,
-            "market":         run.strategy.market,
+            "strategy":       runrefactor.strategy.name,
+            "market":         runrefactor.strategy.market,
             "cagr":           m.get("cagr"),
             "total_return":   m.get("total_return"),
             "sharpe":         m.get("sharpe_ratio"),
@@ -208,7 +208,7 @@ def _comparison_report(
 
     first = valid[0]
     ln.append(div)
-    ln.append(f"  STRATEGY COMPARISON [{first.strategy.market}]")
+    ln.append(f"  STRATEGY COMPARISON [{firstrefactor.strategy.market}]")
     ln.append(div)
     ln.append(f"  Period:     {first.start_date.date()} → {first.end_date.date()}")
     ln.append(f"  Capital:    ${first.metrics.get('initial_capital', 0):,.0f}")
@@ -1118,9 +1118,9 @@ class BacktestRun:
 
     def summary_line(self) -> str:
         if not self.ok:
-            return f"{self.strategy.name:<24s}  ERROR: {self.error}"
+            return f"{selfrefactor.strategy.name:<24s}  ERROR: {self.error}"
         return (
-            f"{self.strategy.name:<24s}  "
+            f"{selfrefactor.strategy.name:<24s}  "
             f"CAGR={self.cagr:>+7.2%}  "
             f"Sharpe={self.sharpe:>5.2f}  "
             f"MaxDD={self.max_drawdown:>7.2%}  "
@@ -2315,17 +2315,17 @@ def _compute_avg_holding_days(trades: list[Trade]) -> float:
 def metrics_report(run: "BacktestRun") -> str:
     m = run.metrics
     if not m:
-        return f"No metrics for '{run.strategy.name}'"
+        return f"No metrics for '{runrefactor.strategy.name}'"
 
     ln: list[str] = []
     div = "=" * 70
     sub = "-" * 70
 
     ln.append(div)
-    ln.append(f"  BACKTEST REPORT: {run.strategy.name}")
-    ln.append(f"  {run.strategy.description}")
-    if run.strategy.market != "US":
-        ln.append(f"  Market: {run.strategy.market}")
+    ln.append(f"  BACKTEST REPORT: {runrefactor.strategy.name}")
+    ln.append(f"  {runrefactor.strategy.description}")
+    if runrefactor.strategy.market != "US":
+        ln.append(f"  Market: {runrefactor.strategy.market}")
     ln.append(div)
 
     ln.append(f"  Period:          {m.get('start_date', '?')} → "
@@ -2672,7 +2672,7 @@ def main():
 
     # ── Single strategy mode ──────────────────────────────────
     try:
-        strategy = get_strategy(args.strategy)
+        strategy = get_strategy(argsrefactor.strategy)
     except KeyError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
@@ -2747,13 +2747,13 @@ def _save_single(run, output_dir: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    report_path = out / f"backtest_{run.strategy.name}_{ts}.txt"
+    report_path = out / f"backtest_{runrefactor.strategy.name}_{ts}.txt"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(metrics_report(run))
     print(f"  Report saved → {report_path}")
 
     if run.backtest_result and not run.backtest_result.equity_curve.empty:
-        eq_path = out / f"equity_{run.strategy.name}_{ts}.csv"
+        eq_path = out / f"equity_{runrefactor.strategy.name}_{ts}.csv"
         eq_df = pd.DataFrame({"equity": run.backtest_result.equity_curve})
         if not run.benchmark_equity.empty:
             eq_df["benchmark"] = run.benchmark_equity
@@ -2761,7 +2761,7 @@ def _save_single(run, output_dir: str) -> None:
         print(f"  Equity saved → {eq_path}")
 
     if not run.monthly_returns.empty:
-        monthly_path = out / f"monthly_{run.strategy.name}_{ts}.csv"
+        monthly_path = out / f"monthly_{runrefactor.strategy.name}_{ts}.csv"
         run.monthly_returns.to_csv(monthly_path)
         print(f"  Monthly returns saved → {monthly_path}")
 

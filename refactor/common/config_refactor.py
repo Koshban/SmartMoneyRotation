@@ -47,10 +47,11 @@ VOLREGIMEPARAMS = {
 # was based on missing data.  Redistributed to trend + participation.
 
 SCORINGWEIGHTS_V2 = {
-    "trend": 0.45,            # was 0.38
-    "participation": 0.25,    # was 0.22
-    "risk": 0.25,             # was 0.25 (unchanged)
-    "regime": 0.05,           # was 0.15
+    "trend":         0.30,
+    "participation": 0.20,
+    "risk":          0.20,
+    "regime":        0.15,
+    "rotation":      0.15,   # ← ADD THIS
 }
 
 SCORINGPARAMS_V2 = {
@@ -235,8 +236,21 @@ BREADTHPARAMS = {
 # ██  ROTATION                                                               ██
 # ═══════════════════════════════════════════════════════════════════════════════
 ROTATIONPARAMS = {
-    "rs_sma_period": 50,
-    "rs_momentum_period": 20,
-    "smooth_span": 10,
-    "min_history": 60,
+    "rs_lookback": 20,
+    "rs_smooth": 5,
+    "rs_weight": 0.65,
+    "etf_score_weight": 0.35,
+    "regime_thresholds": {
+        "leading_min": 0.60,
+        "moderate_min": 0.42,
+        "weak_min": 0.30,
+        "mom_threshold": -0.008,
+        "etf_accel_override": 0.55,
+    },
+    "etf_scoring": {
+        "trend_weight": 0.35,
+        "momentum_weight": 0.30,
+        "participation_weight": 0.20,
+        "risk_weight": 0.15,
+    },
 }

@@ -194,9 +194,9 @@ class BacktestRun:
 
     def summary_line(self) -> str:
         if not self.ok:
-            return f"{self.strategy.name:<24s}  ERROR: {self.error}"
+            return f"{selfrefactor.strategy.name:<24s}  ERROR: {self.error}"
         return (
-            f"{self.strategy.name:<24s}  "
+            f"{selfrefactor.strategy.name:<24s}  "
             f"CAGR={self.cagr:>+7.2%}  "
             f"Sharpe={self.sharpe:>5.2f}  "
             f"MaxDD={self.max_drawdown:>7.2%}  "

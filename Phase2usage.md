@@ -39,7 +39,7 @@ python refactor.runner_v2.py --market US --print-report
 python refactor.runner_v2.py --market US --print-report -v
 
 # Full flags: date range + verbose + report
-python refactor.runner_v2.py --market US --start-date 2024-06-01 --end-date 2025-04-25 --print-report -v
+python refactor/runner_v2.py --market US --start-date 2024-06-01 --end-date 2025-04-25 --print-report -v
 
 # ── Custom Data Path ─────────────────────────────────────────────
 

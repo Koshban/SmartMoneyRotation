@@ -11,9 +11,9 @@ from compute.indicators import compute_all_indicators
 
 from common.sector_map import get_sector_or_class
 
-from .strategy.adapters_v2 import ensure_columns
-from .strategy.breadth_v2 import compute_breadth
-from .strategy.portfolio_v2 import (
+from refactor.strategy.adapters_v2 import ensure_columns
+from refactor.strategy.breadth_v2 import compute_breadth
+from refactor.strategy.portfolio_v2 import (
     build_portfolio_v2,
     DEFAULT_MAX_POSITIONS,
     DEFAULT_MAX_SECTOR_WEIGHT,
@@ -21,11 +21,11 @@ from .strategy.portfolio_v2 import (
     DEFAULT_MAX_SINGLE_WEIGHT,
     DEFAULT_MIN_WEIGHT,
 )
-from .strategy.regime_v2 import classify_volatility_regime
-from .strategy.rotation_v2 import compute_sector_rotation
-from .strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
-from .strategy.scoring_v2 import compute_composite_v2
-from .strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
+from refactor.strategy.regime_v2 import classify_volatility_regime
+from refactor.strategy.rotation_v2 import compute_sector_rotation
+from refactor.strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
+from refactor.strategy.scoring_v2 import compute_composite_v2
+from refactor.strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
 from refactor.common.config_refactor import (
     VOLREGIMEPARAMS,
     SCORINGWEIGHTS_V2,

@@ -250,6 +250,11 @@ SINGLE_NAMES = {
         "etf_proxy": "XLB",
         "tickers": ["LIN", "APD", "SHW", "NUE", "FCX", "DOW", "NEM", "ECL", "CF", "MOS"],
     },
+    "software": {
+        "name": "software",
+        "etf_proxy": "IGV",
+        "tickers": ["HUBS", "CRM", "ADBE", "NOW",],
+    },
     "healthcare_core": {
         "name": "Healthcare Core",
         "etf_proxy": "XLV",

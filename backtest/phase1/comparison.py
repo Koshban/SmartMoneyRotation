@@ -86,7 +86,7 @@ def _build_equity_curves(runs: list[BacktestRun]) -> pd.DataFrame:
         if run.ok and run.backtest_result:
             eq = run.backtest_result.equity_curve
             if not eq.empty:
-                curves[run.strategy.name] = eq
+                curves[runrefactor.strategy.name] = eq
     if not curves:
         return pd.DataFrame()
     return pd.DataFrame(curves)
@@ -100,8 +100,8 @@ def _build_comparison_table(
     for run in runs:
         m = run.metrics
         rows.append({
-            "strategy":       run.strategy.name,
-            "market":         run.strategy.market,
+            "strategy":       runrefactor.strategy.name,
+            "market":         runrefactor.strategy.market,
             "cagr":           m.get("cagr"),
             "total_return":   m.get("total_return"),
             "sharpe":         m.get("sharpe_ratio"),
@@ -149,7 +149,7 @@ def _comparison_report(
 
     first = valid[0]
     ln.append(div)
-    ln.append(f"  STRATEGY COMPARISON [{first.strategy.market}]")
+    ln.append(f"  STRATEGY COMPARISON [{firstrefactor.strategy.market}]")
     ln.append(div)
     ln.append(f"  Period:     {first.start_date.date()} → {first.end_date.date()}")
     ln.append(f"  Capital:    ${first.metrics.get('initial_capital', 0):,.0f}")

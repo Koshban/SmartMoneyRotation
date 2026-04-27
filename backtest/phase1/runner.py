@@ -315,7 +315,7 @@ def main():
         return
 
     # ── Single strategy mode ──────────────────────────────────
-    strategy_name = args.strategy
+    strategy_name = argsrefactor.strategy
 
     # Auto-select default strategy for non-US markets
     if market != "US" and strategy_name == "baseline":
@@ -413,13 +413,13 @@ def _save_single(run, output_dir: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    report_path = out / f"backtest_{run.strategy.name}_{ts}.txt"
+    report_path = out / f"backtest_{runrefactor.strategy.name}_{ts}.txt"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(metrics_report(run))
     print(f"  Report saved → {report_path}")
 
     if run.backtest_result and not run.backtest_result.equity_curve.empty:
-        eq_path = out / f"equity_{run.strategy.name}_{ts}.csv"
+        eq_path = out / f"equity_{runrefactor.strategy.name}_{ts}.csv"
         eq_df = pd.DataFrame({"equity": run.backtest_result.equity_curve})
         if not run.benchmark_equity.empty:
             eq_df["benchmark"] = run.benchmark_equity
@@ -427,7 +427,7 @@ def _save_single(run, output_dir: str) -> None:
         print(f"  Equity saved → {eq_path}")
 
     if not run.monthly_returns.empty:
-        monthly_path = out / f"monthly_{run.strategy.name}_{ts}.csv"
+        monthly_path = out / f"monthly_{runrefactor.strategy.name}_{ts}.csv"
         run.monthly_returns.to_csv(monthly_path)
         print(f"  Monthly returns saved → {monthly_path}")
 

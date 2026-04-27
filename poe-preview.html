@@ -1,0 +1,336 @@
+<!DOCTYPE html><html><head><meta name="x-poe-datastore-behavior" content="local_only"><meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://code.jquery.com https://unpkg.com https://d3js.org https://threejs.org https://cdn.plot.ly https://stackpath.bootstrapcdn.com https://maps.googleapis.com https://cdn.tailwindcss.com https://ajax.googleapis.com https://kit.fontawesome.com https://cdn.datatables.net https://maxcdn.bootstrapcdn.com https://code.highcharts.com https://tako-static-assets-production.s3.amazonaws.com https://www.youtube.com https://fonts.googleapis.com https://fonts.gstatic.com https://pfst.cf2.poecdn.net https://puc.poecdn.net https://i.imgur.com https://wikimedia.org https://*.icons8.com https://*.giphy.com https://picsum.photos https://images.unsplash.com; frame-src 'self' https://www.youtube.com https://trytako.com; child-src 'self'; manifest-src 'self'; worker-src 'self'; upgrade-insecure-requests; block-all-mixed-content;"><meta http-equiv="x-dns-prefetch-control" content="off"><script src="https://puc.poecdn.net/authenticated_preview_page/standard.3ef2c256959faf5a756d.js"></script>
+    <meta charset="utf-8">
+    <title>Poe</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+  <script src="https://puc.poecdn.net/authenticated_preview_page/disableWebRTC.9710cebe07429a9e8e06.js"></script><meta name="x-poe-allow-downloads" content="true"><meta name="x-poe-datastore-behavior" content="disabled"><script src="https://puc.poecdn.net/authenticated_preview_page/tw.50ec1b0612bf5b0c30a5.js"></script><script src="https://puc.poecdn.net/authenticated_preview_page/deps.faccd16000d314dc16d5.js"></script><script src="https://puc.poecdn.net/authenticated_preview_page/exports.b0f0f482cdeb5302b0b9.js"></script><script src="https://puc.poecdn.net/authenticated_preview_page/renderer.75c73ae6b4235f62945a.js"></script><script>Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }var _react = require('react'); var _react2 = _interopRequireDefault(_react);
+var _lucidereact = require('lucide-react');
+
+const sectorData = [
+  { rank: 1, sector: 'Technology', etf: 'XLK', regime: 'leading', blended: 0.7128, rsLvl: 0.0476, rsMom: 0.0356, etfScr: 0.5179, thmAvg: 0.5019, excess20d: 0.1073, rrgQuad: 'leading' },
+  { rank: 2, sector: 'Consumer Discretionary', etf: 'XLY', regime: 'improving', blended: 0.5432, rsLvl: 0.0034, rsMom: 0.0143, etfScr: 0.4810, thmAvg: 0.5175, excess20d: -0.0028, rrgQuad: 'leading' },
+  { rank: 3, sector: 'Real Estate', etf: 'XLRE', regime: 'weakening', blended: 0.4321, rsLvl: -0.0116, rsMom: -0.0113, etfScr: 0.4704, thmAvg: 0.4704, excess20d: -0.0305, rrgQuad: 'lagging' },
+  { rank: 4, sector: 'Communication Services', etf: 'XLC', regime: 'improving', blended: 0.4287, rsLvl: -0.0185, rsMom: -0.0044, etfScr: 0.4582, thmAvg: 0.4582, excess20d: -0.0465, rrgQuad: 'lagging' },
+  { rank: 5, sector: 'Financials', etf: 'XLF', regime: 'weakening', blended: 0.3691, rsLvl: -0.0217, rsMom: -0.0258, etfScr: 0.4534, thmAvg: 0.4987, excess20d: -0.0504, rrgQuad: 'lagging' },
+  { rank: 6, sector: 'Industrials', etf: 'XLI', regime: 'weakening', blended: 0.3545, rsLvl: -0.0208, rsMom: -0.0287, etfScr: 0.4615, thmAvg: 0.4082, excess20d: -0.0426, rrgQuad: 'lagging' },
+  { rank: 7, sector: 'Consumer Staples', etf: 'XLP', regime: 'weakening', blended: 0.3370, rsLvl: -0.0420, rsMom: -0.0135, etfScr: 0.4269, thmAvg: 0.4269, excess20d: -0.1082, rrgQuad: 'lagging' },
+  { rank: 8, sector: 'Materials', etf: 'XLB', regime: 'weakening', blended: 0.3049, rsLvl: -0.0294, rsMom: -0.0438, etfScr: 0.4507, thmAvg: 0.5139, excess20d: -0.0644, rrgQuad: 'lagging' },
+  { rank: 9, sector: 'Healthcare', etf: 'XLV', regime: 'lagging', blended: 0.2511, rsLvl: -0.0550, rsMom: -0.0352, etfScr: 0.4133, thmAvg: 0.4708, excess20d: -0.1195, rrgQuad: 'lagging' },
+  { rank: 10, sector: 'Utilities', etf: 'XLU', regime: 'lagging', blended: 0.2085, rsLvl: -0.0598, rsMom: -0.0457, etfScr: 0.4234, thmAvg: 0.4234, excess20d: -0.1130, rrgQuad: 'lagging' },
+  { rank: 11, sector: 'Energy', etf: 'XLE', regime: 'lagging', blended: 0.1890, rsLvl: -0.0844, rsMom: -0.0316, etfScr: 0.3603, thmAvg: 0.4833, excess20d: -0.2169, rrgQuad: 'lagging' },
+];
+
+const etfData = [
+  { rank: 1, ticker: 'SOXX', theme: 'Semiconductors', sector: 'Technology', score: 0.557, trend: 0.344, mom: 0.872, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 42.7, badge: '' },
+  { rank: 2, ticker: 'SMH', theme: 'Semiconductors', sector: 'Technology', score: 0.543, trend: 0.344, mom: 0.824, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 35.3, badge: '' },
+  { rank: 3, ticker: 'QTUM', theme: 'Quantum Computing', sector: 'Technology', score: 0.523, trend: 0.344, mom: 0.757, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 26.4, badge: '' },
+  { rank: 4, ticker: 'XLK', theme: 'Technology', sector: 'Technology', score: 0.518, trend: 0.344, mom: 0.741, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 23.3, badge: '●' },
+  { rank: 5, ticker: 'DRIV', theme: 'Autonomous & EV', sector: 'Consumer Disc.', score: 0.517, trend: 0.344, mom: 0.739, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 21.9, badge: '' },
+  { rank: 6, ticker: 'LIT', theme: 'Lithium & Battery', sector: 'Materials', score: 0.514, trend: 0.344, mom: 0.727, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 16.5, badge: '' },
+  { rank: 7, ticker: 'AIQ', theme: 'AI & Big Data', sector: 'Technology', score: 0.513, trend: 0.344, mom: 0.725, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 21.3, badge: '' },
+  { rank: 8, ticker: 'BLOK', theme: 'Blockchain', sector: 'Technology', score: 0.513, trend: 0.344, mom: 0.724, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 23.8, badge: '' },
+  { rank: 9, ticker: 'URA', theme: 'Uranium', sector: 'Energy', score: 0.512, trend: 0.344, mom: 0.722, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 18.6, badge: '' },
+  { rank: 10, ticker: 'MTUM', theme: 'Momentum Factor', sector: 'Broad', score: 0.511, trend: 0.344, mom: 0.718, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 19.1, badge: '' },
+  { rank: 11, ticker: 'QQQ', theme: 'Nasdaq 100', sector: 'Broad', score: 0.506, trend: 0.344, mom: 0.702, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 18.0, badge: '○' },
+  { rank: 12, ticker: 'ARKK', theme: 'Innovation', sector: 'Technology', score: 0.501, trend: 0.344, mom: 0.685, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 18.4, badge: '' },
+  { rank: 13, ticker: 'IBIT', theme: 'Bitcoin', sector: 'Financials', score: 0.501, trend: 0.344, mom: 0.684, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 17.7, badge: '' },
+  { rank: 14, ticker: 'FINX', theme: 'Fintech', sector: 'Financials', score: 0.496, trend: 0.344, mom: 0.669, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 16.0, badge: '' },
+  { rank: 15, ticker: 'ARKG', theme: 'Genomics', sector: 'Healthcare', score: 0.496, trend: 0.344, mom: 0.669, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 18.1, badge: '' },
+  { rank: 16, ticker: 'IWM', theme: 'Russell 2000', sector: 'Broad', score: 0.493, trend: 0.344, mom: 0.657, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 13.8, badge: '○' },
+  { rank: 17, ticker: 'URNM', theme: 'Uranium', sector: 'Energy', score: 0.490, trend: 0.344, mom: 0.647, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 12.1, badge: '' },
+  { rank: 18, ticker: 'SPY', theme: 'S&P 500', sector: 'Broad', score: 0.486, trend: 0.344, mom: 0.634, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 12.6, badge: '○' },
+  { rank: 19, ticker: 'ICLN', theme: 'Clean Energy', sector: 'Energy', score: 0.484, trend: 0.344, mom: 0.628, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 12.0, badge: '' },
+  { rank: 20, ticker: 'XLY', theme: 'Consumer Disc.', sector: 'Consumer Disc.', score: 0.481, trend: 0.344, mom: 0.617, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 12.3, badge: '●' },
+  { rank: 21, ticker: 'NLR', theme: 'Nuclear', sector: 'Energy', score: 0.477, trend: 0.344, mom: 0.604, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 10.5, badge: '' },
+  { rank: 22, ticker: 'SKYY', theme: 'Cloud Computing', sector: 'Technology', score: 0.476, trend: 0.344, mom: 0.602, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 11.8, badge: '' },
+  { rank: 23, ticker: 'XBI', theme: 'Biotech', sector: 'Healthcare', score: 0.474, trend: 0.344, mom: 0.595, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 11.4, badge: '' },
+  { rank: 24, ticker: 'MDY', theme: 'S&P MidCap 400', sector: 'Broad', score: 0.471, trend: 0.344, mom: 0.584, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 10.0, badge: '○' },
+  { rank: 25, ticker: 'XLRE', theme: 'Real Estate', sector: 'Real Estate', score: 0.470, trend: 0.344, mom: 0.582, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 9.5, badge: '●' },
+  { rank: 26, ticker: 'IGV', theme: 'Software', sector: 'Technology', score: 0.470, trend: 0.344, mom: 0.581, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 10.8, badge: '' },
+  { rank: 27, ticker: 'CIBR', theme: 'Cybersecurity', sector: 'Technology', score: 0.469, trend: 0.344, mom: 0.577, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 10.7, badge: '' },
+  { rank: 28, ticker: 'DIA', theme: 'Dow Jones', sector: 'Broad', score: 0.465, trend: 0.344, mom: 0.563, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 9.0, badge: '○' },
+  { rank: 29, ticker: 'XLI', theme: 'Industrials', sector: 'Industrials', score: 0.462, trend: 0.344, mom: 0.552, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 8.3, badge: '●' },
+  { rank: 30, ticker: 'XLC', theme: 'Comm. Services', sector: 'Comm. Services', score: 0.458, trend: 0.344, mom: 0.541, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 7.9, badge: '●' },
+  { rank: 31, ticker: 'HACK', theme: 'Cybersecurity', sector: 'Technology', score: 0.453, trend: 0.344, mom: 0.526, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 8.2, badge: '' },
+  { rank: 32, ticker: 'XLF', theme: 'Financials', sector: 'Financials', score: 0.453, trend: 0.344, mom: 0.525, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 7.6, badge: '●' },
+  { rank: 33, ticker: 'TAN', theme: 'Solar', sector: 'Energy', score: 0.453, trend: 0.344, mom: 0.525, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 7.0, badge: '' },
+  { rank: 34, ticker: 'XLB', theme: 'Materials', sector: 'Materials', score: 0.451, trend: 0.344, mom: 0.517, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 6.2, badge: '●' },
+  { rank: 35, ticker: 'IBB', theme: 'Biotech', sector: 'Healthcare', score: 0.442, trend: 0.344, mom: 0.487, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 5.8, badge: '' },
+  { rank: 36, ticker: 'XLP', theme: 'Consumer Staples', sector: 'Consumer Staples', score: 0.427, trend: 0.344, mom: 0.437, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 1.8, badge: '●' },
+  { rank: 37, ticker: 'XLU', theme: 'Utilities', sector: 'Utilities', score: 0.423, trend: 0.344, mom: 0.425, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 1.3, badge: '●' },
+  { rank: 38, ticker: 'XLV', theme: 'Healthcare', sector: 'Healthcare', score: 0.413, trend: 0.344, mom: 0.392, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: 0.6, badge: '●' },
+  { rank: 39, ticker: 'ITA', theme: 'Defense & Aero', sector: 'Industrials', score: 0.408, trend: 0.344, mom: 0.375, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: -0.1, badge: '' },
+  { rank: 40, ticker: 'XLE', theme: 'Energy', sector: 'Energy', score: 0.360, trend: 0.344, mom: 0.215, part: 0.333, rsi: 50.0, adx: 15.0, rvol: 1.00, ret20d: -9.1, badge: '●' },
+];
+
+const regimeColors = {
+  leading: { bg: 'bg-emerald-900/40', text: 'text-emerald-400', border: 'border-emerald-500/30', dot: '🟢' },
+  improving: { bg: 'bg-blue-900/40', text: 'text-blue-400', border: 'border-blue-500/30', dot: '🔵' },
+  weakening: { bg: 'bg-yellow-900/40', text: 'text-yellow-400', border: 'border-yellow-500/30', dot: '🟡' },
+  lagging: { bg: 'bg-red-900/40', text: 'text-red-400', border: 'border-red-500/30', dot: '🔴' },
+};
+
+function SectionHeader({ icon, title, subtitle }) {
+  return (
+    _react2.default.createElement('div', { className: "bg-gradient-to-r from-slate-800 via-slate-800 to-slate-900 border border-cyan-500/30 rounded-lg px-4 py-3 mb-4"         ,}
+      , _react2.default.createElement('div', { className: "flex items-center gap-2"  ,}
+        , icon
+        , _react2.default.createElement('h2', { className: "text-cyan-400 font-bold text-lg tracking-wide"   ,}, title)
+      )
+      , subtitle && _react2.default.createElement('p', { className: "text-slate-400 text-xs mt-1 ml-7"   ,}, subtitle)
+    )
+  );
+}
+
+function RegimeBadge({ regime }) {
+  const c = regimeColors[regime] || regimeColors.lagging;
+  return (
+    _react2.default.createElement('span', { className: `inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${c.bg} ${c.text} border ${c.border}`,}
+      , _react2.default.createElement('span', { className: "text-xs",}, c.dot), " " , regime
+    )
+  );
+}
+
+function BlendedBar({ value, max = 0.75 }) {
+  const pct = Math.max(0, Math.min(100, (value / max) * 100));
+  const color = value > 0.5 ? 'bg-emerald-500' : value > 0.35 ? 'bg-yellow-500' : 'bg-red-500';
+  return (
+    _react2.default.createElement('div', { className: "flex items-center gap-2 w-full"   ,}
+      , _react2.default.createElement('div', { className: "flex-1 bg-slate-700/50 rounded-full h-2 overflow-hidden"    ,}
+        , _react2.default.createElement('div', { className: `h-full rounded-full ${color} transition-all`, style: { width: `${pct}%` },} )
+      )
+      , _react2.default.createElement('span', { className: "text-xs font-mono text-slate-300 w-12 text-right"    ,}, value.toFixed(4))
+    )
+  );
+}
+
+function ScoreBar({ value, max = 0.6 }) {
+  const pct = Math.max(0, Math.min(100, (value / max) * 100));
+  const color = value > 0.5 ? 'bg-emerald-500' : value > 0.45 ? 'bg-cyan-500' : value > 0.4 ? 'bg-yellow-500' : 'bg-red-500';
+  return (
+    _react2.default.createElement('div', { className: "flex items-center gap-2"  ,}
+      , _react2.default.createElement('div', { className: "w-16 bg-slate-700/50 rounded-full h-1.5 overflow-hidden"    ,}
+        , _react2.default.createElement('div', { className: `h-full rounded-full ${color}`, style: { width: `${pct}%` },} )
+      )
+      , _react2.default.createElement('span', { className: "text-xs font-mono text-slate-300"  ,}, value.toFixed(3))
+    )
+  );
+}
+
+function ValCell({ val, warn }) {
+  return (
+    _react2.default.createElement('span', { className: `font-mono text-xs ${warn ? 'text-amber-500/60' : 'text-slate-300'}`,}
+      , typeof val === 'number' ? val.toFixed(val % 1 === 0 ? 1 : val > 10 ? 1 : 3) : val
+    )
+  );
+}
+
+function SectorRotationSection() {
+  const groups = {
+    leading: sectorData.filter(s => s.regime === 'leading'),
+    improving: sectorData.filter(s => s.regime === 'improving'),
+    weakening: sectorData.filter(s => s.regime === 'weakening'),
+    lagging: sectorData.filter(s => s.regime === 'lagging'),
+  };
+
+  return (
+    _react2.default.createElement('div', { className: "mb-6",}
+      , _react2.default.createElement(SectionHeader, {
+        icon: _react2.default.createElement(_lucidereact.TrendingUp, { className: "w-5 h-5 text-cyan-400"  ,} ),
+        title: "SECTOR ROTATION" ,
+        subtitle: "Blended RRG + ETF Composite — 11 GICS Sectors"        ,}
+      )
+
+      , _react2.default.createElement('div', { className: "grid grid-cols-2 gap-3 mb-4"   ,}
+        , Object.entries(groups).map(([regime, items]) => {
+          const c = regimeColors[regime];
+          return (
+            _react2.default.createElement('div', { key: regime, className: `${c.bg} border ${c.border} rounded-lg px-3 py-2`,}
+              , _react2.default.createElement('div', { className: "flex items-center gap-2 mb-1"   ,}
+                , _react2.default.createElement('span', { className: "text-sm",}, c.dot)
+                , _react2.default.createElement('span', { className: `font-bold text-sm uppercase ${c.text}`,}, regime)
+                , _react2.default.createElement('span', { className: "text-slate-500 text-xs" ,}, "(", items.length, ")")
+              )
+              , _react2.default.createElement('p', { className: "text-slate-300 text-xs leading-relaxed"  ,}
+                , items.map(i => i.sector).join(', ')
+              )
+            )
+          );
+        })
+      )
+
+      , _react2.default.createElement('div', { className: "overflow-x-auto",}
+        , _react2.default.createElement('table', { className: "w-full text-xs" ,}
+          , _react2.default.createElement('thead', null
+            , _react2.default.createElement('tr', { className: "border-b border-slate-700" ,}
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2 w-8"     ,}, "#")
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2"    ,}, "Sector")
+              , _react2.default.createElement('th', { className: "text-center text-slate-500 font-medium py-2 px-1"    ,}, "ETF")
+              , _react2.default.createElement('th', { className: "text-center text-slate-500 font-medium py-2 px-1"    ,}, "Regime")
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2 w-48"     ,}, "Blended")
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}, "RS Lvl" )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}, "RS Mom" )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}, "ETF Scr" )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}, "Thm Avg" )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}, "Excess 20d" )
+              , _react2.default.createElement('th', { className: "text-center text-slate-500 font-medium py-2 px-1"    ,}, "RRG")
+            )
+          )
+          , _react2.default.createElement('tbody', null
+            , sectorData.map((s, i) => (
+              _react2.default.createElement('tr', { key: s.etf, className: `border-b border-slate-800/50 ${i % 2 === 0 ? 'bg-slate-800/20' : ''} hover:bg-slate-700/30 transition-colors`,}
+                , _react2.default.createElement('td', { className: "py-2 px-2 text-slate-500 font-mono"   ,}, s.rank)
+                , _react2.default.createElement('td', { className: "py-2 px-2 text-slate-200 font-medium"   ,}, s.sector)
+                , _react2.default.createElement('td', { className: "py-2 px-1 text-center"  ,}
+                  , _react2.default.createElement('span', { className: "font-mono text-cyan-400 font-bold"  ,}, s.etf)
+                )
+                , _react2.default.createElement('td', { className: "py-2 px-1 text-center"  ,}, _react2.default.createElement(RegimeBadge, { regime: s.regime,} ))
+                , _react2.default.createElement('td', { className: "py-2 px-2" ,}, _react2.default.createElement(BlendedBar, { value: s.blended,} ))
+                , _react2.default.createElement('td', { className: `py-2 px-1 text-right font-mono ${s.rsLvl >= 0 ? 'text-emerald-400' : 'text-red-400'}`,}
+                  , s.rsLvl >= 0 ? '+' : '', s.rsLvl.toFixed(4)
+                )
+                , _react2.default.createElement('td', { className: `py-2 px-1 text-right font-mono ${s.rsMom >= 0 ? 'text-emerald-400' : 'text-red-400'}`,}
+                  , s.rsMom >= 0 ? '+' : '', s.rsMom.toFixed(4)
+                )
+                , _react2.default.createElement('td', { className: "py-2 px-1 text-right font-mono text-slate-300"    ,}, s.etfScr.toFixed(4))
+                , _react2.default.createElement('td', { className: "py-2 px-1 text-right font-mono text-slate-300"    ,}, s.thmAvg.toFixed(4))
+                , _react2.default.createElement('td', { className: `py-2 px-1 text-right font-mono ${s.excess20d >= 0 ? 'text-emerald-400' : 'text-red-400'}`,}
+                  , s.excess20d >= 0 ? '+' : '', (s.excess20d * 100).toFixed(2), "%"
+                )
+                , _react2.default.createElement('td', { className: "py-2 px-1 text-center"  ,}, _react2.default.createElement(RegimeBadge, { regime: s.rrgQuad,} ))
+              )
+            ))
+          )
+        )
+      )
+    )
+  );
+}
+
+function ETFUniverseSection() {
+  const [showAll, setShowAll] = _react.useState.call(void 0, false);
+  const displayed = showAll ? etfData : etfData.slice(0, 15);
+
+  return (
+    _react2.default.createElement('div', { className: "mb-6",}
+      , _react2.default.createElement(SectionHeader, {
+        icon: _react2.default.createElement(_lucidereact.BarChart3, { className: "w-5 h-5 text-cyan-400"  ,} ),
+        title: "ETF UNIVERSE RANKING"  ,
+        subtitle: "Composite Score — 51 ETFs scored"     ,}
+      )
+
+      , _react2.default.createElement('div', { className: "flex items-center gap-4 mb-3 px-1"    ,}
+        , _react2.default.createElement('div', { className: "flex items-center gap-2 text-xs"   ,}
+          , _react2.default.createElement('span', { className: "text-slate-500",}, "ETFs:")
+          , _react2.default.createElement('span', { className: "text-slate-200 font-bold" ,}, "51")
+        )
+        , _react2.default.createElement('div', { className: "flex items-center gap-2 text-xs"   ,}
+          , _react2.default.createElement('span', { className: "text-slate-500",}, "Mean:")
+          , _react2.default.createElement('span', { className: "text-slate-200 font-mono" ,}, "0.478")
+        )
+        , _react2.default.createElement('div', { className: "flex items-center gap-2 text-xs"   ,}
+          , _react2.default.createElement('span', { className: "text-slate-500",}, "Top:")
+          , _react2.default.createElement('span', { className: "text-emerald-400 font-mono font-bold"  ,}, "SOXX (0.557)" )
+        )
+        , _react2.default.createElement('div', { className: "flex items-center gap-2 text-xs"   ,}
+          , _react2.default.createElement('span', { className: "text-slate-500",}, "Bottom:")
+          , _react2.default.createElement('span', { className: "text-red-400 font-mono font-bold"  ,}, "XLE (0.360)" )
+        )
+      )
+
+      , _react2.default.createElement('div', { className: "bg-amber-900/20 border border-amber-500/30 rounded-lg px-3 py-2 mb-4 flex items-start gap-2"         ,}
+        , _react2.default.createElement(_lucidereact.AlertTriangle, { className: "w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0"    ,} )
+        , _react2.default.createElement('div', null
+          , _react2.default.createElement('p', { className: "text-amber-400 text-xs font-bold"  ,}, "DATA QUALITY WARNING"  )
+          , _react2.default.createElement('p', { className: "text-amber-300/70 text-xs mt-0.5"  ,}, "Trend, Participation, RSI, ADX, and RVOL columns show identical values across all ETFs (0.344, 0.333, 50.0, 15.0, 1.00). Composite scores are effectively driven by Momentum alone. Check the upstream scoring pipeline."
+
+
+
+          )
+        )
+      )
+
+      , _react2.default.createElement('div', { className: "overflow-x-auto",}
+        , _react2.default.createElement('table', { className: "w-full text-xs" ,}
+          , _react2.default.createElement('thead', null
+            , _react2.default.createElement('tr', { className: "border-b border-slate-700" ,}
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2 w-8"     ,}, "#")
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2"    ,}, "Ticker")
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2"    ,}, "Theme")
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2"    ,}, "Sector")
+              , _react2.default.createElement('th', { className: "text-left text-slate-500 font-medium py-2 px-2"    ,}, "Score")
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}, "Mom")
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}
+                , _react2.default.createElement('span', { className: "text-amber-500/60",}, "Trend")
+              )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}
+                , _react2.default.createElement('span', { className: "text-amber-500/60",}, "RSI")
+              )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}
+                , _react2.default.createElement('span', { className: "text-amber-500/60",}, "ADX")
+              )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-1"    ,}
+                , _react2.default.createElement('span', { className: "text-amber-500/60",}, "RVOL")
+              )
+              , _react2.default.createElement('th', { className: "text-right text-slate-500 font-medium py-2 px-2"    ,}, "Ret 20d" )
+            )
+          )
+          , _react2.default.createElement('tbody', null
+            , displayed.map((e, i) => (
+              _react2.default.createElement('tr', { key: e.ticker, className: `border-b border-slate-800/50 ${i % 2 === 0 ? 'bg-slate-800/20' : ''} hover:bg-slate-700/30 transition-colors`,}
+                , _react2.default.createElement('td', { className: "py-1.5 px-2 text-slate-500 font-mono"   ,}, e.rank)
+                , _react2.default.createElement('td', { className: "py-1.5 px-2" ,}
+                  , _react2.default.createElement('span', { className: "font-mono font-bold text-cyan-400"  ,}, e.ticker)
+                  , e.badge === '●' && _react2.default.createElement('span', { className: "ml-1 text-yellow-400 text-xs"  , title: "Sector ETF" ,}, "●")
+                  , e.badge === '○' && _react2.default.createElement('span', { className: "ml-1 text-slate-400 text-xs"  , title: "Broad Market" ,}, "○")
+                )
+                , _react2.default.createElement('td', { className: "py-1.5 px-2 text-slate-300"  ,}, e.theme)
+                , _react2.default.createElement('td', { className: "py-1.5 px-2 text-slate-400"  ,}, e.sector)
+                , _react2.default.createElement('td', { className: "py-1.5 px-2" ,}, _react2.default.createElement(ScoreBar, { value: e.score,} ))
+                , _react2.default.createElement('td', { className: "py-1.5 px-1 text-right font-mono text-emerald-400 font-medium"     ,}, e.mom.toFixed(3))
+                , _react2.default.createElement('td', { className: "py-1.5 px-1 text-right"  ,}, _react2.default.createElement(ValCell, { val: e.trend, warn: true,} ))
+                , _react2.default.createElement('td', { className: "py-1.5 px-1 text-right"  ,}, _react2.default.createElement(ValCell, { val: e.rsi, warn: true,} ))
+                , _react2.default.createElement('td', { className: "py-1.5 px-1 text-right"  ,}, _react2.default.createElement(ValCell, { val: e.adx, warn: true,} ))
+                , _react2.default.createElement('td', { className: "py-1.5 px-1 text-right"  ,}, _react2.default.createElement(ValCell, { val: e.rvol, warn: true,} ))
+                , _react2.default.createElement('td', { className: `py-1.5 px-2 text-right font-mono font-medium ${e.ret20d >= 0 ? 'text-emerald-400' : 'text-red-400'}`,}
+                  , e.ret20d >= 0 ? '+' : '', e.ret20d.toFixed(1), "%"
+                )
+              )
+            ))
+          )
+        )
+      )
+
+      , etfData.length > 15 && (
+        _react2.default.createElement('button', {
+          onClick: () => setShowAll(!showAll),
+          className: "mt-3 flex items-center gap-1 text-cyan-400 text-xs hover:text-cyan-300 transition-colors mx-auto"        ,}
+
+          , showAll ? _react2.default.createElement(_lucidereact.ChevronUp, { className: "w-4 h-4" ,} ) : _react2.default.createElement(_lucidereact.ChevronDown, { className: "w-4 h-4" ,} )
+          , showAll ? 'Show Top 15' : `Show All ${etfData.length} ETFs`
+        )
+      )
+
+      , _react2.default.createElement('div', { className: "mt-3 flex items-center gap-4 text-xs text-slate-500 px-1"      ,}
+        , _react2.default.createElement('span', null, _react2.default.createElement('span', { className: "text-yellow-400",}, "●"), " Sector ETF"  )
+        , _react2.default.createElement('span', null, _react2.default.createElement('span', { className: "text-slate-400",}, "○"), " Broad Market"  )
+        , _react2.default.createElement('span', { className: "text-amber-500/60",}, "■ Stale data columns"   )
+      )
+    )
+  );
+}
+
+ function SectorRotationDashboard() {
+  return (
+    _react2.default.createElement('div', { className: "bg-slate-900 min-h-screen text-slate-200 p-4"   ,}
+      , _react2.default.createElement('div', { className: "max-w-7xl mx-auto space-y-6"  ,}
+        , _react2.default.createElement(SectorRotationSection, null )
+        , _react2.default.createElement(ETFUniverseSection, null )
+      )
+    )
+  );
+} exports.default = SectorRotationDashboard;
+</script></head>
+  <body>
+  
+
+<div id="preview-app"></div></body></html>

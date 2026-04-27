@@ -47,10 +47,8 @@ BENCHMARK_FALLBACKS = {
 
 
 # ═══════════════════════════════════════════════════════════════
-#  NEW ── THEMATIC ETF DEFINITIONS
+#  THEMATIC ETF DEFINITIONS
 # ═══════════════════════════════════════════════════════════════
-# Maps theme name → list of representative ETFs.
-# Only ETFs present in the parquet will be used.
 
 THEMATIC_ETF_MAP: dict[str, dict[str, list[str]]] = {
     "US": {
@@ -73,7 +71,6 @@ THEMATIC_ETF_MAP: dict[str, dict[str, list[str]]] = {
     "IN": {},
 }
 
-# Flat set per market for quick membership checks
 THEMATIC_ETF_TICKERS: dict[str, set[str]] = {
     mkt: {
         etf
@@ -83,7 +80,6 @@ THEMATIC_ETF_TICKERS: dict[str, set[str]] = {
     for mkt, themes in THEMATIC_ETF_MAP.items()
 }
 
-# 11 GICS sector ETFs (reference – used for logging / diagnostics)
 SECTOR_ETF_MAP: dict[str, str] = {
     "Technology":              "XLK",
     "Consumer Discretionary":  "XLY",
@@ -100,23 +96,94 @@ SECTOR_ETF_MAP: dict[str, str] = {
 
 
 # ═══════════════════════════════════════════════════════════════
-#  NEW ── THEMATIC FRAME EXTRACTION
+#  DISPLAY FORMATTING HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+_BOX_WIDTH = 110
+
+_REGIME_ICON: dict[str, str] = {
+    "leading":   "🟢",
+    "improving": "🔵",
+    "weakening": "🟡",
+    "lagging":   "🔴",
+    "unknown":   "⚪",
+}
+
+
+def _box_header(emoji: str, title: str) -> list[str]:
+    """Produce a ╔═══╗ / ║ ... ║ / ╚═══╝ header block."""
+    inner = _BOX_WIDTH - 2
+    content = f" {emoji}  {title} "
+    # pad to inner width (emoji display width varies; best-effort)
+    padded = content + " " * max(0, inner - len(content))
+    return [
+        "╔" + "═" * inner + "╗",
+        "║" + padded[:inner] + "║",
+        "╚" + "═" * inner + "╝",
+    ]
+
+
+def _sub_header(text: str, width: int = 90) -> str:
+    """Produce a ── Title (extra) ── style sub-header line."""
+    dash_len = max(4, width - len(text) - 6)
+    return f"  ── {text}  {'─' * dash_len}"
+
+
+def _hbar(value: float, max_val: float, width: int = 16) -> str:
+    """Render a thin Unicode horizontal bar chart segment."""
+    if max_val <= 0:
+        return " " * width
+    ratio = max(0.0, min(1.0, value / max_val))
+    filled = ratio * width
+    full = int(filled)
+    frac = filled - full
+    partials = " ▏▎▍▌▋▊▉"
+    bar = "█" * full
+    if full < width:
+        bar += partials[min(int(frac * 8), 7)]
+        bar += " " * (width - full - 1)
+    return bar[:width]
+
+
+def _signed(val: float, width: int = 8, decimals: int = 4, pct: bool = False) -> str:
+    """Format a signed numeric value with explicit +/- prefix."""
+    if pct:
+        formatted = f"{val * 100:+.2f}%"
+    else:
+        formatted = f"{val:+.{decimals}f}"
+    return formatted.rjust(width)
+
+
+def _detect_stale_columns(
+    df: pd.DataFrame,
+    columns: list[str],
+    threshold: float = 0.95,
+) -> list[str]:
+    """Return column names where ≥ threshold fraction of non-null values are identical."""
+    stale: list[str] = []
+    for col in columns:
+        if col not in df.columns:
+            continue
+        series = df[col].dropna()
+        if len(series) < 3:
+            continue
+        if series.nunique() <= 1:
+            stale.append(col)
+            continue
+        top_pct = series.value_counts(normalize=True).iloc[0]
+        if top_pct >= threshold:
+            stale.append(col)
+    return stale
+
+
+# ═══════════════════════════════════════════════════════════════
+#  THEMATIC FRAME EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
 def _extract_thematic_frames(
     universe_frames: dict[str, pd.DataFrame],
     market: str,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, list[str]]]:
-    """
-    Pull thematic-ETF frames out of the already-loaded universe data.
-
-    Returns
-    -------
-    thematic_frames : {ticker: DataFrame}
-        Price frames for every thematic ETF found in the parquet.
-    available_map : {theme_name: [tickers]}
-        Only themes that have at least one ETF in the data.
-    """
     market_upper = market.upper()
     theme_map = THEMATIC_ETF_MAP.get(market_upper, {})
 
@@ -157,18 +224,10 @@ def _extract_thematic_frames(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  NEW ── PORTFOLIO SELECTION GAP DIAGNOSTICS  (answers Q1)
+#  PORTFOLIO SELECTION GAP DIAGNOSTICS
 # ═══════════════════════════════════════════════════════════════
 
 def _log_portfolio_selection_gaps(result: dict[str, Any]) -> None:
-    """
-    Compare every STRONG_BUY name from the scored table against the
-    names actually selected for the portfolio, and log the diff.
-
-    This makes it obvious when a STRONG_BUY is dropped by the
-    portfolio constructor (sector cap, liquidity filter, theme cap …).
-    """
-    # ── locate scored table ────────────────────────────────
     scored_df: pd.DataFrame | None = None
     for key in _SCORED_TABLE_KEYS:
         candidate = result.get(key)
@@ -183,17 +242,14 @@ def _log_portfolio_selection_gaps(result: dict[str, Any]) -> None:
     if ticker_col is None or signal_col is None:
         return
 
-    # ── all STRONG_BUY from scored table ───────────────────
     sb_mask = scored_df[signal_col].astype(str).str.upper() == "STRONG_BUY"
     all_strong_buy = set(scored_df.loc[sb_mask, ticker_col].astype(str))
     if not all_strong_buy:
         return
 
-    # ── selected portfolio tickers ─────────────────────────
     report = result.get("report_v2", {})
     selected_set = _extract_portfolio_set(report)
 
-    # Also look in the result dict directly
     for key in ("portfolio_tickers", "selected_tickers", "selected_names"):
         extra = result.get(key)
         if isinstance(extra, (list, set, frozenset)):
@@ -201,7 +257,6 @@ def _log_portfolio_selection_gaps(result: dict[str, Any]) -> None:
 
     dropped = sorted(all_strong_buy - selected_set)
     if dropped:
-        # Build a mini-table of the dropped names for the log
         drop_rows = scored_df[
             scored_df[ticker_col].astype(str).isin(dropped)
         ]
@@ -236,7 +291,6 @@ def _parse_iso_date(value: str | None) -> date | None:
     return date.fromisoformat(value)
 
 
-
 def setup_logging(verbose: bool = False) -> Path:
     log_dir = Path(LOGS_DIR)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -255,7 +309,6 @@ def setup_logging(verbose: bool = False) -> Path:
     return log_file
 
 
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run refactor v2 pipeline from desktop CLI")
     p.add_argument("--market", default="US", help="US, HK, or IN")
@@ -267,7 +320,6 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-
 def _resolve_parquet_path(market: str, parquet_path: str | None = None) -> Path:
     if parquet_path:
         return Path(parquet_path)
@@ -275,7 +327,6 @@ def _resolve_parquet_path(market: str, parquet_path: str | None = None) -> Path:
     if m not in MARKET_PARQUET:
         raise ValueError(f"Unknown market {market!r}")
     return Path(DATA_DIR) / MARKET_PARQUET[m]
-
 
 
 def _find_date_col(df: pd.DataFrame) -> str:
@@ -287,13 +338,11 @@ def _find_date_col(df: pd.DataFrame) -> str:
     raise ValueError(f"Could not find a date column. Tried {DATE_CANDIDATE_COLS}")
 
 
-
 def _find_ticker_col(df: pd.DataFrame) -> str:
     for col in TICKER_CANDIDATE_COLS:
         if col in df.columns:
             return col
     raise ValueError(f"Could not find a ticker column. Tried {TICKER_CANDIDATE_COLS}")
-
 
 
 def _coerce_and_filter_dates(df: pd.DataFrame, start_date: date | None, end_date: date | None) -> pd.DataFrame:
@@ -317,7 +366,6 @@ def _coerce_and_filter_dates(df: pd.DataFrame, start_date: date | None, end_date
     return out
 
 
-
 def _build_frames_from_panel(df: pd.DataFrame, market: str) -> tuple[dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame | None]:
     ticker_col = _find_ticker_col(df)
     date_col = _find_date_col(df)
@@ -327,7 +375,6 @@ def _build_frames_from_panel(df: pd.DataFrame, market: str) -> tuple[dict[str, p
     cfg = get_market_config_v2(market)
     benchmark = cfg["benchmark"]
     universe_frames: dict[str, pd.DataFrame] = {}
-
 
     for ticker, g in work.groupby(ticker_col):
         g = g.copy()
@@ -339,7 +386,6 @@ def _build_frames_from_panel(df: pd.DataFrame, market: str) -> tuple[dict[str, p
         g.index = pd.to_datetime(g.index)
         g.index.name = "date"
         universe_frames[str(ticker)] = g
-
 
     bench_df = universe_frames.get(benchmark)
 
@@ -359,7 +405,6 @@ def _build_frames_from_panel(df: pd.DataFrame, market: str) -> tuple[dict[str, p
     return universe_frames, bench_df, breadth_df
 
 
-
 def _human_file_size(num_bytes: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     size = float(num_bytes)
@@ -368,7 +413,6 @@ def _human_file_size(num_bytes: int) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024.0
     return f"{num_bytes} B"
-
 
 
 def load_market_data_v2(
@@ -409,7 +453,6 @@ def load_market_data_v2(
 #  SIGNAL WRITER HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-# ── SIGNAL WRITER: canonical action labels ────────────────────
 _BUY_LABELS = frozenset({
     "BUY", "STRONG_BUY", "BUY_SCORING", "BUY_ROTATION",
 })
@@ -419,7 +462,6 @@ _SELL_LABELS = frozenset({
 
 
 def _normalise_action(raw: str) -> str:
-    """Map any signal variant to canonical BUY / SELL / HOLD."""
     raw_upper = str(raw).upper().strip()
     if raw_upper in _BUY_LABELS:
         return "BUY"
@@ -427,8 +469,6 @@ def _normalise_action(raw: str) -> str:
         return "SELL"
     return "HOLD"
 
-
-# ── SIGNAL WRITER: DataFrame column finders ──────────────────
 
 _SCORED_TABLE_KEYS = (
     "final_table", "scored_table", "ranking_table",
@@ -450,7 +490,6 @@ _QUADRANT_COL_CANDIDATES = (
 
 
 def _find_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
-    """Return the first column from *candidates* that exists in *df*."""
     for col in candidates:
         if col in df.columns:
             return col
@@ -461,12 +500,6 @@ def _resolve_run_date(
     bench_df: pd.DataFrame | None,
     result: dict[str, Any],
 ) -> str:
-    """
-    Best-effort run_date extraction.
-
-    Priority: bench_df last index → report header → today.
-    """
-    # 1. Benchmark last date
     if bench_df is not None and not bench_df.empty:
         try:
             last = bench_df.index[-1]
@@ -475,32 +508,24 @@ def _resolve_run_date(
         except Exception:
             pass
 
-    # 2. Report header
     report = result.get("report_v2", {})
     header = report.get("header", {})
     for key in ("as_of_date", "run_date", "date"):
         val = header.get(key)
         if val:
-            return str(val)[:10]  # YYYY-MM-DD
+            return str(val)[:10]
 
-    # 3. Fallback
     return date.today().strftime("%Y-%m-%d")
 
 
 def _extract_action_sets_from_report(
     report: dict[str, Any],
 ) -> tuple[set[str], set[str]]:
-    """
-    Pull explicit buy/sell ticker sets out of the report's action
-    section, which may be a dict-of-lists, a list-of-dicts, or
-    a simple count summary.  Returns (buy_set, sell_set).
-    """
     buy_set: set[str] = set()
     sell_set: set[str] = set()
     actions = report.get("actions", {})
 
     if isinstance(actions, dict):
-        # {"buys": [...], "sells": [...]} or {"buy_tickers": [...]}
         for key in ("buys", "buy_tickers", "buy_list"):
             items = actions.get(key, [])
             if isinstance(items, list):
@@ -523,7 +548,6 @@ def _extract_action_sets_from_report(
                         sell_set.add(item)
 
     elif isinstance(actions, list):
-        # [{"ticker": "AAPL", "action": "BUY"}, ...]
         for item in actions:
             if isinstance(item, dict):
                 t = item.get("ticker") or item.get("symbol")
@@ -538,15 +562,9 @@ def _extract_action_sets_from_report(
 
 
 def _extract_portfolio_set(report: dict[str, Any]) -> set[str]:
-    """
-    Extract the set of tickers selected into the portfolio from the
-    report.  These are treated as BUY if no explicit action column
-    exists in the scored table.
-    """
     selected: set[str] = set()
     portfolio = report.get("portfolio", {})
 
-    # List of holdings / selected names
     for key in ("holdings", "selected", "selected_names", "positions"):
         items = portfolio.get(key, [])
         if isinstance(items, list):
@@ -566,24 +584,12 @@ def _emit_v2_signals(
     result: dict[str, Any],
     bench_df: pd.DataFrame | None = None,
 ) -> None:
-    """
-    Extract per-ticker signals from the v2 pipeline result dict
-    and write them via signal_writer.
-
-    Tries multiple strategies to locate signal data:
-      1. A scored DataFrame in the result (final_table, scored_table, etc.)
-      2. Explicit action lists from the report's "actions" section
-      3. Portfolio selections as implicit BUY signals
-
-    This makes the integration resilient to pipeline output variations.
-    """
     if not _HAS_SIGNAL_WRITER:
         return
 
     report = result.get("report_v2", {})
     run_date = _resolve_run_date(bench_df, result)
 
-    # ── Strategy 1: scored DataFrame ──────────────────────
     scored_df: pd.DataFrame | None = None
     for key in _SCORED_TABLE_KEYS:
         candidate = result.get(key)
@@ -592,11 +598,9 @@ def _emit_v2_signals(
             logger.debug("Signal writer: using scored table from result['%s'] (%d rows)", key, len(candidate))
             break
 
-    # ── Extract action sets from report (used as override / fallback) ──
     report_buy_set, report_sell_set = _extract_action_sets_from_report(report)
     portfolio_set = _extract_portfolio_set(report)
 
-    # ── Selling exhaustion set (annotate in notes) ────────
     exhaustion_set: set[str] = set()
     exhaustion_scores: dict[str, float] = {}
     exhaustion_table = result.get("selling_exhaustion_table", pd.DataFrame())
@@ -611,7 +615,6 @@ def _emit_v2_signals(
                         exhaustion_scores[t] = round(float(row[scol]), 4)
                         break
 
-    # ── Build signals from scored DataFrame ───────────────
     signals: dict[str, dict] = {}
 
     if scored_df is not None:
@@ -629,7 +632,6 @@ def _emit_v2_signals(
             for _, row in scored_df.iterrows():
                 ticker = str(row[ticker_col])
 
-                # Score
                 score = 0.0
                 if score_col and pd.notna(row.get(score_col)):
                     try:
@@ -637,8 +639,6 @@ def _emit_v2_signals(
                     except (TypeError, ValueError):
                         pass
 
-                # Action: prefer explicit column, then report overrides,
-                # then portfolio membership
                 if signal_col and pd.notna(row.get(signal_col)):
                     raw_signal = str(row[signal_col])
                     action = _normalise_action(raw_signal)
@@ -660,17 +660,14 @@ def _emit_v2_signals(
                     buy_rank += 1
                     rank = buy_rank
 
-                # Sector
                 sector = None
                 if sector_col and pd.notna(row.get(sector_col)):
                     sector = str(row[sector_col])
 
-                # Regime / quadrant
                 regime = None
                 if quadrant_col and pd.notna(row.get(quadrant_col)):
                     regime = str(row[quadrant_col])
 
-                # RS rank (try several column names)
                 rs_rank = None
                 for rs_col in ("rs_rank", "rs_zscore", "relative_strength_rank", "rs_composite"):
                     if rs_col in scored_df.columns and pd.notna(row.get(rs_col)):
@@ -680,7 +677,6 @@ def _emit_v2_signals(
                             pass
                         break
 
-                # Notes: provenance + exhaustion flag
                 notes_parts: list[str] = []
                 if raw_signal != action:
                     notes_parts.append(raw_signal)
@@ -695,7 +691,6 @@ def _emit_v2_signals(
                 if ticker in report_sell_set and signal_col:
                     notes_parts.append("report_sell")
 
-                # ── NEW: tag thematic ETFs in notes ───────
                 thematic_map = result.get("thematic_etf_map", {})
                 for theme, tickers in thematic_map.items():
                     if ticker in tickers:
@@ -712,7 +707,6 @@ def _emit_v2_signals(
                     "notes":   "; ".join(notes_parts) if notes_parts else "",
                 }
 
-    # ── Fallback: no scored table, build from report actions + portfolio ──
     if not signals and (report_buy_set or report_sell_set or portfolio_set):
         logger.info("Signal writer: no scored table — building from report actions/portfolio")
         buy_rank = 0
@@ -752,7 +746,6 @@ def _emit_v2_signals(
         logger.info("Signal writer: no signals to emit for market %s", market)
         return
 
-    # ── Build metadata ────────────────────────────────────
     header = report.get("header", {})
     rotation_section = report.get("rotation", {})
     portfolio_section = report.get("portfolio", {})
@@ -763,7 +756,6 @@ def _emit_v2_signals(
         "selected_count":   portfolio_section.get("selected_count", 0),
     }
 
-    # Rotation quadrants
     if rotation_section.get("available"):
         qc = rotation_section.get("quadrant_counts", {})
         meta["rotation_quadrants"] = {}
@@ -774,7 +766,6 @@ def _emit_v2_signals(
                 "sectors": info.get("sectors", []),
             }
 
-    # ── NEW: thematic rotation quadrants in metadata ──────
     thematic_rotation = report.get("thematic_rotation", {})
     if thematic_rotation.get("available"):
         tqc = thematic_rotation.get("quadrant_counts", {})
@@ -786,7 +777,6 @@ def _emit_v2_signals(
                 "themes":  info.get("themes", []),
             }
 
-    # Portfolio rotation exposure
     rot_exp = portfolio_section.get("rotation_exposure", [])
     if rot_exp:
         meta["portfolio_rotation_exposure"] = {
@@ -794,16 +784,13 @@ def _emit_v2_signals(
             for e in rot_exp
         }
 
-    # Selling exhaustion summary
     if exhaustion_set:
         meta["selling_exhaustion_count"] = len(exhaustion_set)
 
-    # Skipped names count
     skipped_table = result.get("skipped_table", pd.DataFrame())
     if isinstance(skipped_table, pd.DataFrame) and not skipped_table.empty:
         meta["skipped_count"] = len(skipped_table)
 
-    # ── Write ─────────────────────────────────────────────
     path = _write_signals(
         phase="phase1",
         market=market.upper(),
@@ -813,6 +800,356 @@ def _emit_v2_signals(
         meta=meta,
     )
     logger.info("V2 signals written → %s  (%d tickers)", path, len(signals))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SECTOR ROTATION DISPLAY (Blended RRG + ETF Composite)
+# ═══════════════════════════════════════════════════════════════
+
+def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
+    """
+    Build formatted display lines for sector rotation using the
+    blended (RRG + ETF composite) sector_summary DataFrame.
+
+    Falls back to the legacy rotation report section if sector_summary
+    is not available (i.e. rotation_v2 not yet integrated into pipeline).
+
+    Returns list of lines (without trailing newlines).
+    """
+    lines: list[str] = []
+    sector_summary: pd.DataFrame = result.get("sector_summary", pd.DataFrame())
+
+    # ── Blended sector rotation (new) ─────────────────────────────────────
+    if isinstance(sector_summary, pd.DataFrame) and not sector_summary.empty:
+        lines.append("")
+        lines.extend(_box_header("📊", "SECTOR ROTATION — Blended RRG + ETF Composite"))
+        lines.append("")
+
+        # ── Quadrant summary ──────────────────────────────────────────────
+        regime_groups: dict[str, list[str]] = {}
+        for _, row in sector_summary.iterrows():
+            r = str(row.get("regime", "unknown"))
+            regime_groups.setdefault(r, []).append(str(row.get("sector", "?")))
+
+        for regime_name in ("leading", "improving", "weakening", "lagging"):
+            members = regime_groups.get(regime_name, [])
+            icon = _REGIME_ICON.get(regime_name, "⚪")
+            label = regime_name.upper()
+            lines.append(
+                f"  {icon} {label:<14}({len(members):>2})  "
+                + (", ".join(members) if members else "—")
+            )
+
+        lines.append("")
+
+        # ── Column availability ───────────────────────────────────────────
+        has_blended    = "blended_score"   in sector_summary.columns
+        has_rs_level   = "rs_level"        in sector_summary.columns
+        has_rs_mom     = "rs_mom"          in sector_summary.columns
+        has_etf_comp   = "etf_composite"   in sector_summary.columns
+        has_theme_avg  = "theme_avg_score" in sector_summary.columns
+        has_excess     = "excess_20d"      in sector_summary.columns
+        has_rrg_quad   = "rrg_quadrant"    in sector_summary.columns
+
+        # ── Table header ──────────────────────────────────────────────────
+        hdr = f"  {'#':>4}  {'Sector':<25} {'ETF':<6}  {'Regime':<16}"
+        if has_blended:
+            hdr += f"  {'Blended':>22}"
+        if has_rs_level:
+            hdr += f"  {'RS Lvl':>9}"
+        if has_rs_mom:
+            hdr += f"  {'RS Mom':>9}"
+        if has_etf_comp:
+            hdr += f"  {'ETF Scr':>8}"
+        if has_theme_avg:
+            hdr += f"  {'Thm Avg':>8}"
+        if has_excess:
+            hdr += f"  {'Excess20d':>10}"
+        if has_rrg_quad:
+            hdr += f"  {'RRG Quad':>16}"
+
+        lines.append(hdr)
+        lines.append("  " + "━" * (len(hdr)))
+
+        # Max blended for bar scaling (with headroom)
+        max_blended = 0.80
+        if has_blended and not sector_summary["blended_score"].empty:
+            max_blended = max(0.80, sector_summary["blended_score"].max() * 1.15)
+
+        # ── Table rows ────────────────────────────────────────────────────
+        for i, (_, row) in enumerate(sector_summary.iterrows(), 1):
+            sector_name = str(row.get("sector", "?"))
+            etf_ticker  = str(row.get("etf", "?"))
+            regime      = str(row.get("regime", "?"))
+            icon        = _REGIME_ICON.get(regime, "⚪")
+
+            rl = f"  {i:>4}  {sector_name:<25} {etf_ticker:<6}  {icon} {regime:<12}"
+
+            if has_blended:
+                bv = float(row.get("blended_score", 0))
+                bar = _hbar(bv, max_blended, width=12)
+                rl += f"  {bar} {bv:.4f}"
+            if has_rs_level:
+                rl += f"  {_signed(float(row.get('rs_level', 0)), width=9)}"
+            if has_rs_mom:
+                rl += f"  {_signed(float(row.get('rs_mom', 0)), width=9)}"
+            if has_etf_comp:
+                rl += f"  {float(row.get('etf_composite', 0)):>8.4f}"
+            if has_theme_avg:
+                rl += f"  {float(row.get('theme_avg_score', 0)):>8.4f}"
+            if has_excess:
+                rl += f"  {_signed(float(row.get('excess_20d', 0)), width=10, pct=True)}"
+            if has_rrg_quad:
+                rq = str(row.get("rrg_quadrant", ""))
+                rq_icon = _REGIME_ICON.get(rq, "⚪")
+                rl += f"  {rq_icon} {rq:<12}"
+
+            lines.append(rl)
+
+        lines.append("")
+        return lines
+
+    # ── Fallback: legacy rotation from report dict ────────────────────────
+    report = result.get("report_v2", {})
+    rotation_section = report.get("rotation", {})
+    if not rotation_section.get("available"):
+        lines.append("")
+        lines.extend(_box_header("📊", "SECTOR ROTATION"))
+        lines.append("  (not available)")
+        return lines
+
+    lines.append("")
+    lines.extend(_box_header("📊", "SECTOR ROTATION — RRG Quadrants (Legacy)"))
+    lines.append("")
+
+    qc = rotation_section.get("quadrant_counts", {})
+    for regime_name in ("leading", "improving", "weakening", "lagging"):
+        info = qc.get(regime_name, {})
+        count = info.get("count", 0)
+        sectors = info.get("sectors", [])
+        icon = _REGIME_ICON.get(regime_name, "⚪")
+        label = regime_name.upper()
+        lines.append(
+            f"  {icon} {label:<14}({count:>2})  "
+            + (", ".join(sectors) if sectors else "—")
+        )
+
+    # If there's a sector detail list in the report, show it
+    sector_detail = rotation_section.get("sector_detail", [])
+    if sector_detail:
+        lines.append("")
+        hdr = (
+            f"  {'#':>4}  {'Sector':<25} {'ETF':<6}  {'Regime':<16}"
+            f"  {'RS Level':>10}  {'RS Mom':>8}  {'Excess 20d':>10}"
+        )
+        lines.append(hdr)
+        lines.append("  " + "━" * len(hdr))
+        for i, sd in enumerate(sector_detail, 1):
+            regime = sd.get("regime", "?")
+            icon = _REGIME_ICON.get(regime, "⚪")
+            lines.append(
+                f"  {i:>4}  {sd.get('sector', '?'):<25} "
+                f"{sd.get('etf', '?'):<6}  {icon} {regime:<12}"
+                f"  {sd.get('rs_level', 0):>10.4f}"
+                f"  {sd.get('rs_mom', 0):>8.4f}"
+                f"  {_signed(sd.get('excess_20d', 0), width=10, pct=True)}"
+            )
+
+    lines.append("")
+    return lines
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ETF UNIVERSE RANKING DISPLAY
+# ═══════════════════════════════════════════════════════════════
+
+def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str]:
+    """
+    Build formatted display lines for the ETF universe ranking.
+
+    Reads result['etf_ranking'] (a DataFrame produced by
+    rotation_v2.score_etf_universe).  Shows rotation ETFs and
+    broad-market ETFs, skips regional/FI by default.
+
+    Detects stale/placeholder columns and flags them with †.
+
+    Returns list of lines (without trailing newlines).
+    """
+    lines: list[str] = []
+    etf_ranking: pd.DataFrame = result.get("etf_ranking", pd.DataFrame())
+
+    if not isinstance(etf_ranking, pd.DataFrame) or etf_ranking.empty:
+        lines.append("")
+        lines.extend(_box_header("📈", "ETF UNIVERSE RANKING"))
+        lines.append("  (not available — rotation_v2 ETF scoring not yet active)")
+        lines.append("")
+        return lines
+
+    lines.append("")
+    lines.extend(_box_header("📈", "ETF UNIVERSE RANKING — by Composite Score"))
+    lines.append("")
+
+    # ── Summary stats ─────────────────────────────────────────────────────
+    comp_col = "etf_composite"
+    n_total = len(etf_ranking)
+    mean_sc = etf_ranking[comp_col].mean() if comp_col in etf_ranking.columns else 0.0
+    top_ticker = str(etf_ranking.iloc[0].get("ticker", "?")) if n_total > 0 else "?"
+    top_score = float(etf_ranking.iloc[0].get(comp_col, 0)) if n_total > 0 else 0.0
+    bot_ticker = str(etf_ranking.iloc[-1].get("ticker", "?")) if n_total > 0 else "?"
+    bot_score = float(etf_ranking.iloc[-1].get(comp_col, 0)) if n_total > 0 else 0.0
+
+    lines.append(
+        f"  ETFs scored: {n_total}     "
+        f"Mean: {mean_sc:.3f}     "
+        f"Top: {top_ticker} ({top_score:.3f})     "
+        f"Bottom: {bot_ticker} ({bot_score:.3f})"
+    )
+    lines.append("")
+
+    # ── Stale column detection ────────────────────────────────────────────
+    _CHECK_COLS: dict[str, str] = {
+        "sub_trend":          "Trend",
+        "sub_participation":  "Part",
+        "rsi14":              "RSI",
+        "adx14":              "ADX",
+        "relativevolume":     "RVOL",
+    }
+    stale_internal = _detect_stale_columns(etf_ranking, list(_CHECK_COLS.keys()))
+    stale_labels: set[str] = {_CHECK_COLS[c] for c in stale_internal}
+
+    if stale_internal:
+        # Build "Trend=0.344, RSI=50.0, ..." summary of the stuck values
+        stale_vals_parts: list[str] = []
+        for col in stale_internal:
+            if col in etf_ranking.columns:
+                mode_series = etf_ranking[col].mode()
+                mode_val = mode_series.iloc[0] if not mode_series.empty else "?"
+                if isinstance(mode_val, float):
+                    mode_val = f"{mode_val:.3f}" if mode_val < 10 else f"{mode_val:.1f}"
+                stale_vals_parts.append(f"{_CHECK_COLS[col]}={mode_val}")
+
+        lines.append("  ⚠️  DATA QUALITY WARNING")
+        lines.append(
+            f"  │  Columns marked † show identical values across all ETFs "
+            f"({', '.join(stale_vals_parts)})."
+        )
+        lines.append(
+            "  │  Composite score is effectively driven by the remaining "
+            "varying columns only."
+        )
+        lines.append(
+            "  │  Check the upstream scoring pipeline for these indicators."
+        )
+        lines.append("  └" + "─" * 95)
+        lines.append("")
+
+    # ── Column availability ───────────────────────────────────────────────
+    has_theme       = "theme"              in etf_ranking.columns
+    has_sector      = "parent_sector"      in etf_ranking.columns
+    has_composite   = comp_col             in etf_ranking.columns
+    has_trend       = "sub_trend"          in etf_ranking.columns
+    has_momentum    = "sub_momentum"       in etf_ranking.columns
+    has_part        = "sub_participation"  in etf_ranking.columns
+    has_rsi         = "rsi14"              in etf_ranking.columns
+    has_adx         = "adx14"              in etf_ranking.columns
+    has_rvol        = "relativevolume"     in etf_ranking.columns
+    has_ret20       = "return20d"          in etf_ranking.columns
+    has_is_sector   = "is_sector_etf"      in etf_ranking.columns
+    has_is_broad    = "is_broad"           in etf_ranking.columns
+    has_is_regional = "is_regional"        in etf_ranking.columns
+
+    def _clbl(display_name: str, internal_col: str) -> str:
+        """Append † to column label if that column is stale."""
+        return display_name + "†" if internal_col in stale_internal else display_name
+
+    # ── Header row ────────────────────────────────────────────────────────
+    hdr = f"  {'#':>4}  {'Ticker':<9}"
+    if has_theme:
+        hdr += f" {'Theme':<22}"
+    if has_sector:
+        hdr += f" {'Sector':<20}"
+    if has_composite:
+        hdr += f"  {'Score':>18}"
+    if has_momentum:
+        hdr += f"  {_clbl('Mom', 'sub_momentum'):>6}"
+    if has_trend:
+        hdr += f"  {_clbl('Trend', 'sub_trend'):>7}"
+    if has_part:
+        hdr += f"  {_clbl('Part', 'sub_participation'):>6}"
+    if has_rsi:
+        hdr += f"  {_clbl('RSI', 'rsi14'):>6}"
+    if has_adx:
+        hdr += f"  {_clbl('ADX', 'adx14'):>6}"
+    if has_rvol:
+        hdr += f"  {_clbl('RVOL', 'relativevolume'):>6}"
+    if has_ret20:
+        hdr += f"  {'Ret20d':>8}"
+
+    lines.append(hdr)
+    lines.append("  " + "━" * len(hdr))
+
+    # ── Filter and display ────────────────────────────────────────────────
+    display_df = etf_ranking.copy()
+    if has_is_regional:
+        display_df = display_df[~display_df["is_regional"]].copy()
+    display_df = display_df.head(max_rows)
+
+    max_score = 0.60
+    if has_composite and not display_df.empty:
+        max_score = max(0.60, display_df[comp_col].max() * 1.10)
+
+    for i, (_, row) in enumerate(display_df.iterrows(), 1):
+        ticker = str(row.get("ticker", "?"))
+
+        # Type marker
+        marker = " "
+        if has_is_sector and row.get("is_sector_etf"):
+            marker = "●"   # sector ETF
+        elif has_is_broad and row.get("is_broad"):
+            marker = "○"   # broad market
+
+        rl = f"  {i:>4}  {ticker:<6}{marker} "
+
+        if has_theme:
+            theme = str(row.get("theme", ""))[:21]
+            rl += f" {theme:<22}"
+        if has_sector:
+            sector = str(row.get("parent_sector", ""))[:19]
+            rl += f" {sector:<20}"
+        if has_composite:
+            sv = float(row.get(comp_col, 0))
+            bar = _hbar(sv, max_score, width=10)
+            rl += f"  {bar} {sv:.3f}"
+        if has_momentum:
+            rl += f"  {float(row.get('sub_momentum', 0)):>6.3f}"
+        if has_trend:
+            rl += f"  {float(row.get('sub_trend', 0)):>7.3f}"
+        if has_part:
+            rl += f"  {float(row.get('sub_participation', 0)):>6.3f}"
+        if has_rsi:
+            rl += f"  {float(row.get('rsi14', 50)):>6.1f}"
+        if has_adx:
+            rl += f"  {float(row.get('adx14', 15)):>6.1f}"
+        if has_rvol:
+            rl += f"  {float(row.get('relativevolume', 1)):>6.2f}"
+        if has_ret20:
+            ret = float(row.get("return20d", 0))
+            rl += f"  {ret:>+8.1%}"
+
+        lines.append(rl)
+
+    # ── Footer / legend ───────────────────────────────────────────────────
+    lines.append("")
+    legend_parts = ["  (● = sector ETF   ○ = broad market)"]
+    if stale_labels:
+        legend_parts.append(
+            f"  († = stale data — identical across all ETFs: "
+            f"{', '.join(sorted(stale_labels))})"
+        )
+    lines.extend(legend_parts)
+    lines.append("")
+
+    return lines
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -846,7 +1183,7 @@ def run_strategy_v2(
     if missing_leadership:
         logger.info("Missing leadership symbols in parquet: count=%d sample=%s", len(missing_leadership), missing_leadership[:25])
 
-    # ── NEW: extract thematic ETF frames ──────────────────────────────────
+    # ── Extract thematic ETF frames ───────────────────────────────────────
     thematic_frames, available_thematic_map = _extract_thematic_frames(
         universe_frames, market,
     )
@@ -860,7 +1197,7 @@ def run_strategy_v2(
         "min_weight": cfg.get("min_weight", 0.04),
     }
 
-    # ── CHANGED: inject thematic data into config for pipeline ────────────
+    # ── Inject thematic data into config for pipeline ─────────────────────
     effective_config = dict(config or {})
     effective_config["thematic_etf_frames"] = thematic_frames
     effective_config["thematic_etf_map"] = available_thematic_map
@@ -872,13 +1209,13 @@ def run_strategy_v2(
         breadth_df=breadth_df,
         market=cfg["market"],
         portfolio_params=portfolio_params,
-        config=effective_config,               # ← thematic data rides here
+        config=effective_config,
     )
     result["market_config_v2"] = cfg
     result["tradable_universe"] = sorted(tradable)
     result["leadership_universe"] = sorted(leadership)
 
-    # ── NEW: persist thematic metadata in result for report / signals ─────
+    # ── Persist thematic metadata in result for report / signals ──────────
     result["thematic_etf_frames"] = thematic_frames
     result["thematic_etf_map"] = available_thematic_map
 
@@ -899,19 +1236,16 @@ def run_strategy_v2(
             "Selling exhaustion candidates: count=%d",
             len(exhaustion_table),
         )
-        # Status breakdown
         if "status" in exhaustion_table.columns:
             status_counts = exhaustion_table["status"].value_counts(dropna=False).to_dict()
             logger.info(
                 "Selling exhaustion status breakdown: %s", status_counts,
             )
-        # Quality breakdown
         if "quality_label" in exhaustion_table.columns:
             quality_counts = exhaustion_table["quality_label"].value_counts(dropna=False).to_dict()
             logger.info(
                 "Selling exhaustion quality breakdown: %s", quality_counts,
             )
-        # Top candidates preview
         preview_cols = [
             c for c in [
                 "ticker", "status", "quality_label",
@@ -925,7 +1259,6 @@ def run_strategy_v2(
                 exhaustion_table[preview_cols].head(10).to_string(index=False),
             )
 
-        # Sector distribution of exhaustion candidates
         if "sector" in exhaustion_table.columns:
             sector_counts = exhaustion_table["sector"].value_counts(dropna=False).to_dict()
             logger.info(
@@ -939,7 +1272,7 @@ def run_strategy_v2(
     result["report_v2"] = report
     result["report_text_v2"] = to_text_v2(report)
 
-    # ── NEW: portfolio selection gap diagnostics (answers Q1) ─────────────
+    # ── Portfolio selection gap diagnostics ────────────────────────────────
     _log_portfolio_selection_gaps(result)
 
     # ── SIGNAL WRITER: emit signals after report is built ─────────────────
@@ -963,7 +1296,7 @@ def run_strategy_v2(
         exhaustion_section.get("count", 0),
     )
 
-    # ── Rotation summary ──────────────────────────────────────────────────
+    # ── Rotation summary (legacy log) ─────────────────────────────────────
     if rotation_section.get("available"):
         qc = rotation_section.get("quadrant_counts", {})
         parts = []
@@ -974,7 +1307,7 @@ def run_strategy_v2(
             parts.append(f"{q}={count}({','.join(sectors[:3])})")
         logger.info("Sector rotation: %s", "  ".join(parts))
 
-    # ── NEW: thematic rotation summary ────────────────────────────────────
+    # ── Thematic rotation summary ─────────────────────────────────────────
     thematic_rotation = report.get("thematic_rotation", {})
     if thematic_rotation.get("available"):
         tqc = thematic_rotation.get("quadrant_counts", {})
@@ -1002,8 +1335,20 @@ def run_strategy_v2(
         ]
         logger.info("Portfolio rotation exposure: %s", "  ".join(exp_parts))
 
-    return result
+    # ══════════════════════════════════════════════════════════════════════
+    #  SECTOR ROTATION + ETF RANKING DISPLAY
+    # ══════════════════════════════════════════════════════════════════════
+    rotation_lines = _display_sector_rotation_v2(result)
+    etf_lines = _display_etf_ranking(result, max_rows=40)
 
+    all_display_lines = rotation_lines + etf_lines
+    if all_display_lines:
+        display_block = "\n".join(all_display_lines)
+        logger.info("Sector Rotation & ETF Ranking:\n%s", display_block)
+        # Also store in result for downstream consumers (HTML report, etc.)
+        result["sector_rotation_display"] = display_block
+
+    return result
 
 
 def main(argv=None):
@@ -1017,7 +1362,6 @@ def main(argv=None):
         logger.info("End date: %s", args.end_date)
         logger.info("Verbose logging: %s", args.verbose)
 
-        # ── SIGNAL WRITER: log availability at startup ────────
         if _HAS_SIGNAL_WRITER:
             logger.info("Signal writer: enabled → results/signals/")
         else:
@@ -1039,7 +1383,6 @@ def main(argv=None):
 
         run_log = RunLogger(f"runner_v2_{args.market}")
         print_run_summary(result, args.market, run_log)
-        # ─────────────────────────────────────────────────────
 
         logger.info("runner_v2 completed")
 
@@ -1051,7 +1394,6 @@ def main(argv=None):
     except Exception as exc:
         logger.exception("runner_v2 failed: %s", exc)
         raise
-
 
 
 if __name__ == "__main__":

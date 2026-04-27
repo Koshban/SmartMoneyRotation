@@ -534,17 +534,17 @@ def _compute_avg_holding_days(trades: list[Trade]) -> float:
 def metrics_report(run: "BacktestRun") -> str:
     m = run.metrics
     if not m:
-        return f"No metrics for '{run.strategy.name}'"
+        return f"No metrics for '{runrefactor.strategy.name}'"
 
     ln: list[str] = []
     div = "=" * 70
     sub = "-" * 70
 
     ln.append(div)
-    ln.append(f"  BACKTEST REPORT: {run.strategy.name}")
-    ln.append(f"  {run.strategy.description}")
-    if run.strategy.market != "US":
-        ln.append(f"  Market: {run.strategy.market}")
+    ln.append(f"  BACKTEST REPORT: {runrefactor.strategy.name}")
+    ln.append(f"  {runrefactor.strategy.description}")
+    if runrefactor.strategy.market != "US":
+        ln.append(f"  Market: {runrefactor.strategy.market}")
     ln.append(div)
 
     ln.append(f"  Period:          {m.get('start_date', '?')} → "
