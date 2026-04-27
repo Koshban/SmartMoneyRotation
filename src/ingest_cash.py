@@ -222,13 +222,6 @@ def fetch_yfinance(
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Bulk download OHLCV via yfinance.
-
-    If *start_date* and *end_date* are given (YYYY-MM-DD strings)
-    they take precedence over *period*.  This is the path used
-    when the caller specifies ``--days``.
-    """
     if start_date and end_date:
         logger.info(
             f"[yfinance] Downloading {len(symbols)} symbols, "
@@ -261,7 +254,6 @@ def fetch_yfinance(
         logger.warning("[yfinance] Empty result")
         return pd.DataFrame()
 
-    # ── Reshape multi-ticker result ────────────────────────────
     records = []
 
     if len(symbols) == 1:
@@ -294,6 +286,13 @@ def fetch_yfinance(
         if c.lower() == "date":
             col_map[c] = "Date"
     result.rename(columns=col_map, inplace=True)
+
+    # ── Deduplicate at source ──────────────────────────────────
+    before = len(result)
+    result = result.drop_duplicates(subset=["Date", "symbol"], keep="last")
+    dupes = before - len(result)
+    if dupes:
+        logger.info(f"[yfinance] Dropped {dupes:,} duplicate (Date, symbol) rows")
 
     logger.info(
         f"[yfinance] Got {len(result):,} rows for "
@@ -342,7 +341,6 @@ def fetch_ibkr(
     except Exception as e:
         logger.error(f"[IBKR] Cannot connect to TWS: {e}")
         logger.warning("[IBKR] Falling back to yfinance")
-        # Compute start/end if days is set for yfinance fallback
         if days is not None:
             end_dt = datetime.now()
             start_dt = end_dt - timedelta(days=days)
@@ -415,6 +413,14 @@ def fetch_ibkr(
         return pd.DataFrame()
 
     result = pd.concat(all_records, ignore_index=True)
+
+    # ── Deduplicate at source ──────────────────────────────────
+    before = len(result)
+    result = result.drop_duplicates(subset=["Date", "symbol"], keep="last")
+    dupes = before - len(result)
+    if dupes:
+        logger.info(f"[IBKR] Dropped {dupes:,} duplicate (Date, symbol) rows")
+
     logger.info(
         f"[IBKR] Got {len(result):,} rows for "
         f"{result['symbol'].nunique()} symbols"
@@ -432,22 +438,9 @@ def fetch_full_universe(
     days: int | None = None,
     force_source: str = None,
 ):
-    """
-    Download OHLCV for all symbols across requested markets.
-    Auto-selects yfinance vs IBKR based on period length.
-
-    If *days* is given it takes precedence over *period*: a
-    start/end date range is computed and passed to yfinance, or
-    converted to an IBKR duration string.
-
-    Saves:
-      data/{market}_cash.parquet   — per-market (for load_db.py)
-      data/universe_ohlcv.parquet  — combined   (for loader.py)
-    """
     DATA_DIR.mkdir(exist_ok=True)
     all_dfs = []
 
-    # Pre-compute date range when --days is in play
     start_date: str | None = None
     end_date: str | None = None
     if days is not None:
@@ -494,6 +487,14 @@ def fetch_full_universe(
         # ── Normalise columns to lowercase ─────────────────────
         df = normalise_columns(df)
 
+        # ── Deduplicate by (date, symbol) before saving ────────
+        before = len(df)
+        df = df.drop_duplicates(subset=["date", "symbol"], keep="last")
+        df = df.reset_index(drop=True)
+        dupes = before - len(df)
+        if dupes:
+            logger.info(f"Deduped {market}: removed {dupes:,} rows")
+
         # ── Save per-market parquet (what load_db.py expects) ──
         market_path = DATA_DIR / f"{market}_cash.parquet"
         df.to_parquet(market_path, index=False)
@@ -510,8 +511,13 @@ def fetch_full_universe(
         logger.warning("No data collected across any market")
         return
 
-    # ── Save combined file (for loader.py parquet reads) ───────
     combined = pd.concat(all_dfs, ignore_index=True)
+
+    # ── Final cross-market dedup (safety net) ──────────────────
+    combined = combined.drop_duplicates(
+        subset=["date", "symbol"], keep="last",
+    ).reset_index(drop=True)
+
     combined_path = DATA_DIR / "universe_ohlcv.parquet"
     combined.to_parquet(combined_path, index=False)
     size_mb = combined_path.stat().st_size / (1024 * 1024)

@@ -11,6 +11,14 @@ from .adapters_v2 import ensure_columns
 logger = logging.getLogger(__name__)
 
 
+_SETUP_COLS = [
+    "sig_setup_continuation",
+    "sig_setup_pullback",
+    "sig_setup_relative",
+    "sig_setup_any",
+]
+
+
 def _log_bool_counts(out: pd.DataFrame, cols: list[str], prefix: str) -> None:
     vals = {c: int(out[c].sum()) if c in out.columns else 0 for c in cols}
     logger.info("%s counts=%s", prefix, vals)
@@ -27,40 +35,33 @@ def _log_preview(out: pd.DataFrame, cols: list[str], label: str, n: int = 40) ->
 def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     out = ensure_columns(df)
     if out.empty:
-        out["sig_vol_ok"] = []
-        out["sig_breadth_ok"] = []
-        out["sig_rs_ok"] = []
-        out["sig_sector_ok"] = []
-        out["sigeffectiveentrymin_v2"] = []
-        out["sig_setup_continuation"] = []
-        out["sig_setup_pullback"] = []
-        out["sig_setup_relative"] = []
-        out["sig_setup_any"] = []
-        out["sigconfirmed_v2"] = []
-        out["sigpositionpct_v2"] = []
-        out["sigexit_v2"] = []
-        out["score_rank"] = []
+        for c in [
+            "sig_vol_ok", "sig_breadth_ok", "sig_rs_ok", "sig_sector_ok",
+            *_SETUP_COLS,
+            "sigeffectiveentrymin_v2", "sigconfirmed_v2",
+            "sigpositionpct_v2", "sigexit_v2", "score_rank",
+        ]:
+            out[c] = []
         return out
 
     p = params if params is not None else SIGNALPARAMS_V2
     logger.info("apply_signals_v2 start: rows=%d", len(out))
     logger.info(
-        "Signal params: base_entry=%.4f base_exit=%.4f pullback_min_trend=%.4f "
-        "continuation_min_trend=%.4f rs_fail_penalty=%.4f breadth_fail_penalty=%.4f "
+        "Signal params: base_entry=%.4f base_exit=%.4f "
+        "rs_fail_penalty=%.4f breadth_fail_penalty=%.4f "
         "min_rank_pct=%.4f pos_base=%.4f pos_range=%.4f pos_max=%.4f "
-        "pullback_min_ext=%.4f cont_min_part=%.4f",
+        "exit_rank_floor=%.4f min_hold_days=%d cooldown=%d",
         float(p.get("base_entry_threshold", 0.0)),
         float(p.get("base_exit_threshold", 0.0)),
-        float(p.get("pullback_min_trend", 0.0)),
-        float(p.get("continuation_min_trend", 0.0)),
         float(p.get("rs_fail_penalty", 0.10)),
         float(p.get("breadth_fail_penalty", 0.05)),
         float(p.get("min_rank_pct", 0.85)),
-        float(p.get("position_base_pct", 0.04)),           # FIX 4
-        float(p.get("position_range_pct", 0.08)),           # FIX 4
-        float(p.get("position_max_pct", 0.12)),             # FIX 4
-        float(p.get("pullback_min_short_extension", -0.05)),# FIX 5
-        float(p.get("continuation_min_participation", 0.50)),# FIX 6
+        float(p.get("position_base_pct", 0.04)),
+        float(p.get("position_range_pct", 0.08)),
+        float(p.get("position_max_pct", 0.12)),
+        float(p.get("exit_rank_floor", 0.25)),
+        int(p.get("min_hold_days", 5)),
+        int(p.get("cooldown_days", 3)),
     )
 
     # ── regime columns ──────────────────────────────────────────────
@@ -69,7 +70,7 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     rsreg = out.get("rsregime", pd.Series("unknown", index=out.index))
     sectreg = out.get("sectrsregime", pd.Series("unknown", index=out.index))
 
-    # ── boolean flags (kept for diagnostics, but RS & breadth are now soft) ──
+    # ── boolean flags (diagnostic; RS & breadth are soft penalties) ─
     out["sig_vol_ok"] = ~volreg.isin(p["hard_block_vol_regimes"])
     out["sig_breadth_ok"] = ~breadthreg.isin(p["hard_block_breadth_regimes"])
     out["sig_rs_ok"] = rsreg.isin(p["allowed_rs_regimes"])
@@ -94,59 +95,25 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
         + breadth_penalty
     )
 
-    # ── setup shapes ────────────────────────────────────────────────
-    score_trend = out.get("scoretrend", pd.Series(0, index=out.index))
-    score_part = out.get("scoreparticipation", pd.Series(0, index=out.index))
-    close_vs_ema = out.get("closevsema30pct", pd.Series(0, index=out.index))
-    rsi = out.get("rsi14", pd.Series(50, index=out.index))
+    # ── setup shapes: vestigial (always True for compat) ────────────
+    for c in _SETUP_COLS:
+        out[c] = True
+
     composite = out["scorecomposite_v2"]
-
-    # FIX 5: pullback lower bound from config
-    pullback_min_ext = p.get("pullback_min_short_extension", -0.05)
-
-    pullback_shape = (
-        (score_trend >= p["pullback_min_trend"])
-        & (close_vs_ema.between(pullback_min_ext, p["pullback_max_short_extension"]))
-        & (rsi <= p["pullback_rsi_max"])
-    )
-
-    # FIX 6: continuation participation floor from config
-    cont_min_part = p.get("continuation_min_participation", 0.50)
-
-    continuation_shape = (
-        (score_trend >= p["continuation_min_trend"])
-        & (score_part >= cont_min_part)
-    )
-
-    rank_threshold_for_setup = p.get("relative_setup_rank_pct", 0.80)
     out["score_rank"] = composite.rank(pct=True)
-    relative_strength_shape = out["score_rank"] >= rank_threshold_for_setup
-
-    out["sig_setup_continuation"] = continuation_shape
-    out["sig_setup_pullback"] = pullback_shape
-    out["sig_setup_relative"] = relative_strength_shape
-    out["sig_setup_any"] = (
-        out["sig_setup_continuation"]
-        | out["sig_setup_pullback"]
-        | out["sig_setup_relative"]
-    )
 
     # ── entry signal ────────────────────────────────────────────────
-    base_ok = (
-        out["sig_vol_ok"]
-        & out["sig_sector_ok"]
-        & out["sig_setup_any"]
-    )
+    hard_blocks_ok = out["sig_vol_ok"] & out["sig_sector_ok"]
 
     min_rank = p.get("min_rank_pct", 0.85)
     score_passes_threshold = composite >= out["sigeffectiveentrymin_v2"]
     rank_passes = out["score_rank"] >= min_rank
 
     out["sigconfirmed_v2"] = (
-        base_ok & score_passes_threshold & rank_passes
+        hard_blocks_ok & score_passes_threshold & rank_passes
     ).astype(int)
 
-    # ── position sizing (FIX 4: all from config) ────────────────────
+    # ── position sizing ─────────────────────────────────────────────
     pos_base = p.get("position_base_pct", 0.04)
     pos_range = p.get("position_range_pct", 0.08)
     pos_max = p.get("position_max_pct", 0.12)
@@ -163,18 +130,28 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     )
 
     # ── exit signal ─────────────────────────────────────────────────
-    exit_thresh = p.get("base_exit_threshold", 0.30)
-
-    vol_regime_scalar = volreg.iloc[0] if len(volreg) > 0 else "calm"
-    if vol_regime_scalar == "chaotic":
-        exit_thresh = exit_thresh + p.get("chaotic_exit_bump", 0.10)
-
+    # FIX: changed OR → AND.
+    #
+    # With OR, ~77 % of the universe was flagged for exit every day.
+    # Positions entered at rank ≥ 0.85 were immediately flagged by the
+    # rank-floor (exit_rank_floor ≈ 0.15–0.25) OR the composite
+    # threshold, because each condition independently catches a huge
+    # slice of the universe.  Min-hold blocked the sells for 5 days,
+    # then everything was dumped at a loss.
+    #
+    # With AND, a position must be BOTH low-scoring AND bottom-ranked
+    # to trigger an exit.  A stock entering at rank 0.85+ must
+    # deteriorate to the bottom quartile AND drop below the composite
+    # floor — a genuine collapse, not daily noise.
+    #
+    # Expected daily exit signals: ~5–15 % of universe instead of ~77 %.
+    exit_thresh = p.get("base_exit_threshold", 0.25)
     exit_rank_floor = p.get("exit_rank_floor", 0.25)
 
-    out["sigexit_v2"] = (
-        (composite <= exit_thresh)
-        | (out["score_rank"] <= exit_rank_floor)
-    ).astype(int)
+    below_exit_score = composite <= exit_thresh
+    below_exit_rank = out["score_rank"] <= exit_rank_floor
+
+    out["sigexit_v2"] = (below_exit_score & below_exit_rank).astype(int)
 
     # ── diagnostic logging ──────────────────────────────────────────
     logger.info(
@@ -202,16 +179,11 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     )
     logger.info(
         "Gate pass counts (of %d): vol_ok=%d sector_ok=%d "
-        "setup_any=%d (cont=%d pull=%d rel=%d) "
-        "base_ok=%d score_ok=%d rank_ok=%d confirmed=%d",
+        "hard_blocks_ok=%d score_ok=%d rank_ok=%d confirmed=%d",
         len(out),
         int(out["sig_vol_ok"].sum()),
         int(out["sig_sector_ok"].sum()),
-        int(out["sig_setup_any"].sum()),
-        int(out["sig_setup_continuation"].sum()),
-        int(out["sig_setup_pullback"].sum()),
-        int(out["sig_setup_relative"].sum()),
-        int(base_ok.sum()),
+        int(hard_blocks_ok.sum()),
         int(score_passes_threshold.sum()),
         int(rank_passes.sum()),
         int(out["sigconfirmed_v2"].sum()),
@@ -223,32 +195,46 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
         int((~out["sig_breadth_ok"]).sum()),
         len(out),
     )
+
+    exit_count = int(out["sigexit_v2"].sum())
+    exit_pct = 100 * out["sigexit_v2"].mean() if len(out) > 0 else 0.0
     logger.info(
-        "Exit stats: exit_thresh=%.4f exit_signals=%d (of %d)",
+        "Exit stats: exit_thresh=%.4f exit_rank_floor=%.4f "
+        "below_score=%d below_rank=%d exit_AND=%d (%.1f%% of %d)",
         exit_thresh,
-        int(out["sigexit_v2"].sum()),
+        exit_rank_floor,
+        int(below_exit_score.sum()),
+        int(below_exit_rank.sum()),
+        exit_count,
+        exit_pct,
         len(out),
     )
+    if exit_pct > 40:
+        logger.warning(
+            "EXIT CHURN RISK: %.1f%% of universe flagged for exit. "
+            "Composite distribution may be heavily left-skewed or "
+            "exit_rank_floor / base_exit_threshold may be too loose.",
+            exit_pct,
+        )
 
     total = len(out)
     if total > 0:
         logger.info(
             "Filter pass rates: vol_ok=%.1f%% sector_ok=%.1f%% "
-            "setup_any=%.1f%% score_ok=%.1f%% rank_ok=%.1f%% confirmed=%.1f%%",
+            "score_ok=%.1f%% rank_ok=%.1f%% confirmed=%.1f%% exit=%.1f%%",
             100 * out["sig_vol_ok"].mean(),
             100 * out["sig_sector_ok"].mean(),
-            100 * out["sig_setup_any"].mean(),
             100 * score_passes_threshold.mean(),
             100 * rank_passes.mean(),
             100 * out["sigconfirmed_v2"].mean(),
+            exit_pct,
         )
 
     _log_bool_counts(
         out,
         [
             "sig_vol_ok", "sig_breadth_ok", "sig_rs_ok", "sig_sector_ok",
-            "sig_setup_continuation", "sig_setup_pullback", "sig_setup_relative",
-            "sig_setup_any", "sigconfirmed_v2", "sigexit_v2",
+            "sigconfirmed_v2", "sigexit_v2",
         ],
         "Signal bool",
     )
@@ -257,8 +243,7 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
         out,
         [
             "ticker", "sig_vol_ok", "sig_breadth_ok", "sig_rs_ok", "sig_sector_ok",
-            "sig_setup_continuation", "sig_setup_pullback", "sig_setup_relative",
-            "sig_setup_any", "scoretrend", "scoreparticipation", "scorecomposite_v2",
+            "scoretrend", "scoreparticipation", "scorecomposite_v2",
             "score_rank", "sigeffectiveentrymin_v2", "sigconfirmed_v2",
             "sigpositionpct_v2", "sigexit_v2", "volregime", "breadthregime",
             "rsregime", "sectrsregime", "rsi14", "adx14", "closevsema30pct",
@@ -276,8 +261,6 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
                     r.append("vol_block")
                 if not row.get("sig_sector_ok", False):
                     r.append("sector_block")
-                if not row.get("sig_setup_any", False):
-                    r.append("no_setup")
                 if row.get("scorecomposite_v2", 0.0) < row.get(
                     "sigeffectiveentrymin_v2", 0.0
                 ):
@@ -301,7 +284,7 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
                         for c in [
                             "ticker", "scorecomposite_v2", "score_rank",
                             "sigeffectiveentrymin_v2", "sig_vol_ok", "sig_sector_ok",
-                            "sig_setup_any", "sig_rs_ok", "sig_breadth_ok",
+                            "sig_rs_ok", "sig_breadth_ok",
                             "rejection_reasons",
                         ]
                         if c in failed.columns

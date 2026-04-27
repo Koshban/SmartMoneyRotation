@@ -1,10 +1,10 @@
 """
 backtest/phase2/run_backtest.py
-CLI entry point.
+CLI entry point — single-config backtest.
 
-    python -m backtest.run_backtest --market HK --start 2025-10-01 --end 2026-04-20
-    python -m backtest.run_backtest --market IN --start 2025-06-01 --end 2026-04-20
-    python -m backtest.run_backtest --market US --start 2025-06-01 --end 2026-04-20
+    python -m backtest.phase2.run_backtest --market HK --start 2025-10-01 --end 2026-04-20
+    python -m backtest.phase2.run_backtest --market IN --start 2025-06-01 --end 2026-04-20
+    python -m backtest.phase2.run_backtest --market US --start 2025-06-01 --end 2026-04-20
 """
 from __future__ import annotations
 
@@ -15,10 +15,12 @@ from pathlib import Path
 
 import pandas as pd
 from rich.console import Console
+from rich.table import Table
 
 from backtest.phase2.data_source import BacktestDataSource
-from backtest.phase2.compare import build_config_dict, run_comparison, print_comparison
-from copy import deepcopy
+from backtest.phase2.engine import BacktestEngine
+from backtest.phase2.metrics import compute_metrics
+from common.universe import get_universe_for_market
 from refactor.common.config_refactor import (
     VOLREGIMEPARAMS,
     SCORINGWEIGHTS_V2,
@@ -26,8 +28,8 @@ from refactor.common.config_refactor import (
     SIGNALPARAMS_V2,
     CONVERGENCEPARAMS_V2,
     ACTIONPARAMS_V2,
-    BREADTHPARAMS,          # ← NEW
-    ROTATIONPARAMS,         # ← NEW
+    BREADTHPARAMS,
+    ROTATIONPARAMS,
 )
 
 console = Console()
@@ -74,7 +76,6 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
     root.addHandler(ch)
 
     # ── silence noisy modules on the console ──────────────────────
-    # These still write DEBUG to the log file via the file handler.
     for noisy in (
         "refactor.strategy.rotation_v2",
         "refactor.pipeline_v2",
@@ -96,12 +97,10 @@ def _log_and_print(msg: str, rich_msg: str | None = None, level: int = logging.I
 #  UNIVERSE + BENCHMARK MAPPING
 # ══════════════════════════════════════════════════════════════════
 
-from common.universe import get_universe_for_market
-
 BENCHMARKS = {
-    "HK": "2800.HK",      # Tracker Fund of Hong Kong
-    "IN": "NIFTYBEES.NS",  # Nifty ETF (adjust to your universe)
-    "US": "SPY",           # S&P 500 ETF
+    "HK": "2800.HK",
+    "IN": "NIFTYBEES.NS",
+    "US": "SPY",
 }
 
 
@@ -166,198 +165,82 @@ def load_data(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  TWO CONFIGS TO COMPARE
+#  SINGLE CONFIG — imported from refactor.common.config_refactor
 # ══════════════════════════════════════════════════════════════════
 
-from copy import deepcopy
-
-_ACTION_COMMON = {
-    "strong_buy": {
-        "min_percentile": 0.90, "min_score": 0.76, "score_above_entry": 0.08,
-        "min_rvol": 1.10, "requires_confirmation": True,
-        "requires_strong_context": True, "blocks_overextended": True,
-    },
-    "buy": {
-        "min_percentile": 0.65, "min_score": 0.62, "score_above_entry": 0.02,
-        "requires_confirmation": True, "requires_decent_momentum": True,
-        "blocks_weak_context": True,
-    },
-    "hold": {
-        "min_percentile": 0.35, "min_score": 0.54, "score_below_entry": 0.06,
-        "blocks_weak_context": True,
-    },
-    "sell": {
-        "floor_score": 0.50, "floor_percentile": 0.15,
-        "exit_score_below_entry": 0.05, "exit_percentile_floor": 0.20,
-    },
-    "strong_context": {
-        "breadth_regimes": ["strong"], "vol_regimes": ["calm"],
-        "min_leadership": 0.60,
-    },
-    "weak_context": {
-        "breadth_regimes": ["weak", "critical"], "vol_regimes": ["chaotic"],
-        "sector_regimes": ["lagging"],
-    },
-    "healthy_momentum": {
-        "allowed_rs": ["leading", "improving"], "blocked_sector": ["lagging"],
-        "min_rsi": 52, "min_adx": 22,
-    },
-    "decent_momentum": {
-        "allowed_rs": ["leading", "improving"],
-        "min_rsi": 45, "min_adx": 16,
-    },
-    "overextended": {"max_ema_pct": 0.045, "max_rsi": 74},
-    "conviction": {
-        "high_pct": 0.90, "high_score": 0.84,
-        "medium_pct": 0.60, "medium_score": 0.68,
-    },
-    "leadership_boost_weight": 0.10,
-}
-_VOL_COMMON = {
-    "atrp_window": 14, "realized_vol_window": 20,
-    "dispersion_window": 20, "gap_window": 20,
-    "calm_atrp_max": 0.035, "volatile_atrp_max": 0.060,
-    "calm_rvol_max": 0.28, "volatile_rvol_max": 0.42,
-    "volatile_gap_rate": 0.18, "chaotic_gap_rate": 0.28,
-    "calm_dispersion_max": 0.022, "volatile_dispersion_max": 0.040,
-    "score_weights": {"atrp": 0.35, "realized_vol": 0.35,
-                      "gap_rate": 0.15, "dispersion": 0.15},
+CONFIG = {
+    "vol_regime_params":  VOLREGIMEPARAMS,
+    "scoring_weights":    SCORINGWEIGHTS_V2,
+    "scoring_params":     SCORINGPARAMS_V2,
+    "signal_params":      SIGNALPARAMS_V2,
+    "convergence_params": CONVERGENCEPARAMS_V2,
+    "action_params":      ACTIONPARAMS_V2,
+    "breadth_params":     BREADTHPARAMS,
+    "rotation_params":    ROTATIONPARAMS,
 }
 
-_VOL_LOOSE = {**_VOL_COMMON, "chaotic_threshold": 0.75, "volatile_threshold": 0.35}
-_VOL_TIGHT = {**_VOL_COMMON, "chaotic_threshold": 0.70, "volatile_threshold": 0.30}
-_ROTATION_COMMON = {
-    "rs_sma_period": 50,
-    "rs_momentum_period": 20,
-    "smooth_span": 10,
-    "min_history": 60,
-}
-CONFIG_LOOSE = build_config_dict(
-    vol_regime_params=_VOL_LOOSE,
-    scoring_weights={"trend": 0.38, "participation": 0.22, "risk": 0.25, "regime": 0.15},
-    scoring_params={
-        "trend": {"w_stock_rs": 0.45, "w_sector_rs": 0.25, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
-        "participation": {"w_rvol": 0.35, "w_obv": 0.30, "w_adline": 0.20, "w_dollar_volume": 0.15},
-        "risk": {"w_vol_penalty": 0.35, "w_liquidity_penalty": 0.25, "w_gap_penalty": 0.20, "w_extension_penalty": 0.20},
-        "regime": {"w_breadth": 0.60, "w_vol_regime": 0.40},
-        "penalties": {
-            "rsi_soft_low": 38.0, "rsi_soft_high": 78.0, "adx_soft_min": 16.0,
-            "atrp_high": 0.07, "extension_warn": 0.12, "extension_bad": 0.22,
-            "illiquidity_bad": 0.015,
-        },
-    },
-    signal_params={
-        "base_entry_threshold": 0.58, "base_exit_threshold": 0.42,
-        "allowed_rs_regimes": ("leading", "improving"),
-        "blocked_sector_regimes": ("lagging",),
-        "hard_block_breadth_regimes": ("critical",),
-        "hard_block_vol_regimes": ("chaotic",),
-        "continuation_min_trend": 0.62, "pullback_min_trend": 0.68,
-        "pullback_max_short_extension": 0.04, "pullback_rsi_max": 58.0,
-        "cooldown_days": 4,
-        "rs_fail_penalty": 0.08,
-        "breadth_fail_penalty": 0.03,
-        "min_rank_pct": 0.80,
-        "relative_setup_rank_pct": 0.75,
-        "exit_rank_floor": 0.20,
-        "chaotic_exit_bump": 0.08,
-        "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.03, "chaotic": 0.10},
-        "breadth_entry_adjustment": {"strong": -0.02, "neutral": 0.00, "weak": 0.03, "critical": 0.08, "unknown": 0.00},
-        "size_multipliers": {"calm": 1.00, "volatile": 0.70, "chaotic": 0.35},
-        # ── position sizing (loose — larger positions) ──
-        "position_base_pct": 0.04,
-        "position_range_pct": 0.08,
-        "position_max_pct": 0.12,
-        # ── pullback lower bound (loose — allows more stretched-down names) ──
-        "pullback_min_short_extension": -0.06,
-        # ── continuation participation floor (loose — lower bar) ──
-        "continuation_min_participation": 0.45,
-    },
-    convergence_params={
-        "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
-        "adjustments": {"calm": 0.04, "volatile": 0.02, "chaotic": 0.00},
-        # ── rotation recommendation mapping (loose — weakening = HOLD) ──
-        "rotation_rec_map": {
-            "leading": "STRONGBUY", "improving": "BUY",
-            "weakening": "HOLD", "lagging": "SELL",
-        },
-        "rotation_rec_default": "HOLD",
-    },
-    action_params=deepcopy(_ACTION_COMMON),
-    breadth_params={
-        "min_symbols": 5, "min_history": 55, "ema_span": 5,
-        "regime_strong": 0.62, "regime_moderate": 0.42, "regime_weak": 0.22,
-        "composite_weights": {
-            "pct_above_sma50": 0.30, "pct_above_sma200": 0.20,
-            "pct_above_sma20": 0.15, "pct_advancing": 0.15,
-            "net_new_highs": 0.20,
-        },
-    },
-    rotation_params=_ROTATION_COMMON,
-)
-CONFIG_TIGHT = build_config_dict(
-    vol_regime_params=_VOL_TIGHT,
-    scoring_weights={"trend": 0.36, "participation": 0.18, "risk": 0.26, "regime": 0.20},
-    scoring_params={
-        "trend": {"w_stock_rs": 0.42, "w_sector_rs": 0.28, "w_rs_accel": 0.15, "w_trend_confirm": 0.15},
-        "participation": {"w_rvol": 0.35, "w_obv": 0.25, "w_adline": 0.20, "w_dollar_volume": 0.20},
-        "risk": {"w_vol_penalty": 0.32, "w_liquidity_penalty": 0.23, "w_gap_penalty": 0.20, "w_extension_penalty": 0.25},
-        "regime": {"w_breadth": 0.65, "w_vol_regime": 0.35},
-        "penalties": {
-            "rsi_soft_low": 40.0, "rsi_soft_high": 76.0, "adx_soft_min": 18.0,
-            "atrp_high": 0.065, "extension_warn": 0.10, "extension_bad": 0.18,
-            "illiquidity_bad": 0.012,
-        },
-    },
-    signal_params={
-        "base_entry_threshold": 0.60, "base_exit_threshold": 0.44,
-        "allowed_rs_regimes": ("leading", "improving"),
-        "blocked_sector_regimes": ("lagging",),
-        "hard_block_breadth_regimes": ("critical",),
-        "hard_block_vol_regimes": ("chaotic",),
-        "continuation_min_trend": 0.64, "pullback_min_trend": 0.70,
-        "pullback_max_short_extension": 0.06, "pullback_rsi_max": 62.0,
-        "cooldown_days": 4,
-        "rs_fail_penalty": 0.12,
-        "breadth_fail_penalty": 0.06,
-        "min_rank_pct": 0.88,
-        "relative_setup_rank_pct": 0.82,
-        "exit_rank_floor": 0.30,
-        "chaotic_exit_bump": 0.12,
-        "regime_entry_adjustment": {"calm": 0.00, "volatile": 0.04, "chaotic": 0.12},
-        "breadth_entry_adjustment": {"strong": -0.01, "neutral": 0.02, "weak": 0.08, "critical": 0.14, "unknown": 0.03},
-        "size_multipliers": {"calm": 1.00, "volatile": 0.65, "chaotic": 0.30},
-        # ── position sizing (tight — smaller positions, lower cap) ──
-        "position_base_pct": 0.03,
-        "position_range_pct": 0.07,
-        "position_max_pct": 0.10,
-        # ── pullback lower bound (tight — narrower acceptable range) ──
-        "pullback_min_short_extension": -0.04,
-        # ── continuation participation floor (tight — higher bar) ──
-        "continuation_min_participation": 0.55,
-    },
-    convergence_params={
-        "tiers": {"aligned_long": 4, "rotation_long_only": 3, "score_long_only": 2, "mixed": 1, "avoid": 0},
-        "adjustments": {"calm": 0.04, "volatile": 0.01, "chaotic": 0.00},
-        # ── rotation recommendation mapping (tight — weakening = SELL) ──
-        "rotation_rec_map": {
-            "leading": "STRONGBUY", "improving": "BUY",
-            "weakening": "SELL", "lagging": "SELL",
-        },
-        "rotation_rec_default": "HOLD",
-    },
-    action_params=deepcopy(_ACTION_COMMON),
-    breadth_params={
-        "min_symbols": 5, "min_history": 55, "ema_span": 5,
-        "regime_strong": 0.68, "regime_moderate": 0.48, "regime_weak": 0.28,
-        "composite_weights": {
-            "pct_above_sma50": 0.30, "pct_above_sma200": 0.20,
-            "pct_above_sma20": 0.15, "pct_advancing": 0.15,
-            "net_new_highs": 0.20,
-        },
-    },
-    rotation_params=_ROTATION_COMMON,
-)
+
+# ══════════════════════════════════════════════════════════════════
+#  METRICS DISPLAY
+# ══════════════════════════════════════════════════════════════════
+
+def _print_metrics(metrics: dict) -> None:
+    """Pretty-print backtest metrics as a Rich table."""
+    table = Table(
+        title="Backtest Results",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Metric", style="bold", min_width=22)
+    table.add_column("Value", justify="right")
+
+    rows = [
+        # ── returns ──────────────────────────────────────────
+        ("Total Return",          "total_return",          lambda v: f"{v:+.2%}"),
+        ("Ann. Return",           "annualized_return",     lambda v: f"{v:+.2%}"),
+        ("Final Value",           "final_value",           lambda v: f"${v:,.0f}"),
+        ("Ann. Volatility",       "annualized_vol",        lambda v: f"{v:.2%}"),
+        ("Sharpe Ratio",          "sharpe_ratio",          lambda v: f"{v:.3f}"),
+        ("Sortino Ratio",         "sortino_ratio",         lambda v: f"{v:.3f}"),
+        ("Max Drawdown",          "max_drawdown",          lambda v: f"{v:.2%}"),
+        ("Max DD Duration",       "max_dd_duration_days",  lambda v: f"{v:.0f} days"),
+        ("Calmar Ratio",          "calmar_ratio",          lambda v: f"{v:.3f}"),
+        # ── benchmark ────────────────────────────────────────
+        ("Benchmark Return",      "benchmark_total_return", lambda v: f"{v:+.2%}"),
+        ("Benchmark Ann. Return", "benchmark_ann_return",   lambda v: f"{v:+.2%}"),
+        ("Benchmark Max DD",      "benchmark_max_dd",       lambda v: f"{v:.2%}"),
+        ("Alpha (Jensen)",        "alpha",                  lambda v: f"{v:+.2%}"),
+        ("Beta",                  "beta",                   lambda v: f"{v:.3f}"),
+        ("Tracking Error",        "tracking_error",         lambda v: f"{v:.2%}"),
+        ("Information Ratio",     "information_ratio",      lambda v: f"{v:.3f}"),
+        # ── trades ───────────────────────────────────────────
+        ("Total Trades",          "total_trades",          lambda v: f"{v:.0f}"),
+        ("Winning Trades",        "winning_trades",        lambda v: f"{v:.0f}"),
+        ("Losing Trades",         "losing_trades",         lambda v: f"{v:.0f}"),
+        ("Win Rate",              "win_rate",              lambda v: f"{v:.1%}"),
+        ("Avg Win",               "avg_win_pct",           lambda v: f"{v:+.2%}"),
+        ("Avg Loss",              "avg_loss_pct",          lambda v: f"{v:+.2%}"),
+        ("Profit Factor",         "profit_factor",         lambda v: f"{v:.2f}"),
+        ("Avg PnL",               "avg_pnl_pct",           lambda v: f"{v:+.2%}"),
+        ("Median PnL",            "median_pnl_pct",        lambda v: f"{v:+.2%}"),
+        ("Avg Holding Days",      "avg_holding_days",      lambda v: f"{v:.1f}"),
+        ("Best Trade",            "best_trade_pct",        lambda v: f"{v:+.2%}"),
+        ("Worst Trade",           "worst_trade_pct",       lambda v: f"{v:+.2%}"),
+        ("Expectancy ($)",        "expectancy_dollar",     lambda v: f"${v:,.0f}"),
+        # ── utilisation ──────────────────────────────────────
+        ("Avg Positions",         "avg_positions",         lambda v: f"{v:.1f}"),
+        ("Max Positions Held",    "max_positions_held",    lambda v: f"{v:.0f}"),
+        ("Trading Days",          "trading_days",          lambda v: f"{v:.0f}"),
+        ("Total Buy Signals",     "total_buy_signals",     lambda v: f"{v:.0f}"),
+        ("Total Sell Signals",    "total_sell_signals",    lambda v: f"{v:.0f}"),
+    ]
+
+    for label, key, formatter in rows:
+        if key in metrics:
+            table.add_row(label, formatter(metrics[key]))
+
+    console.print(table)
+
 
 # ══════════════════════════════════════════════════════════════════
 #  MAIN
@@ -365,7 +248,7 @@ CONFIG_TIGHT = build_config_dict(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Backtest config comparison against a market universe"
+        description="Backtest strategy against a market universe"
     )
     parser.add_argument(
         "--market", required=True,
@@ -378,14 +261,6 @@ def main():
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--lookback", type=int, default=300,
                         help="Lookback bars for indicator warmup")
-    parser.add_argument(
-        "--name-a", default="Loose",
-        help="Display name for Config A",
-    )
-    parser.add_argument(
-        "--name-b", default="Tight",
-        help="Display name for Config B",
-    )
     args = parser.parse_args()
 
     # ── set up dual logging (file + console) ──────────────────
@@ -395,7 +270,7 @@ def main():
     log.info("=" * 70)
     log.info("Backtest started  market=%s  start=%s  end=%s", args.market, args.start, args.end)
     log.info("capital=%.0f  max_positions=%d  lookback=%d", args.capital, args.max_positions, args.lookback)
-    log.info("name_a=%s  name_b=%s  data_dir=%s", args.name_a, args.name_b, args.data_dir)
+    log.info("data_dir=%s", args.data_dir)
     log.info("Log file: %s", log_file)
     log.info("=" * 70)
 
@@ -404,44 +279,43 @@ def main():
     log.info("--- Loading data for %s market ---", args.market)
     ds = load_data(args.market, args.data_dir, args.lookback)
 
-    # ── run both configs ──────────────────────────────────────
-    console.rule("[bold cyan]Running comparison")
-    log.info("--- Running comparison: %s vs %s ---", args.name_a, args.name_b)
-    ra, rb, comp = run_comparison(
+    # ── run backtest ──────────────────────────────────────────
+    console.rule("[bold cyan]Running backtest")
+    log.info("--- Running backtest with config from config_refactor ---")
+
+    engine = BacktestEngine(
         data_source=ds,
         market=args.market,
-        config_a=CONFIG_LOOSE,
-        config_b=CONFIG_TIGHT,
+        config=CONFIG,
         start_date=args.start,
         end_date=args.end,
-        name_a=args.name_a,
-        name_b=args.name_b,
         initial_capital=args.capital,
         max_positions=args.max_positions,
+        config_name="Strategy",
     )
+    results = engine.run()
+    metrics = compute_metrics(results)
+    results["metrics"] = metrics
 
     # ── display ───────────────────────────────────────────────
     console.print()
-    print_comparison(comp, args.name_a, args.name_b, console)
+    _print_metrics(metrics)
 
-    # Log comparison table to file as well
-    log.info("--- Comparison Table ---")
-    for _, row in comp.iterrows():
-        log.info("  %-30s  %s=%s  %s=%s",
-                 row.get("Metric", ""),
-                 args.name_a, row.get(args.name_a, ""),
-                 args.name_b, row.get(args.name_b, ""))
+    # ── log metrics to file ───────────────────────────────────
+    log.info("--- Metrics ---")
+    for key, val in metrics.items():
+        log.info("  %-30s  %s", key, val)
 
     # ── summary ───────────────────────────────────────────────
-    bench_ret_a = ra.get("metrics", {}).get("benchmark_total_return", 0)
+    bench_ret = metrics.get("benchmark_total_return", 0)
     summary_lines = [
         f"Market          : {args.market}",
         f"Period          : {args.start} -> {args.end}",
         f"Start capital   : ${args.capital:,.0f}",
-        f"Benchmark       : {BENCHMARKS.get(args.market, '?')}  ({bench_ret_a:+.1%})",
-        f"{args.name_a:15s} : ${ra['final_value']:,.0f}  (alpha {ra.get('metrics', {}).get('alpha', 0):+.1%})",
-        f"{args.name_b:15s} : ${rb['final_value']:,.0f}  (alpha {rb.get('metrics', {}).get('alpha', 0):+.1%})",
+        f"Benchmark       : {BENCHMARKS.get(args.market, '?')}  ({bench_ret:+.1%})",
+        f"Strategy        : ${results['final_value']:,.0f}  (alpha {metrics.get('alpha', 0):+.1%})",
     ]
+    console.print()
     for line in summary_lines:
         _log_and_print(f"  {line}", f"  {line}")
 
@@ -449,24 +323,19 @@ def main():
     out = Path("backtest_results") / args.market
     out.mkdir(parents=True, exist_ok=True)
 
-    comp.to_csv(out / "comparison.csv", index=False)
+    # Metrics CSV
+    metrics_rows = [{"Metric": k, "Value": v} for k, v in metrics.items()]
+    pd.DataFrame(metrics_rows).to_csv(out / "metrics.csv", index=False)
 
-    # Merge equity curves — include benchmark once
-    eq_a = ra["equity_curve"][["date", "value"]].rename(columns={"value": f"value_{args.name_a}"})
-    eq_b = rb["equity_curve"][["date", "value"]].rename(columns={"value": f"value_{args.name_b}"})
-    eq_bench = ra["equity_curve"][["date", "benchmark"]].rename(columns={"benchmark": "benchmark"})
+    # Equity curve (includes benchmark column)
+    results["equity_curve"].to_csv(out / "equity_curve.csv", index=False)
 
-    eq = eq_a.merge(eq_b, on="date").merge(eq_bench, on="date")
-    eq.to_csv(out / "equity_curves.csv", index=False)
+    # Trade log
+    if not results["trade_log"].empty:
+        results["trade_log"].to_csv(out / "trades.csv", index=False)
 
-    if not ra["trade_log"].empty:
-        ra["trade_log"].to_csv(out / f"trades_{args.name_a}.csv", index=False)
-    if not rb["trade_log"].empty:
-        rb["trade_log"].to_csv(out / f"trades_{args.name_b}.csv", index=False)
-
-    # ── daily log for debugging ───────────────────────────────
-    ra["daily_log"].to_csv(out / f"daily_{args.name_a}.csv", index=False)
-    rb["daily_log"].to_csv(out / f"daily_{args.name_b}.csv", index=False)
+    # Daily log
+    results["daily_log"].to_csv(out / "daily_log.csv", index=False)
 
     _log_and_print(
         f"Results saved to {out}/",

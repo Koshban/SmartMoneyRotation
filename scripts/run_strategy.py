@@ -82,6 +82,13 @@ try:
 except ImportError:
     _conv_build_prices = None
 
+# ── SIGNAL WRITER: optional import ────────────────────────────
+try:
+    from signal_writer import write_signals as _write_signals
+    _HAS_SIGNAL_WRITER = True
+except ImportError:
+    _HAS_SIGNAL_WRITER = False
+
 log = logging.getLogger("run_strategy")
 
 W = 80  # print width
@@ -306,6 +313,307 @@ def _snap_signal(snap: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  SIGNAL WRITER HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+# ── SIGNAL WRITER: normalise raw signal strings to BUY/SELL/HOLD ──
+
+_BUY_LABELS = frozenset({
+    "BUY", "STRONG_BUY", "BUY_SCORING", "BUY_ROTATION",
+})
+_SELL_LABELS = frozenset({
+    "SELL", "STRONG_SELL", "SELL_SCORING", "SELL_ROTATION", "REDUCE",
+})
+
+
+def _normalise_action(raw: str) -> str:
+    """Map any signal label to the canonical BUY / SELL / HOLD."""
+    raw_upper = str(raw).upper().strip()
+    if raw_upper in _BUY_LABELS:
+        return "BUY"
+    if raw_upper in _SELL_LABELS:
+        return "SELL"
+    return "HOLD"
+
+
+def _emit_topdown_signals(
+    market: str,
+    result: Any,
+    run_date,
+    quality_enabled: bool = False,
+) -> None:
+    """
+    Convert top-down results into standardised signals and write
+    via signal_writer.  Handles both RotationResult (US) and the
+    plain RS-ranking dict (HK, IN).
+    """
+    if not _HAS_SIGNAL_WRITER:
+        return
+
+    signals: dict[str, dict] = {}
+    model_name = ""
+    meta: dict[str, Any] = {}
+
+    # ── RotationResult (US sector rotation) ───────────────
+    if isinstance(result, RotationResult):
+        model_name = "Top-Down RS + Sector Rotation"
+        if quality_enabled:
+            model_name += " + Quality"
+
+        buy_tickers = {r.ticker for r in result.buys}
+        buy_rank = 0
+
+        for rec in result.recommendations:
+            action_raw = rec.action.value if hasattr(rec.action, "value") else str(rec.action)
+            action = _normalise_action(action_raw)
+
+            rank = None
+            if action == "BUY":
+                buy_rank += 1
+                rank = buy_rank
+
+            signals[rec.ticker] = {
+                "action":  action,
+                "score":   round(rec.blended_score, 4),
+                "rank":    rank,
+                "rs_rank": rec.sector_rank,
+                "sector":  rec.sector,
+                "regime":  rec.sector_tier,
+                "notes":   rec.reason or "",
+            }
+
+        meta = {
+            "leading_sectors":  result.leading_sectors,
+            "lagging_sectors":  result.lagging_sectors,
+            "quality_stats":    result.quality_stats,
+            "quality_enabled":  quality_enabled,
+        }
+
+    # ── Plain RS ranking (HK / IN) ───────────────────────
+    elif isinstance(result, dict) and "rs_ranking" in result:
+        model_name = "Top-Down RS Ranking"
+        rs_all = result["rs_ranking"]
+        raw_rets = result.get("raw_returns", {})
+
+        n = len(rs_all)
+        n_top = max(1, n // 3)
+        n_bot = max(1, n // 3)
+
+        for i, (ticker, rs_val) in enumerate(rs_all.items()):
+            if i < n_top:
+                action = "BUY"
+                rank = i + 1
+            elif i >= n - n_bot:
+                action = "SELL"
+                rank = None
+            else:
+                action = "HOLD"
+                rank = None
+
+            signals[ticker] = {
+                "action": action,
+                "score":  round(float(rs_val), 6),
+                "rank":   rank,
+                "notes":  "",
+            }
+
+        meta = {"ranking_method": "composite_rs_thirds"}
+
+    else:
+        log.debug("Unknown result type for signal writer: %s", type(result))
+        return
+
+    path = _write_signals(
+        phase="phase1",
+        market=market,
+        run_date=run_date,
+        signals=signals,
+        model_name=model_name,
+        meta=meta,
+    )
+    log.info("Phase 1 signals written → %s", path)
+
+
+def _emit_bottomup_signals(
+    market: str,
+    result: PipelineResult,
+    run_date,
+) -> None:
+    """
+    Convert bottom-up PipelineResult snapshots into standardised
+    signals and write via signal_writer.
+    """
+    if not _HAS_SIGNAL_WRITER:
+        return
+    if not result.snapshots:
+        return
+
+    signals: dict[str, dict] = {}
+    buy_rank = 0
+
+    for snap in result.snapshots:
+        ticker = snap.get("ticker")
+        if not ticker:
+            continue
+
+        raw_signal = _snap_signal(snap)
+        action = _normalise_action(raw_signal)
+
+        rank = None
+        if action == "BUY":
+            buy_rank += 1
+            rank = buy_rank
+
+        signals[ticker] = {
+            "action":  action,
+            "score":   round(_snap_composite(snap), 4),
+            "rank":    rank,
+            "rs_rank": None,
+            "sector":  snap.get("sector"),
+            "regime":  None,
+            "notes":   raw_signal if raw_signal != action else "",
+        }
+
+        # Attach RS z-score if available
+        rs = _snap_rs(snap)
+        if rs != 0.0:
+            signals[ticker]["rs_rank"] = round(rs, 4)
+
+    meta = {
+        "n_tickers":  result.n_tickers,
+        "n_errors":   result.n_errors,
+        "total_time": round(result.total_time, 2),
+    }
+
+    # Include breadth regime if available
+    if result.breadth is not None and not result.breadth.empty:
+        if "breadth_regime" in result.breadth.columns:
+            meta["breadth_regime"] = str(result.breadth["breadth_regime"].iloc[-1])
+
+    path = _write_signals(
+        phase="phase1",
+        market=market,
+        run_date=run_date,
+        signals=signals,
+        model_name="Bottom-Up Scoring Pipeline",
+        meta=meta,
+    )
+    log.info("Phase 1 (bottom-up) signals written → %s", path)
+
+
+def _emit_full_signals(
+    market: str,
+    result: PipelineResult,
+    run_date,
+) -> None:
+    """
+    Convert full-pipeline PipelineResult into standardised signals.
+
+    The full pipeline includes bottom-up scoring + rotation overlay
+    + convergence merge, so signals carry the richest metadata.
+    """
+    if not _HAS_SIGNAL_WRITER:
+        return
+    if not result.snapshots:
+        return
+
+    # Gather convergence strong buys for annotation
+    strong_buy_set: set[str] = set()
+    if result.convergence is not None:
+        strong = getattr(result.convergence, "strong_buys", [])
+        strong_buy_set = {
+            getattr(sb, "ticker", str(sb)) for sb in strong
+        }
+
+    # Gather rotation buys / sells for annotation
+    rot_buy_set: set[str] = set()
+    rot_sell_set: set[str] = set()
+    if result.rotation_result is not None:
+        rot_buy_set = {r.ticker for r in result.rotation_result.buys}
+        rot_sell_set = {r.ticker for r in result.rotation_result.sells}
+
+    # Build rotation lookup for sector / tier info
+    rot_lookup: dict[str, Any] = {}
+    if result.rotation_result is not None:
+        for rec in result.rotation_result.recommendations:
+            rot_lookup[rec.ticker] = rec
+
+    signals: dict[str, dict] = {}
+    buy_rank = 0
+
+    for snap in result.snapshots:
+        ticker = snap.get("ticker")
+        if not ticker:
+            continue
+
+        raw_signal = _snap_signal(snap)
+        action = _normalise_action(raw_signal)
+
+        rank = None
+        if action == "BUY":
+            buy_rank += 1
+            rank = buy_rank
+
+        # Build notes with provenance
+        notes_parts = []
+        if raw_signal != action:
+            notes_parts.append(raw_signal)
+        if ticker in strong_buy_set:
+            notes_parts.append("convergence_strong_buy")
+        if ticker in rot_buy_set:
+            notes_parts.append("rotation_buy")
+        if ticker in rot_sell_set:
+            notes_parts.append("rotation_sell")
+
+        # Enrich with rotation metadata if available
+        rot_rec = rot_lookup.get(ticker)
+        sector = snap.get("sector")
+        regime = None
+        rs_rank_val = None
+        if rot_rec is not None:
+            sector = sector or rot_rec.sector
+            regime = rot_rec.sector_tier
+            rs_rank_val = rot_rec.sector_rank
+
+        signals[ticker] = {
+            "action":  action,
+            "score":   round(_snap_composite(snap), 4),
+            "rank":    rank,
+            "rs_rank": rs_rank_val,
+            "sector":  sector,
+            "regime":  regime,
+            "notes":   "; ".join(notes_parts) if notes_parts else "",
+        }
+
+    meta: dict[str, Any] = {
+        "n_tickers":     result.n_tickers,
+        "n_errors":      result.n_errors,
+        "total_time":    round(result.total_time, 2),
+        "has_rotation":  result.rotation_result is not None,
+        "has_convergence": result.convergence is not None,
+        "n_strong_buys": len(strong_buy_set),
+    }
+
+    if result.breadth is not None and not result.breadth.empty:
+        if "breadth_regime" in result.breadth.columns:
+            meta["breadth_regime"] = str(result.breadth["breadth_regime"].iloc[-1])
+
+    if result.rotation_result is not None:
+        meta["leading_sectors"] = result.rotation_result.leading_sectors
+        meta["lagging_sectors"] = result.rotation_result.lagging_sectors
+
+    path = _write_signals(
+        phase="phase1",
+        market=market,
+        run_date=run_date,
+        signals=signals,
+        model_name="Full Pipeline (Scoring + Rotation + Convergence)",
+        meta=meta,
+    )
+    log.info("Phase 1 (full) signals written → %s", path)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  TOP-DOWN MODE
 # ═══════════════════════════════════════════════════════════════
 
@@ -340,6 +648,9 @@ def _run_top_down(args) -> dict[str, Any]:
         print(f"  Data: {n_days} trading days × {n_tickers} tickers")
         print(f"  Range: {date_range}")
 
+        # ── SIGNAL WRITER: capture run_date from price data ───
+        run_date = prices.index[-1].strftime("%Y-%m-%d")
+
         if "rotation" in engines:
             indicator_data: dict[str, pd.DataFrame] | None = None
             if args.quality:
@@ -366,11 +677,21 @@ def _run_top_down(args) -> dict[str, Any]:
             rotation_result = run_rotation(prices=prices, current_holdings=holdings, config=rcfg, indicator_data=indicator_data)
             print_rotation_result(rotation_result)
             results[market] = rotation_result
+
+            # ── SIGNAL WRITER: emit rotation signals ──────────
+            _emit_topdown_signals(
+                market, rotation_result, run_date,
+                quality_enabled=bool(args.quality and indicator_data),
+            )
         else:
             _print_rs_ranking(prices, benchmark, market)
             config = RotationConfig(benchmark=benchmark)
             rs_all, raw = composite_rs_all(prices, config)
-            results[market] = {"rs_ranking": rs_all, "raw_returns": raw}
+            rs_result = {"rs_ranking": rs_all, "raw_returns": raw}
+            results[market] = rs_result
+
+            # ── SIGNAL WRITER: emit RS ranking signals ────────
+            _emit_topdown_signals(market, rs_result, run_date)
 
         elapsed = time.perf_counter() - t0
         print(f"\n  ⏱  {market} top-down: {elapsed:.1f}s")
@@ -460,6 +781,16 @@ def _run_bottom_up(args) -> dict[str, PipelineResult]:
 
         _print_bottom_up_result(result, market)
         results[market] = result
+
+        # ── SIGNAL WRITER: emit bottom-up signals ─────────────
+        run_date = date.today().strftime("%Y-%m-%d")
+        # Try to get actual last date from orchestrator data
+        if hasattr(orch, "_ohlcv") and orch._ohlcv:
+            for df in orch._ohlcv.values():
+                if df is not None and not df.empty:
+                    run_date = df.index[-1].strftime("%Y-%m-%d")
+                    break
+        _emit_bottomup_signals(market, result, run_date)
 
         elapsed = time.perf_counter() - t0
         print(f"\n  ⏱  {market} bottom-up: {elapsed:.1f}s total")
@@ -581,6 +912,10 @@ def _run_full(args) -> dict[str, PipelineResult]:
         for market, result in raw.items():
             _print_full_result(result, market)
             results[market] = result
+
+            # ── SIGNAL WRITER: emit full-pipeline signals ─────
+            run_date = date.today().strftime("%Y-%m-%d")
+            _emit_full_signals(market, result, run_date)
     else:
         market = markets[0]
         result = run_full_pipeline(
@@ -590,6 +925,10 @@ def _run_full(args) -> dict[str, PipelineResult]:
         )
         _print_full_result(result, market)
         results[market] = result
+
+        # ── SIGNAL WRITER: emit full-pipeline signals ─────────
+        run_date = date.today().strftime("%Y-%m-%d")
+        _emit_full_signals(market, result, run_date)
 
     return results
 
@@ -882,6 +1221,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     log.info(f"Strategy run: mode={args.mode}, market={args.market}")
     log.info(f"Log file: {log_file}")
+
+    # ── SIGNAL WRITER: log availability ───────────────────
+    if _HAS_SIGNAL_WRITER:
+        log.info("Signal writer: enabled → results/signals/")
+    else:
+        log.info("Signal writer: not available (install signal_writer.py for combined reports)")
 
     # ── Dispatch ──────────────────────────────────────────
     if args.mode == "top-down":

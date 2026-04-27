@@ -79,6 +79,8 @@ RUNGS    = 5
 DELAY_YF = 1.5
 DELAY_IBKR = 0.6
 
+# ── Dedup key for options (module-level constant) ─────────────
+_OPTIONS_DEDUP_KEYS = ["date", "symbol", "expiry", "strike", "opt_type"]
 
 # ═══════════════════════════════════════════════════════════════
 #  SYMBOL LISTS
@@ -445,7 +447,21 @@ def fetch_symbol_ibkr(
                 rows.append(row)
             ib.sleep(DELAY_IBKR)
 
-    return pd.DataFrame(rows) if rows else None
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+
+    # ── Deduplicate at source ──────────────────────────────────
+    before = len(df)
+    df = df.drop_duplicates(
+        subset=_OPTIONS_DEDUP_KEYS, keep="last",
+    ).reset_index(drop=True)
+    dupes = before - len(df)
+    if dupes:
+        LOG.info(f"    {symbol}: dropped {dupes} duplicate option rows")
+
+    return df if not df.empty else None
 
 
 def _fetch_single_option(
@@ -654,6 +670,7 @@ def run_yfinance(symbols: list[str], n_rungs: int):
 # ═══════════════════════════════════════════════════════════════
 
 def consolidate(market: str = "us") -> pd.DataFrame:
+    """Merge per-ticker CSVs into one parquet, deduped."""
     csv_dir = DATA_DIR / "options" / market
     if not csv_dir.exists():
         LOG.warning(f"No options directory: {csv_dir}")
@@ -662,7 +679,7 @@ def consolidate(market: str = "us") -> pd.DataFrame:
     frames = []
     for csv_file in sorted(csv_dir.glob("*.csv")):
         try:
-            df = pd.read_csv(csv_file)
+            df = pd.read_csv(csv_file, dtype={"date": str, "expiry": str})
             if not df.empty:
                 frames.append(df)
         except Exception as e:
@@ -673,6 +690,15 @@ def consolidate(market: str = "us") -> pd.DataFrame:
         return pd.DataFrame()
 
     combined = pd.concat(frames, ignore_index=True)
+
+    # ── Deduplicate across all tickers ─────────────────────────
+    before = len(combined)
+    combined = combined.drop_duplicates(
+        subset=_OPTIONS_DEDUP_KEYS, keep="last",
+    ).reset_index(drop=True)
+    dupes = before - len(combined)
+    if dupes:
+        LOG.info(f"Consolidation dedup: removed {dupes:,} duplicate rows")
 
     out_path = DATA_DIR / f"{market}_options.parquet"
     combined.to_parquet(out_path, index=False)
@@ -690,10 +716,20 @@ def consolidate(market: str = "us") -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════
 
 def _append_save(df: pd.DataFrame, path: Path):
+    """
+    Append today's data to a per-ticker CSV, deduplicating by the
+    full composite key.  Safe to call multiple times on the same day.
+    """
     if path.exists():
-        prev = pd.read_csv(path, dtype={"date": str})
-        prev = prev[prev["date"] != date.today().isoformat()]
+        prev = pd.read_csv(path, dtype={"date": str, "expiry": str})
         df = pd.concat([prev, df], ignore_index=True)
+
+    before = len(df)
+    df = df.drop_duplicates(subset=_OPTIONS_DEDUP_KEYS, keep="last")
+    dupes = before - len(df)
+    if dupes:
+        LOG.debug(f"  {path.name}: removed {dupes} duplicate rows")
+
     df.to_csv(path, index=False)
 
 

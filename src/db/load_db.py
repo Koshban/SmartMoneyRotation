@@ -1,34 +1,39 @@
 """
-src/db/load_db.py
+src/db/load_db.py — Load parquet/CSV data into PostgreSQL (upsert).
 
-Load parquet / CSV files into PostgreSQL tables defined in schema.py.
+Uses INSERT ... ON CONFLICT DO UPDATE so the script is safe to
+re-run at any time.  Duplicate rows (by the table's unique key)
+are updated in place rather than rejected.
 
 Usage:
-    python src/db/load_db.py --market all --type all
-    python src/db/load_db.py --market us  --type cash
-    python src/db/load_db.py --market us  --type options
-    python src/db/load_db.py --market hk  --type options
-    python src/db/load_db.py --status
+    python src/db/load_db.py                            # all markets, all types
+    python src/db/load_db.py --market us                 # US only
+    python src/db/load_db.py --type cash                 # cash tables only
+    python src/db/load_db.py --type options              # options tables only
+    python src/db/load_db.py --market us --type cash     # US cash only
+    python src/db/load_db.py --dry-run                   # preview, no DB writes
+    python src/db/load_db.py --status                    # show row counts only
 """
+
 import sys
 from pathlib import Path
 
-_SRC  = Path(__file__).resolve().parent.parent  # .../src
-_ROOT = _SRC.parent                             # .../SmartMoneyRotation
+_SRC  = Path(__file__).resolve().parent.parent
+_ROOT = _SRC.parent
 for _p in (str(_ROOT), str(_SRC)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
 import argparse
 import logging
-import pandas as pd
-from sqlalchemy import text
+import math
+
 import numpy as np
+import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 
-SRC = Path(__file__).resolve().parent.parent
-ROOT = SRC.parent
-sys.path.insert(0, str(ROOT))
-
-from db.db import get_engine
+from common.credentials import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,332 +41,429 @@ logging.basicConfig(
 )
 LOG = logging.getLogger(__name__)
 
-DATA_DIR = ROOT / "data"
+DATA_DIR = _ROOT / "data"
+
+CASH_REGIONS    = ["us", "hk", "in"]
+OPTIONS_REGIONS = ["us", "hk"]
+
+BATCH_SIZE = 2000
 
 
 # ═══════════════════════════════════════════════════════════════
-#  COLUMN MAPS  — parquet/CSV column → DB column
+#  CONNECTION
 # ═══════════════════════════════════════════════════════════════
 
-CASH_COLUMNS = [
-    "date", "symbol", "open", "high", "low", "close", "volume",
+def get_conn():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STATUS — row counts for every table in the database
+# ═══════════════════════════════════════════════════════════════
+
+# Tables we expect to exist (in display order).
+# Any table found in the DB but not listed here is still shown,
+# appended at the end.
+KNOWN_TABLES = [
+    "us_cash",
+    "hk_cash",
+    "india_cash",
+    "us_options",
+    "hk_options",
 ]
 
-OPTIONS_COLUMNS = [
-    "date", "symbol", "expiry", "strike", "opt_type",
-    "bid", "ask", "last", "volume", "oi",
-    "iv",
-    "delta", "gamma", "theta", "vega", "rho",
-    "underlying_price", "dte",
-    "source",
-]
+
+def _discover_tables(conn) -> list[str]:
+    """
+    Return all user tables in the public schema, ordered so that
+    KNOWN_TABLES appear first (in their defined order) followed
+    by any extras alphabetically.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT table_name
+        FROM   information_schema.tables
+        WHERE  table_schema = 'public'
+          AND  table_type   = 'BASE TABLE'
+        ORDER  BY table_name
+        """
+    )
+    all_tables = [row[0] for row in cur.fetchall()]
+    cur.close()
+
+    # Preserve KNOWN_TABLES ordering, then append anything else
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for t in KNOWN_TABLES:
+        if t in all_tables:
+            ordered.append(t)
+            seen.add(t)
+    for t in all_tables:
+        if t not in seen:
+            ordered.append(t)
+
+    return ordered
+
+
+def load_status() -> None:
+    """Show row counts for all tables in the database."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        tables = _discover_tables(conn)
+
+        LOG.info("=" * 55)
+        LOG.info(f"  {'Table':<30s} {'Rows':>12s}  {'Date range':>25s}")
+        LOG.info("-" * 55)
+
+        for table in tables:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
+                count = cur.fetchone()[0]
+
+                # Best-effort date range (works for tables with a 'date' column)
+                date_range = ""
+                try:
+                    cur.execute(
+                        f"SELECT MIN(date)::text, MAX(date)::text FROM {table}"  # noqa: S608
+                    )
+                    row = cur.fetchone()
+                    if row and row[0] and row[1]:
+                        date_range = f"{row[0]} → {row[1]}"
+                except Exception:
+                    pass  # table has no 'date' column — that's fine
+
+                LOG.info(f"  {table:<30s} {count:>12,}  {date_range:>25s}")
+
+            except Exception:
+                LOG.info(f"  {table:<30s} {'(error)':>12s}")
+
+        LOG.info("=" * 55)
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TYPE SANITISATION  (numpy/pandas → Python natives)
+# ═══════════════════════════════════════════════════════════════
+
+def _sanitize(val):
+    """Convert numpy/pandas types to Python natives for psycopg2."""
+    if val is None:
+        return None
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        v = float(val)
+        return None if (math.isnan(v) or math.isinf(v)) else v
+    if isinstance(val, (np.bool_,)):
+        return bool(val)
+    if isinstance(val, (pd.Timestamp,)):
+        return None if pd.isna(val) else val.to_pydatetime().date()
+    if isinstance(val, np.datetime64):
+        if pd.isna(val):
+            return None
+        return pd.Timestamp(val).to_pydatetime().date()
+    # Catch-all for other pandas NA types (pd.NA, pd.NaT, etc.)
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return val
+
+
+def _to_tuples(df: pd.DataFrame, columns: list[str]) -> list[tuple]:
+    """Convert DataFrame rows to a list of sanitised tuples."""
+    return [
+        tuple(_sanitize(v) for v in row)
+        for row in df[columns].itertuples(index=False, name=None)
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  BATCH UPSERT ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def _batch_upsert(
+    table: str,
+    sql_template: str,
+    rows: list[tuple],
+) -> int:
+    """
+    Execute batched INSERT ... ON CONFLICT DO UPDATE.
+    Returns the number of rows processed.
+    """
+    if not rows:
+        return 0
+
+    sql = sql_template.format(table=table)
+    conn = get_conn()
+    cur = conn.cursor()
+    total = 0
+
+    try:
+        for i in range(0, len(rows), BATCH_SIZE):
+            batch = rows[i : i + BATCH_SIZE]
+            execute_values(cur, sql, batch, page_size=BATCH_SIZE)
+            total += len(batch)
+
+            if total % 10_000 == 0 or total == len(rows):
+                LOG.info(f"  {table}: {total:,} / {len(rows):,} rows upserted")
+
+        conn.commit()
+        LOG.info(f"  {table}: DONE — {total:,} rows upserted")
+
+    except Exception as e:
+        conn.rollback()
+        LOG.error(f"  {table}: upsert failed at row ~{total:,}: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    return total
 
 
 # ═══════════════════════════════════════════════════════════════
 #  CASH LOADING
 # ═══════════════════════════════════════════════════════════════
 
-def load_cash(market: str) -> int:
-    """
-    Load cash OHLCV data into {market}_cash table.
+CASH_COLS = ["date", "symbol", "open", "high", "low", "close", "volume"]
 
-    Reads from: data/{market}_cash.parquet  (or .csv fallback)
-    Upsert:     ON CONFLICT (date, symbol) DO UPDATE
-    """
-    table = f"{market}_cash"
-    df = _read_data_file(market, "cash")
+CASH_UPSERT_SQL = """
+INSERT INTO {table} (date, symbol, open, high, low, close, volume)
+VALUES %s
+ON CONFLICT (date, symbol) DO UPDATE SET
+    open   = EXCLUDED.open,
+    high   = EXCLUDED.high,
+    low    = EXCLUDED.low,
+    close  = EXCLUDED.close,
+    volume = EXCLUDED.volume
+"""
 
-    if df is None or df.empty:
-        LOG.warning(f"No data found for {table}")
+
+def load_cash(market: str, dry_run: bool = False) -> int:
+    """Read {market}_cash.parquet → upsert into {market}_cash table."""
+    path = DATA_DIR / f"{market}_cash.parquet"
+    if not path.exists():
+        LOG.warning(f"Not found: {path}")
         return 0
 
-    # Ensure required columns exist
-    for col in ["date", "symbol", "close"]:
-        if col not in df.columns:
-            LOG.error(f"{table}: missing required column '{col}'")
-            return 0
+    df = pd.read_parquet(path)
+    df.columns = [str(c).lower().strip() for c in df.columns]
 
-    # Keep only known columns, fill missing optional ones with None
-    for col in CASH_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    df = df[CASH_COLUMNS].copy()
+    if "date" not in df.columns:
+        LOG.error(f"No 'date' column in {path.name}  (cols: {list(df.columns)})")
+        return 0
 
-    # Clean
-    df = df.dropna(subset=["date", "symbol", "close"])
     df["date"] = pd.to_datetime(df["date"]).dt.date
-    df = df.drop_duplicates(subset=["date", "symbol"], keep="last")
 
-    if df.empty:
-        LOG.warning(f"{table}: no valid rows after cleaning")
+    missing = [c for c in CASH_COLS if c not in df.columns]
+    if missing:
+        LOG.error(f"Missing columns in {path.name}: {missing}")
         return 0
 
-    # Upsert
-    engine = get_engine()
-    upsert_sql = f"""
-        INSERT INTO {table} (date, symbol, open, high, low, close, volume)
-        VALUES (:date, :symbol, :open, :high, :low, :close, :volume)
-        ON CONFLICT (date, symbol) DO UPDATE SET
-            open   = EXCLUDED.open,
-            high   = EXCLUDED.high,
-            low    = EXCLUDED.low,
-            close  = EXCLUDED.close,
-            volume = EXCLUDED.volume;
-    """
+    # ── Deduplicate ────────────────────────────────────────────
+    before = len(df)
+    df = df.drop_duplicates(subset=["date", "symbol"], keep="last")
+    dupes = before - len(df)
+    if dupes:
+        LOG.info(f"  {path.name}: removed {dupes:,} duplicate rows before load")
 
-    rows_loaded = _batch_upsert(engine, upsert_sql, df, table)
-    return rows_loaded
+    table = f"{market}_cash"
+    LOG.info(
+        f"Loading {len(df):,} rows → {table}  "
+        f"({df['symbol'].nunique()} symbols, "
+        f"{df['date'].min()} → {df['date'].max()})"
+    )
+
+    if dry_run:
+        LOG.info("  [DRY RUN] — skipped DB write")
+        return len(df)
+
+    rows = _to_tuples(df, CASH_COLS)
+    return _batch_upsert(table, CASH_UPSERT_SQL, rows)
 
 
 # ═══════════════════════════════════════════════════════════════
 #  OPTIONS LOADING
 # ═══════════════════════════════════════════════════════════════
 
-def load_options(market: str) -> int:
-    """
-    Load options snapshot data into {market}_options table.
+OPTIONS_DEDUP_KEYS = ["date", "symbol", "expiry", "strike", "opt_type"]
 
-    Reads from: data/{market}_options.parquet  (or .csv fallback)
-    Upsert:     ON CONFLICT (date, symbol, expiry, strike, opt_type) DO UPDATE
+OPTIONS_COLS = [
+    "date", "symbol", "expiry", "strike", "opt_type",
+    "bid", "ask", "last", "volume", "oi", "iv",
+    "delta", "gamma", "theta", "vega", "rho",
+    "underlying_price", "dte", "source",
+]
 
-    Handles both yfinance data (greeks are NULL) and IBKR data (full greeks).
-    When IBKR data overwrites yfinance data for the same contract, greeks
-    get populated.
-    """
-    table = f"{market}_options"
-    df = _read_data_file(market, "options")
+OPTIONS_UPSERT_SQL = """
+INSERT INTO {table} (
+    date, symbol, expiry, strike, opt_type,
+    bid, ask, last, volume, oi, iv,
+    delta, gamma, theta, vega, rho,
+    underlying_price, dte, source
+)
+VALUES %s
+ON CONFLICT (date, symbol, expiry, strike, opt_type) DO UPDATE SET
+    bid              = EXCLUDED.bid,
+    ask              = EXCLUDED.ask,
+    last             = EXCLUDED.last,
+    volume           = EXCLUDED.volume,
+    oi               = EXCLUDED.oi,
+    iv               = EXCLUDED.iv,
+    delta            = EXCLUDED.delta,
+    gamma            = EXCLUDED.gamma,
+    theta            = EXCLUDED.theta,
+    vega             = EXCLUDED.vega,
+    rho              = EXCLUDED.rho,
+    underlying_price = EXCLUDED.underlying_price,
+    dte              = EXCLUDED.dte,
+    source           = EXCLUDED.source
+"""
 
-    if df is None or df.empty:
-        LOG.warning(f"No data found for {table}")
+
+def load_options(market: str, dry_run: bool = False) -> int:
+    """Read per-ticker CSVs from data/options/{market}/ → upsert into {market}_options."""
+    csv_dir = DATA_DIR / "options" / market
+    if not csv_dir.exists():
+        LOG.warning(f"Not found: {csv_dir}")
         return 0
 
-    # Ensure required columns exist
-    for col in ["date", "symbol", "expiry", "strike", "opt_type"]:
-        if col not in df.columns:
-            LOG.error(f"{table}: missing required column '{col}'")
-            return 0
+    frames = []
+    for csv_file in sorted(csv_dir.glob("*.csv")):
+        try:
+            tmp = pd.read_csv(csv_file, dtype={"date": str, "expiry": str})
+            if not tmp.empty:
+                frames.append(tmp)
+        except Exception as e:
+            LOG.warning(f"  Skipping {csv_file.name}: {e}")
 
-    # Add missing optional columns as None
-    for col in OPTIONS_COLUMNS:
+    if not frames:
+        LOG.warning(f"No CSV files in {csv_dir}")
+        return 0
+
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = [str(c).lower().strip() for c in df.columns]
+
+    # ── Parse dates ────────────────────────────────────────────
+    df["date"]   = pd.to_datetime(df["date"]).dt.date
+    df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
+
+    # ── Compute DTE if missing ─────────────────────────────────
+    if "dte" not in df.columns:
+        df["dte"] = df.apply(
+            lambda r: (r["expiry"] - r["date"]).days
+            if pd.notna(r["expiry"]) and pd.notna(r["date"])
+            else None,
+            axis=1,
+        )
+
+    if "source" not in df.columns:
+        df["source"] = "yfinance"
+
+    # ── Fill any missing optional columns with None ────────────
+    for col in OPTIONS_COLS:
         if col not in df.columns:
             df[col] = None
 
-    # Compute DTE if not present
-    if df["dte"].isna().all():
-        try:
-            df["dte"] = (
-                pd.to_datetime(df["expiry"]) - pd.to_datetime(df["date"])
-            ).dt.days
-        except Exception:
-            pass
+    # ── Deduplicate ────────────────────────────────────────────
+    before = len(df)
+    df = df.drop_duplicates(subset=OPTIONS_DEDUP_KEYS, keep="last")
+    dupes = before - len(df)
+    if dupes:
+        LOG.info(f"  Removed {dupes:,} duplicate rows before load")
 
-    df = df[OPTIONS_COLUMNS].copy()
-
-    # Clean
-    df = df.dropna(subset=["date", "symbol", "expiry", "strike", "opt_type"])
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
-    df["opt_type"] = df["opt_type"].str.upper().str.strip()
-    df = df[df["opt_type"].isin(["C", "P"])]
-    df = df.drop_duplicates(
-        subset=["date", "symbol", "expiry", "strike", "opt_type"],
-        keep="last",
+    table = f"{market}_options"
+    LOG.info(
+        f"Loading {len(df):,} rows → {table}  "
+        f"({df['symbol'].nunique()} symbols)"
     )
 
-    if df.empty:
-        LOG.warning(f"{table}: no valid rows after cleaning")
-        return 0
-    # ── Fix types: parquet stores volume/oi as DOUBLE (can contain inf/NaN)
-    #    but PostgreSQL expects INTEGER ──
-    
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df["volume"] = df["volume"].astype("Int64")
-    df["oi"]     = df["oi"].astype("Int64")
-    df["dte"]    = df["dte"].astype("Int64")
+    if dry_run:
+        LOG.info("  [DRY RUN] — skipped DB write")
+        return len(df)
 
-    # Upsert — IBKR data (with greeks) overwrites yfinance data (without)
-    # Upsert — IBKR data (with greeks) overwrites yfinance data (without)
-    engine = get_engine()
-    upsert_sql = f"""
-        INSERT INTO {table} (
-            date, symbol, expiry, strike, opt_type,
-            bid, ask, last, volume, oi,
-            iv,
-            delta, gamma, theta, vega, rho,
-            underlying_price, dte,
-            source
-        )
-        VALUES (
-            :date, :symbol, :expiry, :strike, :opt_type,
-            :bid, :ask, :last, :volume, :oi,
-            :iv,
-            :delta, :gamma, :theta, :vega, :rho,
-            :underlying_price, :dte,
-            :source
-        )
-        ON CONFLICT (date, symbol, expiry, strike, opt_type) DO UPDATE SET
-            bid              = COALESCE(EXCLUDED.bid,              {table}.bid),
-            ask              = COALESCE(EXCLUDED.ask,              {table}.ask),
-            last             = COALESCE(EXCLUDED.last,             {table}.last),
-            volume           = COALESCE(EXCLUDED.volume,           {table}.volume),
-            oi               = COALESCE(EXCLUDED.oi,               {table}.oi),
-            iv               = COALESCE(EXCLUDED.iv,               {table}.iv),
-            delta            = COALESCE(EXCLUDED.delta,            {table}.delta),
-            gamma            = COALESCE(EXCLUDED.gamma,            {table}.gamma),
-            theta            = COALESCE(EXCLUDED.theta,            {table}.theta),
-            vega             = COALESCE(EXCLUDED.vega,             {table}.vega),
-            rho              = COALESCE(EXCLUDED.rho,              {table}.rho),
-            underlying_price = COALESCE(EXCLUDED.underlying_price, {table}.underlying_price),
-            dte              = COALESCE(EXCLUDED.dte,              {table}.dte),
-            source           = COALESCE(EXCLUDED.source,           {table}.source);
-    """
-
-    rows_loaded = _batch_upsert(engine, upsert_sql, df, table)
-    return rows_loaded
-
-
-# ═══════════════════════════════════════════════════════════════
-#  SHARED HELPERS
-# ═══════════════════════════════════════════════════════════════
-
-def _read_data_file(market: str, dtype: str) -> pd.DataFrame | None:
-    """
-    Read data from parquet (preferred) or CSV fallback.
-
-    Looks for:  data/{market}_{dtype}.parquet
-                data/{market}_{dtype}.csv
-    """
-    parquet_path = DATA_DIR / f"{market}_{dtype}.parquet"
-    csv_path = DATA_DIR / f"{market}_{dtype}.csv"
-
-    if parquet_path.exists():
-        LOG.info(f"Reading {parquet_path.name}")
-        return pd.read_parquet(parquet_path)
-    elif csv_path.exists():
-        LOG.info(f"Reading {csv_path.name} (parquet not found)")
-        return pd.read_csv(csv_path)
-    else:
-        LOG.warning(
-            f"No data file found: {parquet_path.name} or {csv_path.name}"
-        )
-        return None
-
-
-def _batch_upsert(
-    engine,
-    sql: str,
-    df: pd.DataFrame,
-    table: str,
-    batch_size: int = 1000,
-) -> int:
-    """
-    Execute upsert in batches for memory efficiency.
-
-    Converts NaN/NaT to None for proper NULL handling in SQL.
-    """
-    # Replace NaN with None (psycopg2 sends NULL)
-    records = df.where(df.notna(), None).to_dict("records")
-
-    total = 0
-    with engine.begin() as conn:
-        for i in range(0, len(records), batch_size):
-            batch = records[i : i + batch_size]
-            conn.execute(text(sql), batch)
-            total += len(batch)
-
-            if total % 5000 == 0 or total == len(records):
-                LOG.info(f"  {table}: {total:,} / {len(records):,} rows")
-
-    LOG.info(f"  {table}: loaded {total:,} rows total")
-    return total
-
-
-def load_status():
-    """Show row counts for all tables."""
-    engine = get_engine()
-    from db.schema import all_table_names
-
-    LOG.info("=" * 50)
-    LOG.info(f"{'Table':<20s} {'Rows':>10s}")
-    LOG.info("-" * 50)
-
-    with engine.connect() as conn:
-        for table in all_table_names():
-            try:
-                result = conn.execute(
-                    text(f"SELECT COUNT(*) FROM {table}")
-                ).scalar()
-                LOG.info(f"{table:<20s} {result:>10,}")
-            except Exception:
-                LOG.info(f"{table:<20s} {'(missing)':>10s}")
-
-    LOG.info("=" * 50)
+    rows = _to_tuples(df, OPTIONS_COLS)
+    return _batch_upsert(table, OPTIONS_UPSERT_SQL, rows)
 
 
 # ═══════════════════════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════════════════════
 
-MARKET_CHOICES = ["us", "hk", "in", "others", "all"]
-TYPE_CHOICES = ["cash", "options", "all"]
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Load parquet/CSV data into PostgreSQL",
+        description="Load parquet/CSV → PostgreSQL (upsert, idempotent)",
     )
     parser.add_argument(
         "--market",
-        choices=MARKET_CHOICES,
+        choices=["us", "hk", "in", "all"],
         default="all",
     )
     parser.add_argument(
         "--type",
-        choices=TYPE_CHOICES,
+        choices=["cash", "options", "all"],
         default="all",
-        dest="dtype",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview row counts — no DB writes",
     )
     parser.add_argument(
         "--status",
         action="store_true",
-        help="Show table row counts",
+        help="Show row counts for all tables and exit (no loading)",
     )
     args = parser.parse_args()
 
+    # ── Status-only mode: print table counts and exit ──────────
     if args.status:
         load_status()
         return
 
-    # ── Determine what to load ────────────────────────────────
-    from db.schema import CASH_REGIONS, OPTIONS_REGIONS
-
     if args.market == "all":
-        cash_markets = CASH_REGIONS
-        opt_markets = OPTIONS_REGIONS
+        cash_markets    = CASH_REGIONS
+        options_markets = OPTIONS_REGIONS
     else:
-        cash_markets = [args.market] if args.market in CASH_REGIONS else []
-        opt_markets = [args.market] if args.market in OPTIONS_REGIONS else []
+        cash_markets    = [args.market] if args.market in CASH_REGIONS else []
+        options_markets = [args.market] if args.market in OPTIONS_REGIONS else []
+
+    LOG.info("=" * 60)
+    LOG.info("LOAD DB — upsert from parquet / CSV")
+    if args.dry_run:
+        LOG.info("  *** DRY RUN — no DB writes ***")
+    LOG.info("=" * 60)
 
     total = 0
 
-    # ── Cash ──────────────────────────────────────────────────
-    if args.dtype in ("cash", "all"):
-        for m in cash_markets:
-            try:
-                n = load_cash(m)
-                total += n
-            except Exception as e:
-                LOG.error(f"Failed loading {m}_cash: {e}")
+    if args.type in ("cash", "all"):
+        for mkt in cash_markets:
+            total += load_cash(mkt, dry_run=args.dry_run)
 
-    # ── Options ───────────────────────────────────────────────
-    if args.dtype in ("options", "all"):
-        for m in opt_markets:
-            try:
-                n = load_options(m)
-                total += n
-            except Exception as e:
-                LOG.error(f"Failed loading {m}_options: {e}")
+    if args.type in ("options", "all"):
+        for mkt in options_markets:
+            total += load_options(mkt, dry_run=args.dry_run)
 
-    LOG.info(f"DONE — {total:,} total rows loaded")
+    LOG.info("=" * 60)
+    LOG.info(f"TOTAL: {total:,} rows processed")
+    LOG.info("=" * 60)
+
+    # ── Show status after loading ──────────────────────────────
+    load_status()
 
 
 if __name__ == "__main__":

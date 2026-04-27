@@ -33,8 +33,8 @@ from refactor.common.config_refactor import (
     SIGNALPARAMS_V2,
     CONVERGENCEPARAMS_V2,
     ACTIONPARAMS_V2,
-    BREADTHPARAMS,          # ← NEW
-    ROTATIONPARAMS,         # ← NEW
+    BREADTHPARAMS,
+    ROTATIONPARAMS,
 )
 
 logger = logging.getLogger(__name__)
@@ -333,174 +333,17 @@ def _add_score_percentiles(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _log_action_diagnostics(out: pd.DataFrame, params: dict) -> None:
-    if out.empty:
-        logger.info("Action diagnostics skipped because input frame is empty")
-        return
+# ══════════════════════════════════════════════════════════════════════════════
+# ── CHANGED: _log_action_diagnostics REMOVED (was only called by old
+#    _generate_actions; the simplified version below does not need it)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    sb = params["strong_buy"]
-    bu = params["buy"]
-    ho = params["hold"]
-    se = params["sell"]
-    sc = params["strong_context"]
-    wc = params["weak_context"]
-    hm = params["healthy_momentum"]
-    dm = params["decent_momentum"]
-    oe = params["overextended"]
 
-    score = out.get("scoreadjusted_v2", out.get("scorecomposite_v2", pd.Series(0.0, index=out.index))).fillna(0.0)
-    pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
-    entry = out.get("sigeffectiveentrymin_v2", pd.Series(0.60, index=out.index)).fillna(0.60)
-    confirmed = out.get("sigconfirmed_v2", pd.Series(0, index=out.index)).fillna(0).astype(int)
-    exit_sig = out.get("sigexit_v2", pd.Series(0, index=out.index)).fillna(0).astype(int)
-    breadth = out.get("breadthregime", pd.Series("unknown", index=out.index)).fillna("unknown")
-    vol = out.get("volregime", pd.Series("calm", index=out.index)).fillna("calm")
-    leadership = out.get("leadership_strength", pd.Series(0.0, index=out.index)).fillna(0.0)
-    rs_regime = out.get("rsregime", pd.Series("unknown", index=out.index)).fillna("unknown")
-    sector_regime = out.get("sectrsregime", pd.Series("unknown", index=out.index)).fillna("unknown")
-    rsi = out.get("rsi14", pd.Series(50.0, index=out.index)).fillna(50.0)
-    adx = out.get("adx14", pd.Series(20.0, index=out.index)).fillna(20.0)
-    relvol = out.get("relativevolume", pd.Series(1.0, index=out.index)).fillna(1.0)
-    short_ext = out.get("closevsema30pct", pd.Series(0.0, index=out.index)).fillna(0.0)
-
-    diag_rows = []
-    fail_counts = {
-        "exit_or_weak": 0, "below_sell_floor": 0, "strong_buy_not_met": 0,
-        "buy_not_met": 0, "hold_not_met": 0, "weak_context": 0,
-        "not_confirmed": 0, "pct_below_buy": 0, "score_below_buy": 0,
-        "momentum_not_decent": 0, "momentum_not_healthy": 0,
-        "overextended": 0, "relvol_below_strong_buy": 0,
-    }
-
-    for i in out.index:
-        s = float(score.loc[i]); pv = float(pct.loc[i]); e = float(entry.loc[i])
-        c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
-        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i])
-        r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
-        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i])
-        ext = float(short_ext.loc[i])
-        ticker = out.loc[i, "ticker"] if "ticker" in out.columns else str(i)
-
-        strong_context = (
-            (b in sc["breadth_regimes"] and v in sc["vol_regimes"])
-            or l >= sc["min_leadership"]
-        )
-        weak_ctx = (
-            b in wc["breadth_regimes"]
-            or v in wc["vol_regimes"]
-            or sr in wc["sector_regimes"]
-        )
-        healthy_mom = (
-            r in hm["allowed_rs"]
-            and sr not in hm.get("blocked_sector", [])
-            and ri >= hm["min_rsi"]
-            and ax >= hm["min_adx"]
-        )
-        decent_mom = (
-            r in dm["allowed_rs"]
-            and ri >= dm["min_rsi"]
-            and ax >= dm["min_adx"]
-        )
-        overext = ext >= oe["max_ema_pct"] or ri >= oe["max_rsi"]
-
-        sb_score_floor = max(sb["min_score"], e + sb["score_above_entry"])
-        bu_score_floor = max(bu["min_score"], e + bu["score_above_entry"])
-        ho_score_floor = max(ho["min_score"], e - ho["score_below_entry"])
-
-        strong_buy_ready = (
-            (not sb["requires_confirmation"] or c == 1)
-            and pv >= sb["min_percentile"]
-            and s >= sb_score_floor
-            and (not sb["requires_strong_context"] or strong_context)
-            and healthy_mom
-            and rv >= sb["min_rvol"]
-            and (not sb["blocks_overextended"] or not overext)
-        )
-        buy_ready = (
-            (not bu["requires_confirmation"] or c == 1)
-            and pv >= bu["min_percentile"]
-            and s >= bu_score_floor
-            and (not bu["requires_decent_momentum"] or decent_mom)
-            and (not bu["blocks_weak_context"] or not weak_ctx)
-        )
-        hold_ready = (
-            pv >= ho["min_percentile"]
-            and s >= ho_score_floor
-            and (not ho["blocks_weak_context"] or not weak_ctx)
-        )
-
-        reasons = []
-        if x == 1 and (
-            s < max(se["floor_score"], e - se["exit_score_below_entry"])
-            or pv <= se["exit_percentile_floor"]
-            or weak_ctx
-        ):
-            fail_counts["exit_or_weak"] += 1
-            reasons.append("exit_signal_path")
-        if s < se["floor_score"] or pv <= se["floor_percentile"]:
-            fail_counts["below_sell_floor"] += 1
-            reasons.append("below_sell_floor")
-        if not strong_buy_ready:
-            fail_counts["strong_buy_not_met"] += 1
-            if sb["requires_confirmation"] and c != 1:
-                fail_counts["not_confirmed"] += 1
-                reasons.append("strong_buy:no_confirmation")
-            if pv < sb["min_percentile"]:
-                reasons.append(f"strong_buy:pct<{sb['min_percentile']:.2f}")
-            if s < sb_score_floor:
-                reasons.append(f"strong_buy:score<{sb_score_floor:.3f}")
-            if sb["requires_strong_context"] and not strong_context:
-                reasons.append("strong_buy:context_not_strong")
-            if not healthy_mom:
-                fail_counts["momentum_not_healthy"] += 1
-                reasons.append("strong_buy:momentum_not_healthy")
-            if rv < sb["min_rvol"]:
-                fail_counts["relvol_below_strong_buy"] += 1
-                reasons.append(f"strong_buy:rvol<{sb['min_rvol']:.2f}")
-            if sb["blocks_overextended"] and overext:
-                fail_counts["overextended"] += 1
-                reasons.append("strong_buy:overextended")
-        if not buy_ready:
-            fail_counts["buy_not_met"] += 1
-            if bu["requires_confirmation"] and c != 1:
-                reasons.append("buy:no_confirmation")
-            if pv < bu["min_percentile"]:
-                fail_counts["pct_below_buy"] += 1
-                reasons.append(f"buy:pct<{bu['min_percentile']:.2f}")
-            if s < bu_score_floor:
-                fail_counts["score_below_buy"] += 1
-                reasons.append(f"buy:score<{bu_score_floor:.3f}")
-            if bu["requires_decent_momentum"] and not decent_mom:
-                fail_counts["momentum_not_decent"] += 1
-                reasons.append("buy:momentum_not_decent")
-            if bu["blocks_weak_context"] and weak_ctx:
-                fail_counts["weak_context"] += 1
-                reasons.append("buy:weak_context")
-        if not hold_ready:
-            fail_counts["hold_not_met"] += 1
-            reasons.append("hold:not_met")
-
-        diag_rows.append({
-            "ticker": ticker, "score": round(s, 4), "pct": round(pv, 4),
-            "entry": round(e, 4), "confirmed": c, "exit_sig": x,
-            "breadth": b, "vol": v, "lead": round(l, 3),
-            "rs": r, "sectrs": sr, "rsi14": round(ri, 2), "adx14": round(ax, 2),
-            "rvol": round(rv, 2), "ema30ext": round(ext, 4),
-            "strong_buy_ready": strong_buy_ready, "buy_ready": buy_ready,
-            "hold_ready": hold_ready, "reasons": "; ".join(reasons[:8]),
-        })
-
-    diag_df = pd.DataFrame(diag_rows)
-    action_counts = out["action_v2"].value_counts(dropna=False).to_dict() if "action_v2" in out.columns else {}
-    logger.info("Action diagnostics summary: actions=%s fail_counts=%s", action_counts, fail_counts)
-    if logger.isEnabledFor(logging.DEBUG):
-        sort_cols = [c for c in ["buy_ready", "hold_ready", "score", "pct"] if c in diag_df.columns]
-        diag_view = diag_df.sort_values(sort_cols, ascending=[False, False, False, False]) if sort_cols else diag_df
-        logger.debug("Top action diagnostics rows:\n%s", diag_view.head(50).to_string(index=False))
-        near_buys = diag_df[(diag_df["buy_ready"] == False) & (diag_df["hold_ready"] == True)].head(30)
-        if not near_buys.empty:
-            logger.debug("Near-buy names that failed BUY gate:\n%s", near_buys.to_string(index=False))
-
+# ══════════════════════════════════════════════════════════════════════════════
+# ── CHANGED: _generate_actions completely replaced with simplified logic.
+#    Only three gates: score floor, percentile rank, and score-vs-entry.
+#    No momentum / confirmation / context / overextension boolean cascades.
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     ap = params if params is not None else ACTIONPARAMS_V2
@@ -513,127 +356,84 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         out["action_sort_key_v2"] = pd.Series(dtype=float)
         return out
 
-    sb = ap["strong_buy"]
-    bu = ap["buy"]
-    ho = ap["hold"]
-    se = ap["sell"]
-    sc = ap["strong_context"]
-    wc = ap["weak_context"]
-    hm = ap["healthy_momentum"]
-    dm = ap["decent_momentum"]
-    oe = ap["overextended"]
-    cv = ap["conviction"]
+    sb = ap.get("strong_buy", {})
+    bu = ap.get("buy", {})
+    ho = ap.get("hold", {})
+    se = ap.get("sell", {})
+    cv = ap.get("conviction", {"high_pct": 0.85, "high_score": 0.75,
+                                "medium_pct": 0.55, "medium_score": 0.60})
+
+    score = out.get(
+        "scoreadjusted_v2",
+        out.get("scorecomposite_v2", pd.Series(0.0, index=out.index)),
+    ).fillna(0.0)
+    pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
+    entry = out.get(
+        "sigeffectiveentrymin_v2", pd.Series(0.50, index=out.index),
+    ).fillna(0.50)
+
+    # Thresholds from config
+    sell_floor = se.get("floor_score", 0.35)
+    sell_pct_floor = se.get("floor_percentile", 0.10)
+    sb_min_pct = sb.get("min_percentile", 0.85)
+    sb_min_score = sb.get("min_score", 0.68)
+    sb_above = sb.get("score_above_entry", 0.06)
+    bu_min_pct = bu.get("min_percentile", 0.50)
+    bu_min_score = bu.get("min_score", 0.52)
+    bu_above = bu.get("score_above_entry", 0.01)
+    ho_min_pct = ho.get("min_percentile", 0.25)
+    ho_min_score = ho.get("min_score", 0.42)
+    ho_below = ho.get("score_below_entry", 0.06)
 
     logger.info(
-        "Action params: sb_pct=%.2f sb_score=%.2f bu_pct=%.2f bu_score=%.2f "
-        "ho_pct=%.2f ho_score=%.2f sell_floor=%.2f sell_pct=%.2f "
-        "weak_ctx_breadth=%s weak_ctx_vol=%s weak_ctx_sector=%s "
-        "dm_rs=%s dm_rsi=%.0f dm_adx=%.0f",
-        sb["min_percentile"], sb["min_score"],
-        bu["min_percentile"], bu["min_score"],
-        ho["min_percentile"], ho["min_score"],
-        se["floor_score"], se["floor_percentile"],
-        wc["breadth_regimes"], wc["vol_regimes"], wc["sector_regimes"],
-        dm["allowed_rs"], dm["min_rsi"], dm["min_adx"],
+        "Simplified action thresholds: sell_floor=%.3f sell_pct=%.3f "
+        "sb_pct=%.2f sb_score=%.3f bu_pct=%.2f bu_score=%.3f "
+        "ho_pct=%.2f ho_score=%.3f",
+        sell_floor, sell_pct_floor,
+        sb_min_pct, sb_min_score,
+        bu_min_pct, bu_min_score,
+        ho_min_pct, ho_min_score,
     )
 
-    score = out.get("scoreadjusted_v2", out.get("scorecomposite_v2", pd.Series(0.0, index=out.index))).fillna(0.0)
-    pct = out.get("score_percentile_v2", pd.Series(0.0, index=out.index)).fillna(0.0)
-    entry = out.get("sigeffectiveentrymin_v2", pd.Series(0.60, index=out.index)).fillna(0.60)
-    confirmed = out.get("sigconfirmed_v2", pd.Series(0, index=out.index)).fillna(0).astype(int)
-    exit_sig = out.get("sigexit_v2", pd.Series(0, index=out.index)).fillna(0).astype(int)
-    breadth = out.get("breadthregime", pd.Series("unknown", index=out.index)).fillna("unknown")
-    vol = out.get("volregime", pd.Series("calm", index=out.index)).fillna("calm")
-    leadership = out.get("leadership_strength", pd.Series(0.0, index=out.index)).fillna(0.0)
-    rs_regime = out.get("rsregime", pd.Series("unknown", index=out.index)).fillna("unknown")
-    sector_regime = out.get("sectrsregime", pd.Series("unknown", index=out.index)).fillna("unknown")
-    rsi = out.get("rsi14", pd.Series(50.0, index=out.index)).fillna(50.0)
-    adx = out.get("adx14", pd.Series(20.0, index=out.index)).fillna(20.0)
-    relvol = out.get("relativevolume", pd.Series(1.0, index=out.index)).fillna(1.0)
-    short_ext = out.get("closevsema30pct", pd.Series(0.0, index=out.index)).fillna(0.0)
-
-    actions, reasons, convictions, sort_keys = [], [], [], []
+    actions = []
+    reasons = []
+    convictions = []
+    sort_keys = []
     action_rank = {"STRONG_BUY": 4, "BUY": 3, "HOLD": 2, "SELL": 1}
 
     for i in out.index:
-        s = float(score.loc[i]); pv = float(pct.loc[i]); e = float(entry.loc[i])
-        c = int(confirmed.loc[i]); x = int(exit_sig.loc[i])
-        b = str(breadth.loc[i]); v = str(vol.loc[i]); l = float(leadership.loc[i])
-        r = str(rs_regime.loc[i]); sr = str(sector_regime.loc[i])
-        rv = float(relvol.loc[i]); ri = float(rsi.loc[i]); ax = float(adx.loc[i])
-        ext = float(short_ext.loc[i])
+        s = float(score.loc[i])
+        pv = float(pct.loc[i])
+        e = float(entry.loc[i])
 
-        strong_context = (
-            (b in sc["breadth_regimes"] and v in sc["vol_regimes"])
-            or l >= sc["min_leadership"]
-        )
-        weak_ctx = (
-            b in wc["breadth_regimes"]
-            or v in wc["vol_regimes"]
-            or sr in wc["sector_regimes"]
-        )
-        healthy_mom = (
-            r in hm["allowed_rs"]
-            and sr not in hm.get("blocked_sector", [])
-            and ri >= hm["min_rsi"]
-            and ax >= hm["min_adx"]
-        )
-        decent_mom = (
-            r in dm["allowed_rs"]
-            and ri >= dm["min_rsi"]
-            and ax >= dm["min_adx"]
-        )
-        overext = ext >= oe["max_ema_pct"] or ri >= oe["max_rsi"]
-
-        if x == 1 and (
-            s < max(se["floor_score"], e - se["exit_score_below_entry"])
-            or pv <= se["exit_percentile_floor"]
-            or weak_ctx
-        ):
+        # ── 1. SELL: below absolute floor ─────────────────────
+        if s < sell_floor or pv <= sell_pct_floor:
             action = "SELL"
-            reason = "Exit condition active with weak relative rank or hostile regime"
+            reason = "Below sell floor"
 
-        elif s < se["floor_score"] or pv <= se["floor_percentile"]:
-            action = "SELL"
-            reason = "Bottom-ranked score in the current market set"
-
-        elif (
-            (not sb["requires_confirmation"] or c == 1)
-            and pv >= sb["min_percentile"]
-            and s >= max(sb["min_score"], e + sb["score_above_entry"])
-            and (not sb["requires_strong_context"] or strong_context)
-            and healthy_mom
-            and rv >= sb["min_rvol"]
-            and (not sb["blocks_overextended"] or not overext)
-        ):
+        # ── 2. STRONG_BUY: top tier ──────────────────────────
+        elif pv >= sb_min_pct and s >= max(sb_min_score, e + sb_above):
             action = "STRONG_BUY"
-            reason = "Top-decile score with confirmation, momentum, and supportive regime"
+            reason = "Top-tier score and percentile"
 
-        elif (
-            (not bu["requires_confirmation"] or c == 1)
-            and pv >= bu["min_percentile"]
-            and s >= max(bu["min_score"], e + bu["score_above_entry"])
-            and (not bu["requires_decent_momentum"] or decent_mom)
-            and (not bu["blocks_weak_context"] or not weak_ctx)
-        ):
+        # ── 3. BUY: above buy threshold ──────────────────────
+        elif pv >= bu_min_pct and s >= max(bu_min_score, e + bu_above):
             action = "BUY"
-            reason = "Upper-tier score with confirmation and acceptable momentum"
+            reason = "Above buy threshold"
 
-        elif (
-            pv >= ho["min_percentile"]
-            and s >= max(ho["min_score"], e - ho["score_below_entry"])
-            and (not ho["blocks_weak_context"] or not weak_ctx)
-        ):
+        # ── 4. HOLD: in hold band ────────────────────────────
+        elif pv >= ho_min_pct and s >= max(ho_min_score, e - ho_below):
             action = "HOLD"
-            reason = "Mid-ranked score worth monitoring but not strong enough to buy"
+            reason = "In hold band"
 
+        # ── 5. SELL: everything else ─────────────────────────
         else:
             action = "SELL"
-            reason = "Below hold band after percentile and regime adjustment"
+            reason = "Below hold band"
 
         conviction = (
-            "high" if (pv >= cv["high_pct"] or s >= cv["high_score"])
-            else "medium" if (pv >= cv["medium_pct"] or s >= cv["medium_score"])
+            "high" if (pv >= cv.get("high_pct", 0.85) or s >= cv.get("high_score", 0.75))
+            else "medium" if (pv >= cv.get("medium_pct", 0.55) or s >= cv.get("medium_score", 0.60))
             else "low"
         )
 
@@ -647,16 +447,24 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     out["action_reason_v2"] = reasons
     out["action_sort_key_v2"] = sort_keys
 
-    _log_action_diagnostics(out, params=ap)
+    counts = pd.Series(actions).value_counts().to_dict()
+    logger.info("Action counts (simplified): %s", counts)
 
-    sort_score_col = "scoreadjusted_v2" if "scoreadjusted_v2" in out.columns else "scorecomposite_v2"
+    sort_col = (
+        "scoreadjusted_v2"
+        if "scoreadjusted_v2" in out.columns
+        else "scorecomposite_v2"
+    )
     return out.sort_values(
-        ["action_sort_key_v2", sort_score_col], ascending=[False, False]
+        ["action_sort_key_v2", sort_col], ascending=[False, False]
     ).reset_index(drop=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# _build_review_table — UNCHANGED
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _build_review_table(action_table: pd.DataFrame, action_params: dict | None = None) -> pd.DataFrame:
-    """FIX 3 (critical): overextended thresholds from config, not hardcoded."""
     if action_table.empty:
         return pd.DataFrame()
 
@@ -709,6 +517,10 @@ def _build_review_table(action_table: pd.DataFrame, action_params: dict | None =
         logger.debug("Review table preview:\n%s", review.head(20).to_string(index=False))
     return review
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _build_selling_exhaustion_table — UNCHANGED
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], breadth_regime: str, vol_regime: str, leadership_snapshot: pd.DataFrame) -> pd.DataFrame:
     rows = []
@@ -812,6 +624,10 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
     return out.sort_values(["reversal_trigger_score", "selling_exhaustion_score", "rsi_14", "price_5d_change"], ascending=[False, False, True, True]).reset_index(drop=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# _build_skipped_table — UNCHANGED
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _build_skipped_table(skipped_rows: list[dict]) -> pd.DataFrame:
     if not skipped_rows:
         return pd.DataFrame(columns=[
@@ -826,6 +642,7 @@ def _build_skipped_table(skipped_rows: list[dict]) -> pd.DataFrame:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main pipeline entry point
+# ── CHANGED: added precomputed parameter + fast-path guards
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline_v2(
@@ -836,28 +653,29 @@ def run_pipeline_v2(
     leadership_frames: dict[str, pd.DataFrame] | None = None,
     portfolio_params: dict | None = None,
     config: dict | None = None,
+    precomputed: bool = False,                                         # ── NEW
 ) -> dict:
     if bench_df is None or bench_df.empty:
         raise ValueError("bench_df is required and cannot be empty")
 
     config = config or {}
 
-    # ── unpack ALL config blocks (critical fix 1 + moderate fixes 7–9) ────────
+    # ── unpack ALL config blocks ──────────────────────────────────────────────
     vol_regime_params  = config.get("vol_regime_params")   or config.get("VOLREGIMEPARAMS", None)
     scoring_weights    = config.get("scoring_weights")     or config.get("SCORINGWEIGHTS_V2", None)
     scoring_params     = config.get("scoring_params")      or config.get("SCORINGPARAMS_V2", None)
     signal_params      = config.get("signal_params")       or config.get("SIGNALPARAMS_V2", None)
     convergence_params = config.get("convergence_params")  or config.get("CONVERGENCEPARAMS_V2", None)
     action_params      = config.get("action_params")       or config.get("ACTIONPARAMS_V2", None)
-    breadth_params     = config.get("breadth_params")      or config.get("BREADTHPARAMS", None)       # FIX 8
-    rotation_params    = config.get("rotation_params")     or config.get("ROTATIONPARAMS", None)      # FIX 9
+    breadth_params     = config.get("breadth_params")      or config.get("BREADTHPARAMS", None)
+    rotation_params    = config.get("rotation_params")     or config.get("ROTATIONPARAMS", None)
 
     logger.info(
-        "run_pipeline_v2 start: market=%s tradable=%d leadership=%d",
-        market, len(tradable_frames), len(leadership_frames or {}),
+        "run_pipeline_v2 start: market=%s tradable=%d leadership=%d precomputed=%s",
+        market, len(tradable_frames), len(leadership_frames or {}), precomputed,
     )
 
-    # ── A. volatility regime from benchmark (FIX 1: config-driven) ────────────
+    # ── A. volatility regime from benchmark (always runs — single ticker) ─────
     regime_df = classify_volatility_regime(bench_df, params=vol_regime_params)
 
     # ── B. merge all symbol frames into one working universe ──────────────────
@@ -874,7 +692,7 @@ def run_pipeline_v2(
         len(set(tradable_frames) & set(leadership_frames or {})),
     )
 
-    # ── C. BREADTH (FIX 8: config-driven) ─────────────────────────────────────
+    # ── C. BREADTH (always runs — lightweight aggregation) ────────────────────
     breadth_computed_df = compute_breadth(all_symbol_frames, params=breadth_params)
 
     if (
@@ -905,8 +723,12 @@ def run_pipeline_v2(
     )
 
     # ── D. CROSS-SECTIONAL RS ─────────────────────────────────────────────────
-    all_symbol_frames = compute_rs_zscores(all_symbol_frames, bench_df)
-    all_symbol_frames = enrich_rs_regimes(all_symbol_frames)
+    # ── CHANGED: skip when precomputed (already in frames from engine) ────────
+    if not precomputed:
+        all_symbol_frames = compute_rs_zscores(all_symbol_frames, bench_df)
+        all_symbol_frames = enrich_rs_regimes(all_symbol_frames)
+    else:
+        logger.info("Skipping RS z-score computation (precomputed=True)")
 
     tradable_enriched = {
         k: all_symbol_frames[k]
@@ -919,7 +741,7 @@ def run_pipeline_v2(
         if k in all_symbol_frames
     }
 
-    # ── D2. SECTOR ROTATION (FIX 9: config-driven) ───────────────────────────
+    # ── D2. SECTOR ROTATION (always runs — reads RS from frames) ─────────────
     rotation_result = compute_sector_rotation(
         all_symbol_frames,
         bench_df,
@@ -931,9 +753,14 @@ def run_pipeline_v2(
     sector_summary = rotation_result["sector_summary"]
 
     # ── E. leadership snapshot ────────────────────────────────────────────────
-    leadership_snapshot = _normalize_leadership(
-        _build_leadership_snapshot(leadership_enriched)
-    )
+    # ── CHANGED: skip expensive leadership build in precomputed mode ──────────
+    if precomputed:
+        leadership_snapshot = pd.DataFrame()
+        logger.info("Skipping leadership snapshot build (precomputed=True)")
+    else:
+        leadership_snapshot = _normalize_leadership(
+            _build_leadership_snapshot(leadership_enriched)
+        )
 
     last_vol = regime_df.iloc[-1]
 
@@ -956,7 +783,7 @@ def run_pipeline_v2(
         lagging_sectors or ["none"],
     )
 
-    # ── rotation recommendation mapping (FIX 7: from convergence config) ──────
+    # ── rotation recommendation mapping ───────────────────────────────────────
     _cp = convergence_params if convergence_params is not None else CONVERGENCEPARAMS_V2
     _sect_to_rec = _cp.get("rotation_rec_map", {
         "leading":   "STRONGBUY",
@@ -981,12 +808,17 @@ def run_pipeline_v2(
             logger.debug("Skipping empty tradable frame for %s", ticker)
             continue
 
-        prepared = _prepare_frame(df)
-        row = prepared.iloc[-1].to_dict()
+        # ── CHANGED: skip _prepare_frame when precomputed ─────────────────────
+        if precomputed:
+            row = df.iloc[-1].to_dict()
+        else:
+            prepared = _prepare_frame(df)
+            row = prepared.iloc[-1].to_dict()
+
         row["ticker"] = ticker
         row["instrument_type"] = _instrument_type(ticker)
 
-        # ── attach pipeline-level context ─────────────────────────────────────
+        # ── attach pipeline-level context (UNCHANGED) ─────────────────────────
         _row_vol = row.get("volregime")
         if _row_vol is None or str(_row_vol).lower() in ("unknown", "nan", ""):
             row["volregime"] = last_vol.get("volregime", "calm")
@@ -1016,7 +848,6 @@ def run_pipeline_v2(
         if _row_sr is None or str(_row_sr).lower() in ("unknown", "nan", ""):
             row["sectrsregime"] = ticker_regimes.get(ticker, "unknown")
 
-        # ── rotation recommendation (FIX 7: from config map) ──────────────────
         _row_rr = row.get("rotationrec")
         if _row_rr is None or str(_row_rr).lower() in ("unknown", "nan", ""):
             row["rotationrec"] = _sect_to_rec.get(
@@ -1079,7 +910,9 @@ def run_pipeline_v2(
     logger.info("Latest tradable snapshot rows=%d skipped=%d", len(latest), len(skipped_table))
 
     if not latest.empty:
-        latest["leadership_strength"] = latest.apply(lambda row: _lookup_group_strength(row, leadership_snapshot), axis=1)
+        latest["leadership_strength"] = latest.apply(
+            lambda row: _lookup_group_strength(row, leadership_snapshot), axis=1
+        )
         latest = ensure_columns(latest)
         latest = annotate_scoreability(latest)
         logger.info(
@@ -1121,7 +954,6 @@ def run_pipeline_v2(
             + _lead_w * scored.get("leadership_strength", 0.0)
         ).clip(0, 1)
 
-        # FIX 13: use config entry threshold for diagnostics
         _sp = signal_params if signal_params is not None else SIGNALPARAMS_V2
         _diag_entry = _sp.get("base_entry_threshold", 0.55)
         logger.info(
@@ -1161,29 +993,24 @@ def run_pipeline_v2(
             cols = [c for c in ["ticker", "action_v2", "conviction_v2", "scorecomposite_v2", "scoreadjusted_v2", "score_percentile_v2", "rsi14", "adx14", "relativevolume", "sectrsregime", "rotationrec", "convergence_label_v2", "action_reason_v2"] if c in action_table.columns]
             logger.debug("Action table preview:\n%s", action_table[cols].head(50).to_string(index=False))
 
-    # FIX 3 (critical): pass action_params to review table
-    review_table = _build_review_table(action_table, action_params=action_params) if not action_table.empty else pd.DataFrame()
-
-    selling_exhaustion_table = _build_selling_exhaustion_table(
-        tradable_enriched,
-        breadth_info.get("breadth_regime", "unknown"),
-        last_vol.get("volregime", "unknown"),
-        leadership_snapshot,
-    )
-
-    # FIX 2 (critical): forward ALL portfolio params
-    params = portfolio_params or {}
-    portfolio = (
-        build_portfolio_v2(
-            action_table,
-            max_positions=params.get("max_positions", DEFAULT_MAX_POSITIONS),
-            max_sector_weight=params.get("max_sector_weight", DEFAULT_MAX_SECTOR_WEIGHT),
-            max_theme_names=params.get("max_theme_names", DEFAULT_MAX_THEME_NAMES),
-            max_single_weight=params.get("max_single_weight", DEFAULT_MAX_SINGLE_WEIGHT),
-            min_weight=params.get("min_weight", DEFAULT_MIN_WEIGHT),
+    # ── CHANGED: skip review + exhaustion tables in precomputed mode ──────────
+    if precomputed:
+        review_table = pd.DataFrame()
+        selling_exhaustion_table = pd.DataFrame()
+        logger.info("Skipping review_table + selling_exhaustion_table (precomputed=True)")
+    else:
+        review_table = _build_review_table(action_table, action_params=action_params) if not action_table.empty else pd.DataFrame()
+        selling_exhaustion_table = _build_selling_exhaustion_table(
+            tradable_enriched,
+            breadth_info.get("breadth_regime", "unknown"),
+            last_vol.get("volregime", "unknown"),
+            leadership_snapshot,
         )
-        if not action_table.empty
-        else {
+
+    # ── CHANGED: skip portfolio construction in precomputed mode ──────────────
+    #    (backtest engine only needs action_table to extract BUY/SELL signals)
+    if precomputed:
+        portfolio = {
             "selected": pd.DataFrame(),
             "meta": {
                 "selected_count": 0,
@@ -1193,7 +1020,30 @@ def run_pipeline_v2(
                 "vol_regime": last_vol.get("volregime", "unknown"),
             },
         }
-    )
+        logger.info("Skipping portfolio construction (precomputed=True)")
+    else:
+        params = portfolio_params or {}
+        portfolio = (
+            build_portfolio_v2(
+                action_table,
+                max_positions=params.get("max_positions", DEFAULT_MAX_POSITIONS),
+                max_sector_weight=params.get("max_sector_weight", DEFAULT_MAX_SECTOR_WEIGHT),
+                max_theme_names=params.get("max_theme_names", DEFAULT_MAX_THEME_NAMES),
+                max_single_weight=params.get("max_single_weight", DEFAULT_MAX_SINGLE_WEIGHT),
+                min_weight=params.get("min_weight", DEFAULT_MIN_WEIGHT),
+            )
+            if not action_table.empty
+            else {
+                "selected": pd.DataFrame(),
+                "meta": {
+                    "selected_count": 0,
+                    "candidate_count": 0,
+                    "target_exposure": 0.0,
+                    "breadth_regime": breadth_info.get("breadth_regime", "unknown"),
+                    "vol_regime": last_vol.get("volregime", "unknown"),
+                },
+            }
+        )
 
     logger.info(
         "Pipeline skip summary: scored=%d skipped=%d",

@@ -22,8 +22,8 @@
 
 ingest_cash.py [-h] [--market {us,hk,in,all}] [--period PERIOD] [--days DAYS] [--source {yfinance,ibkr}] [--full] [--backfill]
 
-python src/ingest_cash.py --market all --period 20y
-python src/ingest_cash.py --market in --period 5d
+python src/ingest_cash.py --market all --period 20y 
+python src/ingest_cash.py --market in --period 5d --source ibkr
 python src/db/load_db.py --market all --type cash
 
 python src/ingest_options.py --market us      
@@ -69,9 +69,7 @@ python run_bounce_scan.py --market US
 python -m scripts.run_strategy full --market US \
     --holdings NVDA,CRWD,CEG,LMT,VST -v
 
-# Backtesting
-Backtesting
-The backtest/ module enables testing any strategy variant over up to 20 years of historical data.
+# Backtesting The backtest/ module enables testing any strategy variant over up to 20 years of historical data.
 
 bash
 # Download 20 years of data
@@ -100,3 +98,22 @@ python -m backtest.runner --strategy in_low_churn --universe in
 # ── List what's available ─────────────────────────────────
 python -m backtest.runner --list --universe hk                 # HK strategies
 python -m backtest.runner --list --universe in              # India strategies
+
+
+
+Usage:
+    python run_bounce_scan.py                    # default market (US)
+    python run_bounce_scan.py --market IN        # Indian market
+    python run_bounce_scan.py --market US --top 15
+    python run_bounce_scan.py --csv              # also save to CSV
+    python run_bounce_scan.py --relaxed          # relax filters for more hits
+
+
+python scripts/run_bounce_scan.py --market US --csv
+
+Usage:
+    python src/db/schema.py create          # Create all tables
+    python src/db/schema.py drop --yes      # Drop all tables (confirm required)
+    python src/db/schema.py recreate --yes  # Drop + Create
+    python src/db/schema.py status          # Show which tables exist
+    python src/db/schema.py drop-options --yes  # Drop only options tables
