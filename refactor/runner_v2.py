@@ -28,6 +28,20 @@ try:
 except ImportError:
     _HAS_SIGNAL_WRITER = False
 
+# ── HTML REPORT: optional import ──────────────────────────────
+try:
+    from utils.html_report import build_html_report, save_html_report
+    _HAS_HTML_REPORT = True
+except ImportError:
+    _HAS_HTML_REPORT = False
+
+# ── EMAIL: optional import ────────────────────────────────────
+try:
+    from utils.email_report import send_report_email
+    _HAS_EMAIL = True
+except ImportError:
+    _HAS_EMAIL = False
+
 
 logger = logging.getLogger("refactor.runner_v2")
 
@@ -114,7 +128,6 @@ def _box_header(emoji: str, title: str) -> list[str]:
     """Produce a ╔═══╗ / ║ ... ║ / ╚═══╝ header block."""
     inner = _BOX_WIDTH - 2
     content = f" {emoji}  {title} "
-    # pad to inner width (emoji display width varies; best-effort)
     padded = content + " " * max(0, inner - len(content))
     return [
         "╔" + "═" * inner + "╗",
@@ -316,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--end-date", type=_parse_iso_date, default=None, help="Inclusive end date YYYY-MM-DD")
     p.add_argument("--parquet-path", default=None, help="Optional explicit parquet file path")
     p.add_argument("--print-report", action="store_true", help="Print plain-text v2 report to stdout")
+    p.add_argument("--no-email", action="store_true", help="Skip emailing the HTML report")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -807,25 +821,14 @@ def _emit_v2_signals(
 # ═══════════════════════════════════════════════════════════════
 
 def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
-    """
-    Build formatted display lines for sector rotation using the
-    blended (RRG + ETF composite) sector_summary DataFrame.
-
-    Falls back to the legacy rotation report section if sector_summary
-    is not available (i.e. rotation_v2 not yet integrated into pipeline).
-
-    Returns list of lines (without trailing newlines).
-    """
     lines: list[str] = []
     sector_summary: pd.DataFrame = result.get("sector_summary", pd.DataFrame())
 
-    # ── Blended sector rotation (new) ─────────────────────────────────────
     if isinstance(sector_summary, pd.DataFrame) and not sector_summary.empty:
         lines.append("")
         lines.extend(_box_header("📊", "SECTOR ROTATION — Blended RRG + ETF Composite"))
         lines.append("")
 
-        # ── Quadrant summary ──────────────────────────────────────────────
         regime_groups: dict[str, list[str]] = {}
         for _, row in sector_summary.iterrows():
             r = str(row.get("regime", "unknown"))
@@ -842,7 +845,6 @@ def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
 
         lines.append("")
 
-        # ── Column availability ───────────────────────────────────────────
         has_blended    = "blended_score"   in sector_summary.columns
         has_rs_level   = "rs_level"        in sector_summary.columns
         has_rs_mom     = "rs_mom"          in sector_summary.columns
@@ -851,7 +853,6 @@ def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
         has_excess     = "excess_20d"      in sector_summary.columns
         has_rrg_quad   = "rrg_quadrant"    in sector_summary.columns
 
-        # ── Table header ──────────────────────────────────────────────────
         hdr = f"  {'#':>4}  {'Sector':<25} {'ETF':<6}  {'Regime':<16}"
         if has_blended:
             hdr += f"  {'Blended':>22}"
@@ -871,12 +872,10 @@ def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
         lines.append(hdr)
         lines.append("  " + "━" * (len(hdr)))
 
-        # Max blended for bar scaling (with headroom)
         max_blended = 0.80
         if has_blended and not sector_summary["blended_score"].empty:
             max_blended = max(0.80, sector_summary["blended_score"].max() * 1.15)
 
-        # ── Table rows ────────────────────────────────────────────────────
         for i, (_, row) in enumerate(sector_summary.iterrows(), 1):
             sector_name = str(row.get("sector", "?"))
             etf_ticker  = str(row.get("etf", "?"))
@@ -909,7 +908,6 @@ def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
         lines.append("")
         return lines
 
-    # ── Fallback: legacy rotation from report dict ────────────────────────
     report = result.get("report_v2", {})
     rotation_section = report.get("rotation", {})
     if not rotation_section.get("available"):
@@ -934,7 +932,6 @@ def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
             + (", ".join(sectors) if sectors else "—")
         )
 
-    # If there's a sector detail list in the report, show it
     sector_detail = rotation_section.get("sector_detail", [])
     if sector_detail:
         lines.append("")
@@ -964,17 +961,6 @@ def _display_sector_rotation_v2(result: dict[str, Any]) -> list[str]:
 # ═══════════════════════════════════════════════════════════════
 
 def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str]:
-    """
-    Build formatted display lines for the ETF universe ranking.
-
-    Reads result['etf_ranking'] (a DataFrame produced by
-    rotation_v2.score_etf_universe).  Shows rotation ETFs and
-    broad-market ETFs, skips regional/FI by default.
-
-    Detects stale/placeholder columns and flags them with †.
-
-    Returns list of lines (without trailing newlines).
-    """
     lines: list[str] = []
     etf_ranking: pd.DataFrame = result.get("etf_ranking", pd.DataFrame())
 
@@ -989,7 +975,6 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
     lines.extend(_box_header("📈", "ETF UNIVERSE RANKING — by Composite Score"))
     lines.append("")
 
-    # ── Summary stats ─────────────────────────────────────────────────────
     comp_col = "etf_composite"
     n_total = len(etf_ranking)
     mean_sc = etf_ranking[comp_col].mean() if comp_col in etf_ranking.columns else 0.0
@@ -1006,7 +991,6 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
     )
     lines.append("")
 
-    # ── Stale column detection ────────────────────────────────────────────
     _CHECK_COLS: dict[str, str] = {
         "sub_trend":          "Trend",
         "sub_participation":  "Part",
@@ -1018,7 +1002,6 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
     stale_labels: set[str] = {_CHECK_COLS[c] for c in stale_internal}
 
     if stale_internal:
-        # Build "Trend=0.344, RSI=50.0, ..." summary of the stuck values
         stale_vals_parts: list[str] = []
         for col in stale_internal:
             if col in etf_ranking.columns:
@@ -1043,7 +1026,6 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
         lines.append("  └" + "─" * 95)
         lines.append("")
 
-    # ── Column availability ───────────────────────────────────────────────
     has_theme       = "theme"              in etf_ranking.columns
     has_sector      = "parent_sector"      in etf_ranking.columns
     has_composite   = comp_col             in etf_ranking.columns
@@ -1059,10 +1041,8 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
     has_is_regional = "is_regional"        in etf_ranking.columns
 
     def _clbl(display_name: str, internal_col: str) -> str:
-        """Append † to column label if that column is stale."""
         return display_name + "†" if internal_col in stale_internal else display_name
 
-    # ── Header row ────────────────────────────────────────────────────────
     hdr = f"  {'#':>4}  {'Ticker':<9}"
     if has_theme:
         hdr += f" {'Theme':<22}"
@@ -1088,7 +1068,6 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
     lines.append(hdr)
     lines.append("  " + "━" * len(hdr))
 
-    # ── Filter and display ────────────────────────────────────────────────
     display_df = etf_ranking.copy()
     if has_is_regional:
         display_df = display_df[~display_df["is_regional"]].copy()
@@ -1101,12 +1080,11 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
     for i, (_, row) in enumerate(display_df.iterrows(), 1):
         ticker = str(row.get("ticker", "?"))
 
-        # Type marker
         marker = " "
         if has_is_sector and row.get("is_sector_etf"):
-            marker = "●"   # sector ETF
+            marker = "●"
         elif has_is_broad and row.get("is_broad"):
-            marker = "○"   # broad market
+            marker = "○"
 
         rl = f"  {i:>4}  {ticker:<6}{marker} "
 
@@ -1138,7 +1116,6 @@ def _display_etf_ranking(result: dict[str, Any], max_rows: int = 40) -> list[str
 
         lines.append(rl)
 
-    # ── Footer / legend ───────────────────────────────────────────────────
     lines.append("")
     legend_parts = ["  (● = sector ETF   ○ = broad market)"]
     if stale_labels:
@@ -1183,12 +1160,10 @@ def run_strategy_v2(
     if missing_leadership:
         logger.info("Missing leadership symbols in parquet: count=%d sample=%s", len(missing_leadership), missing_leadership[:25])
 
-    # ── Extract thematic ETF frames ───────────────────────────────────────
     thematic_frames, available_thematic_map = _extract_thematic_frames(
         universe_frames, market,
     )
 
-    # ── Build portfolio params from market config ─────────────────────────
     portfolio_params = {
         "max_positions": cfg.get("max_positions", 8),
         "max_sector_weight": cfg.get("max_sector_weight", 0.35),
@@ -1197,7 +1172,6 @@ def run_strategy_v2(
         "min_weight": cfg.get("min_weight", 0.04),
     }
 
-    # ── Inject thematic data into config for pipeline ─────────────────────
     effective_config = dict(config or {})
     effective_config["thematic_etf_frames"] = thematic_frames
     effective_config["thematic_etf_map"] = available_thematic_map
@@ -1215,11 +1189,9 @@ def run_strategy_v2(
     result["tradable_universe"] = sorted(tradable)
     result["leadership_universe"] = sorted(leadership)
 
-    # ── Persist thematic metadata in result for report / signals ──────────
     result["thematic_etf_frames"] = thematic_frames
     result["thematic_etf_map"] = available_thematic_map
 
-    # ── Log skipped names ─────────────────────────────────────────────────
     skipped_table = result.get("skipped_table", pd.DataFrame())
     if isinstance(skipped_table, pd.DataFrame) and not skipped_table.empty:
         sample_cols = [c for c in ["ticker", "missing_critical_fields_v2"] if c in skipped_table.columns]
@@ -1229,7 +1201,6 @@ def run_strategy_v2(
             skipped_table[sample_cols].head(20).to_dict(orient="records") if sample_cols else skipped_table.head(20).to_dict(orient="records"),
         )
 
-    # ── Log selling exhaustion ────────────────────────────────────────────
     exhaustion_table = result.get("selling_exhaustion_table", pd.DataFrame())
     if isinstance(exhaustion_table, pd.DataFrame) and not exhaustion_table.empty:
         logger.info(
@@ -1267,18 +1238,14 @@ def run_strategy_v2(
     else:
         logger.info("Selling exhaustion: no candidates detected")
 
-    # ── Build report ──────────────────────────────────────────────────────
     report = build_report_v2(result)
     result["report_v2"] = report
     result["report_text_v2"] = to_text_v2(report)
 
-    # ── Portfolio selection gap diagnostics ────────────────────────────────
     _log_portfolio_selection_gaps(result)
 
-    # ── SIGNAL WRITER: emit signals after report is built ─────────────────
     _emit_v2_signals(market, result, bench_df)
 
-    # ── Summary logging (read from nested report structure) ───────────────
     header = report.get("header", {})
     portfolio_section = report.get("portfolio", {})
     action_summary = report.get("actions", {})
@@ -1296,7 +1263,6 @@ def run_strategy_v2(
         exhaustion_section.get("count", 0),
     )
 
-    # ── Rotation summary (legacy log) ─────────────────────────────────────
     if rotation_section.get("available"):
         qc = rotation_section.get("quadrant_counts", {})
         parts = []
@@ -1307,7 +1273,6 @@ def run_strategy_v2(
             parts.append(f"{q}={count}({','.join(sectors[:3])})")
         logger.info("Sector rotation: %s", "  ".join(parts))
 
-    # ── Thematic rotation summary ─────────────────────────────────────────
     thematic_rotation = report.get("thematic_rotation", {})
     if thematic_rotation.get("available"):
         tqc = thematic_rotation.get("quadrant_counts", {})
@@ -1326,7 +1291,6 @@ def run_strategy_v2(
             list(available_thematic_map.keys()),
         )
 
-    # ── Portfolio rotation exposure ───────────────────────────────────────
     rot_exp = portfolio_section.get("rotation_exposure", [])
     if rot_exp:
         exp_parts = [
@@ -1335,9 +1299,6 @@ def run_strategy_v2(
         ]
         logger.info("Portfolio rotation exposure: %s", "  ".join(exp_parts))
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  SECTOR ROTATION + ETF RANKING DISPLAY
-    # ══════════════════════════════════════════════════════════════════════
     rotation_lines = _display_sector_rotation_v2(result)
     etf_lines = _display_etf_ranking(result, max_rows=40)
 
@@ -1345,11 +1306,14 @@ def run_strategy_v2(
     if all_display_lines:
         display_block = "\n".join(all_display_lines)
         logger.info("Sector Rotation & ETF Ranking:\n%s", display_block)
-        # Also store in result for downstream consumers (HTML report, etc.)
         result["sector_rotation_display"] = display_block
 
     return result
 
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
@@ -1367,6 +1331,18 @@ def main(argv=None):
         else:
             logger.info("Signal writer: not available (install signal_writer.py for combined reports)")
 
+        if _HAS_HTML_REPORT:
+            logger.info("HTML report: enabled")
+        else:
+            logger.info("HTML report: not available (install utils/html_report.py)")
+
+        if _HAS_EMAIL and not args.no_email:
+            logger.info("Email report: enabled")
+        elif args.no_email:
+            logger.info("Email report: disabled via --no-email")
+        else:
+            logger.info("Email report: not available (install utils/email_report.py)")
+
         universe_frames, bench_df, breadth_df = load_market_data_v2(
             market=args.market,
             start_date=args.start_date,
@@ -1381,8 +1357,59 @@ def main(argv=None):
             breadth_df=breadth_df,
         )
 
+        # ── Console summary (existing) ────────────────────────────────
         run_log = RunLogger(f"runner_v2_{args.market}")
         print_run_summary(result, args.market, run_log)
+
+        # ── HTML Report: build, save, print link ──────────────────────
+        html_path = None
+        html_content = None
+        if _HAS_HTML_REPORT:
+            try:
+                html_content = build_html_report(result, args.market)
+                html_path = save_html_report(html_content, args.market)
+                logger.info("HTML report: %s", html_path)
+
+                # Print a clickable file-URL
+                try:
+                    file_url = html_path.as_uri()
+                except Exception:
+                    file_url = f"file:///{html_path.as_posix()}"
+
+                print(f"\n{'─' * 72}")
+                print(f"📊  HTML Report saved → {html_path}")
+                print(f"    Open in browser:    {file_url}")
+            except Exception as exc:
+                logger.error("HTML report generation failed: %s", exc)
+        else:
+            print(f"\n{'─' * 72}")
+            print("📊  HTML report: skipped (utils/html_report.py not found)")
+
+        # ── Email Report ──────────────────────────────────────────────
+        if _HAS_EMAIL and not args.no_email and html_content:
+            try:
+                run_date = _resolve_run_date(bench_df, result)
+                subject = (
+                    f"Smart Money Rotation — {args.market.upper()} — {run_date}"
+                )
+                ok = send_report_email(
+                    html_content=html_content,
+                    subject=subject,
+                    html_path=html_path,
+                )
+                if ok:
+                    print(f"📧  Report emailed successfully")
+                else:
+                    print(f"📧  Email not sent (check common/credential.py)")
+            except Exception as exc:
+                logger.error("Email sending failed: %s", exc)
+                print(f"📧  Email failed: {exc}")
+        elif args.no_email:
+            print(f"📧  Email skipped (--no-email)")
+        else:
+            print(f"📧  Email not available (install utils/email_report.py + common/credential.py)")
+
+        print(f"{'─' * 72}\n")
 
         logger.info("runner_v2 completed")
 

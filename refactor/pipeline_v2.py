@@ -87,6 +87,15 @@ OPTIONAL_SCORE_COLUMNS_V2 = (
     "dispersion",
 )
 
+# ── Vol regime: string label → numeric risk score (0=calm … 1=chaotic) ──  # ← NEW
+_VOL_REGIME_RISK_MAP: dict[str, float] = {
+    "calm":     0.10,
+    "moderate": 0.35,
+    "elevated": 0.60,
+    "volatile": 0.80,
+    "chaotic":  1.00,
+}
+
 
 def _is_missing_value(value) -> bool:
     if value is None:
@@ -97,24 +106,52 @@ def _is_missing_value(value) -> bool:
         return False
 
 
+def _safe_float_or_none(val) -> float | None:                               # ← NEW helper
+    """Convert to float; return None on failure or NaN."""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return None if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
 def _classify_breadth_regime(breadth_df: pd.DataFrame | None) -> dict:
+    """Extract breadth context from the last row of the breadth DataFrame."""  # ← FIXED: enriched
     if breadth_df is None or breadth_df.empty:
         return {
             "breadth_regime": "unknown",
             "breadthscore": None,
             "dispersion20": None,
             "dispersion": None,
+            "above_sma50_pct": None,                                         # ← NEW
+            "above_sma200_pct": None,                                        # ← NEW
+            "advancing_pct": None,                                           # ← NEW
+            "net_highs_pct": None,                                           # ← NEW
         }
     row = breadth_df.iloc[-1]
     regime = row.get("breadthregime", row.get("breadth_regime", "unknown"))
     score = row.get("breadthscore", row.get("breadth_score", None))
     disp20 = row.get("dispersion20", None)
     disp = row.get("dispersion_daily", row.get("dispersion", None))
+    above_sma50 = row.get("above_sma50_pct", row.get("pct_above_sma50",     # ← NEW
+                  row.get("above_sma50", None)))
+    above_sma200 = row.get("above_sma200_pct", row.get("pct_above_sma200",  # ← NEW
+                   row.get("above_sma200", None)))
+    advancing = row.get("advancing_pct", row.get("pct_advancing",            # ← NEW
+                row.get("advancing", None)))
+    net_highs = row.get("net_highs_pct", row.get("net_new_highs_pct",       # ← NEW
+                row.get("net_highs", None)))
     return {
         "breadth_regime": regime,
         "breadthscore": score,
         "dispersion20": disp20,
         "dispersion": disp,
+        "above_sma50_pct": _safe_float_or_none(above_sma50),                # ← NEW
+        "above_sma200_pct": _safe_float_or_none(above_sma200),              # ← NEW
+        "advancing_pct": _safe_float_or_none(advancing),                     # ← NEW
+        "net_highs_pct": _safe_float_or_none(net_highs),                     # ← NEW
     }
 
 
@@ -789,15 +826,24 @@ def run_pipeline_v2(
             "breadthscore": None,
             "dispersion20": None,
             "dispersion": None,
+            "above_sma50_pct": None,
+            "above_sma200_pct": None,
+            "advancing_pct": None,
+            "net_highs_pct": None,
         }
         breadth_source = "none"
 
     logger.info(
-        "Breadth context (source=%s): regime=%s score=%s dispersion20=%s",
+        "Breadth context (source=%s): regime=%s score=%s dispersion20=%s "
+        "above_sma50=%s above_sma200=%s advancing=%s net_highs=%s",           # ← FIXED: richer log
         breadth_source,
         breadth_info.get("breadth_regime", "unknown"),
         breadth_info.get("breadthscore"),
         breadth_info.get("dispersion20"),
+        breadth_info.get("above_sma50_pct"),
+        breadth_info.get("above_sma200_pct"),
+        breadth_info.get("advancing_pct"),
+        breadth_info.get("net_highs_pct"),
     )
 
     # ── D. CROSS-SECTIONAL RS ─────────────────────────────────────────────────
@@ -849,12 +895,22 @@ def run_pipeline_v2(
         sector_summary.loc[sector_summary["regime"] == "lagging", "sector"].tolist()
         if not sector_summary.empty else []
     )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── FIXED: derive vol regime score from label if raw score is 0.0 ────── # ← NEW
+    # classify_volatility_regime may produce volregimescore=0.0 as a valid
+    # value for "calm", but this looks like "missing" in reports and collapses
+    # the vol dimension.  Derive a small positive score from the label so
+    # that the scoring formula and display both work meaningfully.
+    # ══════════════════════════════════════════════════════════════════════════
+    _vol_regime_label = str(last_vol.get("volregime", "unknown")).lower().strip()
+
     logger.info(
         "Regime context: breadth=%s breadthscore=%s vol=%s volscore=%s "
         "leading_sectors=%s lagging_sectors=%s",
         breadth_info.get("breadth_regime", "unknown"),
         breadth_info.get("breadthscore"),
-        last_vol.get("volregime", "unknown"),
+        _vol_regime_label,
         last_vol.get("volregimescore", None),
         leading_sectors or ["none"],
         lagging_sectors or ["none"],
@@ -990,6 +1046,24 @@ def run_pipeline_v2(
             lambda row: _lookup_group_strength(row, leadership_snapshot), axis=1
         )
         latest = ensure_columns(latest)
+
+        # ── FIXED: re-stamp breadth context after ensure_columns ──────────  # ← NEW
+        # ensure_columns may add dispersion20/dispersion as NaN defaults,
+        # overwriting the values we stamped in the per-symbol loop.
+        _bi_d20 = breadth_info.get("dispersion20")
+        if _bi_d20 is not None and not (isinstance(_bi_d20, float) and math.isnan(_bi_d20)):
+            if "dispersion20" in latest.columns:
+                latest["dispersion20"] = latest["dispersion20"].fillna(_bi_d20)
+            else:
+                latest["dispersion20"] = _bi_d20
+        _bi_d = breadth_info.get("dispersion")
+        if _bi_d is not None and not (isinstance(_bi_d, float) and math.isnan(_bi_d)):
+            if "dispersion" in latest.columns:
+                latest["dispersion"] = latest["dispersion"].fillna(_bi_d)
+            else:
+                latest["dispersion"] = _bi_d
+        # ── END re-stamp ──────────────────────────────────────────────────
+
         latest = annotate_scoreability(latest)
         logger.info(
             "Latest snapshot diagnostics: avg_rsi14=%.2f avg_adx14=%.2f avg_rvol=%.2f "
@@ -1025,11 +1099,7 @@ def run_pipeline_v2(
             logger.debug("Latest snapshot preview:\n%s", latest[cols].head(30).to_string(index=False))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ── CHANGED: extract market-level scalars for scoreregime ─────────────────
-    # breadth_info["breadthscore"] and last_vol["volregimescore"] are
-    # single scalars for the most recent date.  Passing them as kwargs
-    # prevents compute_composite_v2 from reading the per-row columns
-    # (which are almost always the ensure_columns defaults of 0.5 / 0.0).
+    # ── Extract market-level scalars for scoreregime ──────────────────────────
     # ══════════════════════════════════════════════════════════════════════════
     _market_breadth_score: float | None = None
     _raw_breadth = breadth_info.get("breadthscore")
@@ -1051,10 +1121,39 @@ def run_pipeline_v2(
         except (TypeError, ValueError):
             _market_vol_score = None
 
+    # ── FIXED: derive vol score from label when raw score is 0.0 or None ──  # ← NEW
+    if _market_vol_score is None or _market_vol_score == 0.0:
+        _derived = _VOL_REGIME_RISK_MAP.get(_vol_regime_label)
+        if _derived is not None:
+            logger.info(
+                "Vol regime score fallback: raw=%s label=%s → derived=%.4f",
+                _market_vol_score, _vol_regime_label, _derived,
+            )
+            _market_vol_score = _derived
+        elif _market_vol_score is None:
+            _market_vol_score = 0.35  # neutral default
+            logger.info(
+                "Vol regime score fallback: raw=None label=%s → neutral=0.35",
+                _vol_regime_label,
+            )
+    # ── END vol score fix ─────────────────────────────────────────────────
+
+    # ── Build vol_info dict for report rendering ──────────────────────────  # ← NEW
+    _rv20d = last_vol.get("realizedvol20d", last_vol.get("realized_vol_20d"))
+    _rv20d_f = _safe_float_or_none(_rv20d)
+    vol_info = {
+        "vol_regime": _vol_regime_label,
+        "vol_regime_score": _market_vol_score,
+        "vol_favorability": max(0.10, 0.70 - 0.60 * (_market_vol_score or 0.35)),
+        "realized_vol_20d": _rv20d_f,
+    }
+
     logger.info(
-        "Market-level scores for composite: breadth_score=%s vol_regime_score=%s",
+        "Market-level scores for composite: breadth_score=%s vol_regime_score=%s "
+        "vol_favorability=%.4f",
         f"{_market_breadth_score:.4f}" if _market_breadth_score is not None else "None",
         f"{_market_vol_score:.4f}" if _market_vol_score is not None else "None",
+        vol_info["vol_favorability"],
     )
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1063,8 +1162,8 @@ def run_pipeline_v2(
             latest,
             weights=scoring_weights,
             params=scoring_params,
-            market_breadth_score=_market_breadth_score,        # ← NEW
-            market_vol_regime_score=_market_vol_score,         # ← NEW
+            market_breadth_score=_market_breadth_score,
+            market_vol_regime_score=_market_vol_score,
         )
         if not latest.empty
         else pd.DataFrame()
@@ -1106,6 +1205,7 @@ def run_pipeline_v2(
                 "scoreregime", "scorerotation", "scorepenalty",
                 "scorecomposite_v2",
                 "breadthscore", "volregimescore",
+                "volfavorability",                                            # ← NEW
                 "rsi14", "adx14", "relativevolume", "rszscore",
             ] if c in scored.columns]
         ].copy()
@@ -1243,6 +1343,7 @@ def run_pipeline_v2(
         "regime_df": regime_df,
         "breadth_info": breadth_info,
         "breadth_df": breadth_computed_df,
+        "vol_info": vol_info,                                                # ← NEW
         "sector_summary": sector_summary,
         "sector_regimes": sector_regimes,
         "etf_ranking": etf_ranking,

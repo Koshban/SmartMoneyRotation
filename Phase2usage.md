@@ -44,7 +44,7 @@ python refactor/runner_v2.py --market US --start-date 2024-06-01 --end-date 2025
 # ── Custom Data Path ─────────────────────────────────────────────
 
 # Point to a specific parquet file
-python refactor/runner_v2.py --market US --parquet-path data/us_cash.parquet --print-report
+python refactor/runner_v2.py --market US --parquet-path data/us_cash.parquet
 
 # ── Other Markets ────────────────────────────────────────────────
 
@@ -52,23 +52,17 @@ python refactor/runner_v2.py --market US --parquet-path data/us_cash.parquet --p
 python refactor.runner_v2.py --market HK --print-report -v
 
 # India with date range
-python refactor.runner_v2.py --market IN --start-date 2024-01-01 --end-date 2025-04-25 --print-report -v
+python refactor/runner_v2.py --market IN --parquet-path data/in_cash.parquet --print-report -v
 
 # ── Single Day Run ───────────────────────────────────────────────
 
 # Run for a single trading day
-python refactor.runner_v2.py --market US --start-date 2025-04-25 --end-date 2025-04-25 --print-report -v
+python refactor.runner_v2.py --market US --start 2025-04-25 --end 2025-04-25 --print-report -v
 
 # ── Standard Backtests ───────────────────────────────────────────
 
 # Both configs (loose + tight), US market, full year
-python backtest.phase2.run_backtest.py --market US --start-date 2024-01-02 --end-date 2025-04-25
-
-# Loose config only
-python backtest.phase2.run_backtest.py --market US --start-date 2024-01-02 --end-date 2025-04-25 --config loose
-
-# Tight config only
-python backtest.phase2.run_backtest.py --market US --start-date 2024-01-02 --end-date 2025-04-25 --config tight
+python backtest/phase2/run_backtest.py --market US --start 2020-01-01 --end 2026-04-20
 
 # ── Custom Capital & Positions ───────────────────────────────────
 

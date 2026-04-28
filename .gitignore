@@ -7,6 +7,7 @@ __pycache__/
 **/*/*.csv
 **/test*html
 **/runner_*html
+**/report_*html
 **/*.log
 **/*.parquet
 **/result*json

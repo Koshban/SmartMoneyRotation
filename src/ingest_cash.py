@@ -78,6 +78,11 @@ PERIOD_DAYS_MAP = {
 IBKR_THRESHOLD_DAYS = 5
 IBKR_SUPPORTED_MARKETS = {"us", "hk"}
 
+# ── Rolling parquet window ─────────────────────────────────────
+# 450 calendar days ≈ 310 trading days — enough for EMA(200) +
+# convergence runway.  Data older than this is trimmed on save.
+MAX_PARQUET_CALENDAR_DAYS = 450
+
 
 # ====================================================================
 #  Symbol lists from universe.py
@@ -185,6 +190,97 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
               inplace=True)
 
     return df
+
+
+# ====================================================================
+#  Cumulative parquet upsert
+# ====================================================================
+
+def upsert_parquet(
+    new_df: pd.DataFrame,
+    parquet_path: Path,
+    date_col: str = "date",
+    symbol_col: str = "symbol",
+    max_calendar_days: int = MAX_PARQUET_CALENDAR_DAYS,
+) -> pd.DataFrame:
+    """
+    Append *new_df* to the existing parquet at *parquet_path*,
+    deduplicate by (symbol, date), trim to rolling window,
+    and overwrite the file.
+
+    This turns a simple daily fetch into a cumulative local store
+    with enough history for long-lookback indicators (EMA-200, etc.).
+
+    Parameters
+    ----------
+    new_df : pd.DataFrame
+        Fresh rows from today's fetch.
+    parquet_path : Path
+        Where the cumulative parquet lives.
+    date_col / symbol_col : str
+        Column names used for dedup and trimming.
+    max_calendar_days : int
+        How far back to keep.  450 calendar days ≈ 310 trading
+        days — enough for EMA(200) + convergence runway.
+
+    Returns
+    -------
+    pd.DataFrame
+        The merged, deduplicated, trimmed DataFrame (also saved to disk).
+    """
+    parquet_path = Path(parquet_path)
+
+    # ── Load existing history ─────────────────────────────────
+    if parquet_path.exists():
+        existing = pd.read_parquet(parquet_path)
+        logger.info(
+            f"  Existing parquet: {len(existing):,} rows, "
+            f"{existing[symbol_col].nunique()} symbols, "
+            f"{existing[date_col].min()} → {existing[date_col].max()}"
+        )
+    else:
+        existing = pd.DataFrame()
+        logger.info(f"  No existing parquet at {parquet_path.name} — starting fresh")
+
+    # ── Coerce dates ──────────────────────────────────────────
+    new_df = new_df.copy()
+    new_df[date_col] = pd.to_datetime(new_df[date_col], errors="coerce")
+    if not existing.empty:
+        existing[date_col] = pd.to_datetime(existing[date_col], errors="coerce")
+
+    # ── Concatenate ───────────────────────────────────────────
+    combined = pd.concat([existing, new_df], ignore_index=True)
+
+    # ── Deduplicate: keep LAST (newest fetch wins) ────────────
+    before = len(combined)
+    combined = combined.drop_duplicates(
+        subset=[symbol_col, date_col],
+        keep="last",
+    )
+    dupes = before - len(combined)
+    if dupes:
+        logger.info(f"  Parquet dedup: removed {dupes:,} duplicate rows")
+
+    # ── Trim to rolling window ────────────────────────────────
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=max_calendar_days)
+    before_trim = len(combined)
+    combined = combined[combined[date_col] >= cutoff].copy()
+    trimmed = before_trim - len(combined)
+    if trimmed:
+        logger.info(f"  Parquet trim: removed {trimmed:,} rows older than {cutoff.date()}")
+
+    # ── Sort and save ─────────────────────────────────────────
+    combined = combined.sort_values([symbol_col, date_col]).reset_index(drop=True)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(parquet_path, index=False)
+
+    logger.info(
+        f"  Saved {parquet_path.name}: {len(combined):,} rows, "
+        f"{combined[symbol_col].nunique()} symbols, "
+        f"{combined[date_col].min().date()} → {combined[date_col].max().date()}"
+    )
+
+    return combined
 
 
 # ====================================================================
@@ -495,17 +591,16 @@ def fetch_full_universe(
         if dupes:
             logger.info(f"Deduped {market}: removed {dupes:,} rows")
 
-        # ── Save per-market parquet (what load_db.py expects) ──
+        # ── Save per-market parquet (CUMULATIVE upsert) ────────
         market_path = DATA_DIR / f"{market}_cash.parquet"
-        df.to_parquet(market_path, index=False)
-        size_mb = market_path.stat().st_size / (1024 * 1024)
-        logger.info(
-            f"Saved → {market_path}  "
-            f"({size_mb:.1f} MB, {len(df):,} rows, "
-            f"{df['symbol'].nunique()} symbols)"
+        merged = upsert_parquet(
+            new_df=df,
+            parquet_path=market_path,
+            date_col="date",
+            symbol_col="symbol",
         )
 
-        all_dfs.append(df)
+        all_dfs.append(merged)
 
     if not all_dfs:
         logger.warning("No data collected across any market")

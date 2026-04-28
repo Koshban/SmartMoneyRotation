@@ -1,4 +1,728 @@
 """
+src/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
+
+Auto-selects data source:
+  Period ≤ 5 days   → IBKR TWS  (must be running)
+  Period > 5 days   → yfinance  (bulk backfill)
+
+Override with --source yfinance | ibkr
+
+Outputs:
+  data/{market}_cash.parquet   — per-market files (for load_db.py)
+  data/universe_ohlcv.parquet  — combined file   (for loader.py)
+
+Usage:
+    python src/ingest_cash.py --market all --period 2y
+    python src/ingest_cash.py --market all --days 180
+    python src/ingest_cash.py --market us  --days 365
+    python src/ingest_cash.py --market all --period 3d
+    python src/ingest_cash.py --market us --period 5d --source ibkr
+    python src/ingest_cash.py --full --backfill
+"""
+
+import sys
+from pathlib import Path
+_SRC  = Path(__file__).resolve().parent        # .../src
+_ROOT = _SRC.parent                            # .../SmartMoneyRotation
+for _p in (str(_ROOT), str(_SRC)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import math
+import logging
+import argparse
+import re
+from datetime import datetime, date, timedelta
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pandas as pd
+import yfinance as yf
+
+from common.credentials import IBKR_PORT
+from common.universe import (
+    get_us_only_etfs,
+    get_all_single_names,
+    get_hk_only,
+    get_india_only,
+    is_hk_ticker,
+    is_india_ticker,
+)
+
+try:
+    from common.credentials import IBKR_HOST
+except ImportError:
+    IBKR_HOST = "127.0.0.1"
+
+try:
+    from common.credentials import IBKR_CLIENT_ID_INGEST
+except ImportError:
+    IBKR_CLIENT_ID_INGEST = 10
+
+# ── Paths ──────────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+)
+
+# ── Period → approximate calendar days ─────────────────────────
+PERIOD_DAYS_MAP = {
+    "1d": 1, "2d": 2, "3d": 3, "4d": 4, "5d": 5,
+    "1w": 7, "2w": 14, "1mo": 30, "3mo": 90, "6mo": 180,
+    "1y": 365, "2y": 730, "5y": 1825, "10y": 3650, "max": 9999,
+}
+
+IBKR_THRESHOLD_DAYS = 5
+IBKR_SUPPORTED_MARKETS = {"us", "hk"}
+
+# ── Rolling parquet window ─────────────────────────────────────
+# 450 calendar days ≈ 310 trading days — enough for EMA(200) +
+# convergence runway.  Data older than this is trimmed on save.
+MAX_PARQUET_CALENDAR_DAYS = 450
+
+
+# ====================================================================
+#  Symbol lists from universe.py
+# ====================================================================
+
+def get_symbols_for_market(market: str) -> list[str]:
+    """Build symbol list for a market using universe.py helpers."""
+    if market == "us":
+        etfs = get_us_only_etfs()
+        singles = [
+            s for s in get_all_single_names()
+            if not is_hk_ticker(s) and not is_india_ticker(s)
+        ]
+        combined = list(dict.fromkeys(etfs + singles))
+        return combined
+
+    elif market == "hk":
+        return get_hk_only()
+
+    elif market == "in":
+        return get_india_only()
+
+    else:
+        logger.warning(f"Unknown market: {market}")
+        return []
+
+
+# ====================================================================
+#  Helpers
+# ====================================================================
+
+def period_to_days(period: str) -> int:
+    """Convert a period string like '2y', '5d', '3mo' to approx calendar days."""
+    period = period.lower().strip()
+    if period in PERIOD_DAYS_MAP:
+        return PERIOD_DAYS_MAP[period]
+
+    m = re.match(r"^(\d+)\s*(d|w|mo|m|y)$", period)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == "d":
+            return n
+        if unit == "w":
+            return n * 7
+        if unit in ("mo", "m"):
+            return n * 30
+        if unit == "y":
+            return n * 365
+
+    logger.warning(f"Cannot parse period '{period}', defaulting to 9999 days (yfinance)")
+    return 9999
+
+
+def days_to_ibkr_duration(days: int) -> str:
+    """Convert a calendar-day count to IBKR durationStr format."""
+    if days <= 7:
+        return f"{days} D"
+    elif days <= 60:
+        weeks = max(1, days // 7)
+        return f"{weeks} W"
+    elif days <= 365:
+        months = max(1, days // 30)
+        return f"{months} M"
+    else:
+        years = max(1, days // 365)
+        return f"{years} Y"
+
+
+def period_to_ibkr_duration(period: str) -> str:
+    """Convert period string to IBKR durationStr format like '5 D'."""
+    days = period_to_days(period)
+    return days_to_ibkr_duration(days)
+
+
+def choose_source(period: str = None, market: str = "us",
+                  force_source: str = None, days: int = None) -> str:
+    """
+    Decide whether to use 'yfinance' or 'ibkr'.
+      1. If force_source is set, use that.
+      2. If period ≤ 5 days AND market is IBKR-supported → ibkr
+      3. Otherwise → yfinance
+    """
+    if force_source:
+        return force_source
+
+    effective_days = days if days is not None else period_to_days(period or "2y")
+    if effective_days <= IBKR_THRESHOLD_DAYS and market in IBKR_SUPPORTED_MARKETS:
+        return "ibkr"
+
+    return "yfinance"
+
+
+def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise column names to lowercase for load_db.py compatibility.
+    """
+    df = df.copy()
+    df.columns = [str(c).lower().strip() for c in df.columns]
+
+    renames = {
+        "adj close": "adj_close",
+    }
+    df.rename(columns={k: v for k, v in renames.items() if k in df.columns},
+              inplace=True)
+
+    return df
+
+
+# ====================================================================
+#  Cumulative parquet upsert
+# ====================================================================
+
+def upsert_parquet(
+    new_df: pd.DataFrame,
+    parquet_path: Path,
+    date_col: str = "date",
+    symbol_col: str = "symbol",
+    max_calendar_days: int = MAX_PARQUET_CALENDAR_DAYS,
+) -> pd.DataFrame:
+    """
+    Append *new_df* to the existing parquet at *parquet_path*,
+    deduplicate by (symbol, date), trim to rolling window,
+    and overwrite the file.
+
+    This turns a simple daily fetch into a cumulative local store
+    with enough history for long-lookback indicators (EMA-200, etc.).
+
+    Parameters
+    ----------
+    new_df : pd.DataFrame
+        Fresh rows from today's fetch.
+    parquet_path : Path
+        Where the cumulative parquet lives.
+    date_col / symbol_col : str
+        Column names used for dedup and trimming.
+    max_calendar_days : int
+        How far back to keep.  450 calendar days ≈ 310 trading
+        days — enough for EMA(200) + convergence runway.
+
+    Returns
+    -------
+    pd.DataFrame
+        The merged, deduplicated, trimmed DataFrame (also saved to disk).
+    """
+    parquet_path = Path(parquet_path)
+
+    # ── Load existing history ─────────────────────────────────
+    if parquet_path.exists():
+        existing = pd.read_parquet(parquet_path)
+        logger.info(
+            f"  Existing parquet: {len(existing):,} rows, "
+            f"{existing[symbol_col].nunique()} symbols, "
+            f"{existing[date_col].min()} → {existing[date_col].max()}"
+        )
+    else:
+        existing = pd.DataFrame()
+        logger.info(f"  No existing parquet at {parquet_path.name} — starting fresh")
+
+    # ── Coerce dates ──────────────────────────────────────────
+    new_df = new_df.copy()
+    new_df[date_col] = pd.to_datetime(new_df[date_col], errors="coerce")
+    if not existing.empty:
+        existing[date_col] = pd.to_datetime(existing[date_col], errors="coerce")
+
+    # ── Concatenate ───────────────────────────────────────────
+    combined = pd.concat([existing, new_df], ignore_index=True)
+
+    # ── Deduplicate: keep LAST (newest fetch wins) ────────────
+    before = len(combined)
+    combined = combined.drop_duplicates(
+        subset=[symbol_col, date_col],
+        keep="last",
+    )
+    dupes = before - len(combined)
+    if dupes:
+        logger.info(f"  Parquet dedup: removed {dupes:,} duplicate rows")
+
+    # ── Trim to rolling window ────────────────────────────────
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=max_calendar_days)
+    before_trim = len(combined)
+    combined = combined[combined[date_col] >= cutoff].copy()
+    trimmed = before_trim - len(combined)
+    if trimmed:
+        logger.info(f"  Parquet trim: removed {trimmed:,} rows older than {cutoff.date()}")
+
+    # ── Sort and save ─────────────────────────────────────────
+    combined = combined.sort_values([symbol_col, date_col]).reset_index(drop=True)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(parquet_path, index=False)
+
+    logger.info(
+        f"  Saved {parquet_path.name}: {len(combined):,} rows, "
+        f"{combined[symbol_col].nunique()} symbols, "
+        f"{combined[date_col].min().date()} → {combined[date_col].max().date()}"
+    )
+
+    return combined
+
+
+# ====================================================================
+#  IBKR contract helpers
+# ====================================================================
+
+def clean_hk_symbol(symbol: str) -> str:
+    """'0005.HK' → '5', '0700.HK' → '700'"""
+    sym = symbol.replace(".HK", "").lstrip("0")
+    return sym if sym else "0"
+
+
+def make_ibkr_contract(symbol: str, market: str):
+    """Build an ib_insync Stock contract from a yfinance-style symbol."""
+    from ib_insync import Stock
+
+    if market == "hk":
+        ibkr_sym = clean_hk_symbol(symbol)
+        return Stock(ibkr_sym, "SEHK", "HKD")
+    elif market == "in":
+        ibkr_sym = symbol.replace(".NS", "").replace(".BO", "")
+        return Stock(ibkr_sym, "NSE", "INR")
+    else:
+        ibkr_sym = symbol.split(".")[0]
+        return Stock(ibkr_sym, "SMART", "USD")
+
+
+# ====================================================================
+#  yfinance fetch
+# ====================================================================
+
+def fetch_yfinance(
+    symbols: list[str],
+    period: str = "2y",
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    if start_date and end_date:
+        logger.info(
+            f"[yfinance] Downloading {len(symbols)} symbols, "
+            f"{start_date} → {end_date}"
+        )
+        df = yf.download(
+            tickers=symbols,
+            start=start_date,
+            end=end_date,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+        )
+    else:
+        logger.info(
+            f"[yfinance] Downloading {len(symbols)} symbols, "
+            f"period={period}"
+        )
+        df = yf.download(
+            tickers=symbols,
+            period=period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+        )
+
+    if df.empty:
+        logger.warning("[yfinance] Empty result")
+        return pd.DataFrame()
+
+    records = []
+
+    if len(symbols) == 1:
+        sym = symbols[0]
+        tmp = df.copy()
+        tmp = tmp.reset_index()
+        tmp["symbol"] = sym
+        records.append(tmp)
+    else:
+        for sym in symbols:
+            try:
+                tmp = df[sym].copy()
+                tmp = tmp.dropna(how="all")
+                if tmp.empty:
+                    continue
+                tmp = tmp.reset_index()
+                tmp["symbol"] = sym
+                records.append(tmp)
+            except KeyError:
+                logger.warning(f"[yfinance] No data for {sym}")
+                continue
+
+    if not records:
+        return pd.DataFrame()
+
+    result = pd.concat(records, ignore_index=True)
+
+    col_map = {}
+    for c in result.columns:
+        if c.lower() == "date":
+            col_map[c] = "Date"
+    result.rename(columns=col_map, inplace=True)
+
+    # ── Deduplicate at source ──────────────────────────────────
+    before = len(result)
+    result = result.drop_duplicates(subset=["Date", "symbol"], keep="last")
+    dupes = before - len(result)
+    if dupes:
+        logger.info(f"[yfinance] Dropped {dupes:,} duplicate (Date, symbol) rows")
+
+    logger.info(
+        f"[yfinance] Got {len(result):,} rows for "
+        f"{result['symbol'].nunique()} symbols"
+    )
+    return result
+
+
+# ====================================================================
+#  IBKR fetch
+# ====================================================================
+
+def fetch_ibkr(
+    symbols: list[str],
+    period: str = "5d",
+    market: str = "us",
+    days: int | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch historical daily bars from IBKR TWS.
+
+    If *days* is given it is converted directly to an IBKR
+    duration string, bypassing the period-string parsing.
+    """
+    try:
+        from ib_insync import IB, util
+    except ImportError:
+        logger.error("ib_insync not installed. Run: pip install ib_insync")
+        return pd.DataFrame()
+
+    if days is not None:
+        duration = days_to_ibkr_duration(days)
+    else:
+        duration = period_to_ibkr_duration(period)
+
+    logger.info(
+        f"[IBKR] Fetching {len(symbols)} symbols, "
+        f"duration={duration}, market={market}"
+    )
+
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID_INGEST)
+        ib.reqMarketDataType(1)
+        logger.info(f"[IBKR] Connected to TWS at {IBKR_HOST}:{IBKR_PORT}")
+    except Exception as e:
+        logger.error(f"[IBKR] Cannot connect to TWS: {e}")
+        logger.warning("[IBKR] Falling back to yfinance")
+        if days is not None:
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(days=days)
+            return fetch_yfinance(
+                symbols,
+                start_date=start_dt.strftime("%Y-%m-%d"),
+                end_date=end_dt.strftime("%Y-%m-%d"),
+            )
+        return fetch_yfinance(symbols, period)
+
+    all_records = []
+
+    try:
+        for idx, sym in enumerate(symbols, 1):
+            logger.info(f"[IBKR] [{idx}/{len(symbols)}] {sym}")
+
+            contract = make_ibkr_contract(sym, market)
+            qualified = ib.qualifyContracts(contract)
+
+            if not qualified:
+                logger.warning(f"[IBKR]   Could not qualify {sym}, skipping")
+                continue
+
+            contract = qualified[0]
+
+            try:
+                bars = ib.reqHistoricalData(
+                    contract,
+                    endDateTime="",
+                    durationStr=duration,
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                )
+            except Exception as e:
+                logger.warning(f"[IBKR]   Error fetching {sym}: {e}")
+                continue
+
+            if not bars:
+                logger.warning(f"[IBKR]   No bars for {sym}")
+                continue
+
+            df = util.df(bars)
+            df["symbol"] = sym
+
+            df.rename(columns={
+                "date":     "Date",
+                "open":     "Open",
+                "high":     "High",
+                "low":      "Low",
+                "close":    "Close",
+                "volume":   "Volume",
+                "average":  "VWAP",
+                "barCount": "Trades",
+            }, inplace=True)
+
+            df["Adj Close"] = df["Close"]
+
+            all_records.append(df)
+            logger.info(f"[IBKR]   {sym}: {len(df)} bars")
+
+            ib.sleep(0.5)
+
+    finally:
+        ib.disconnect()
+        logger.info("[IBKR] Disconnected")
+
+    if not all_records:
+        return pd.DataFrame()
+
+    result = pd.concat(all_records, ignore_index=True)
+
+    # ── Deduplicate at source ──────────────────────────────────
+    before = len(result)
+    result = result.drop_duplicates(subset=["Date", "symbol"], keep="last")
+    dupes = before - len(result)
+    if dupes:
+        logger.info(f"[IBKR] Dropped {dupes:,} duplicate (Date, symbol) rows")
+
+    logger.info(
+        f"[IBKR] Got {len(result):,} rows for "
+        f"{result['symbol'].nunique()} symbols"
+    )
+    return result
+
+
+# ====================================================================
+#  Orchestration
+# ====================================================================
+
+def fetch_full_universe(
+    markets: list[str],
+    period: str = "2y",
+    days: int | None = None,
+    force_source: str = None,
+):
+    DATA_DIR.mkdir(exist_ok=True)
+    all_dfs = []
+
+    start_date: str | None = None
+    end_date: str | None = None
+    if days is not None:
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days)
+        start_date = start_dt.strftime("%Y-%m-%d")
+        end_date = end_dt.strftime("%Y-%m-%d")
+
+    for market in markets:
+        symbols = get_symbols_for_market(market)
+        if not symbols:
+            logger.warning(f"No symbols for market: {market}")
+            continue
+
+        source = choose_source(
+            period=period, market=market,
+            force_source=force_source, days=days,
+        )
+
+        effective_label = (
+            f"{days} days" if days is not None else f"period={period}"
+        )
+        logger.info(
+            f"Market: {market.upper()} | "
+            f"{len(symbols)} symbols | "
+            f"{effective_label} | "
+            f"source: {source}"
+        )
+
+        if source == "ibkr":
+            df = fetch_ibkr(symbols, period, market, days=days)
+        else:
+            df = fetch_yfinance(
+                symbols,
+                period=period,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        if df is None or df.empty:
+            logger.warning(f"No data returned for market: {market}")
+            continue
+
+        # ── Normalise columns to lowercase ─────────────────────
+        df = normalise_columns(df)
+
+        # ── Deduplicate by (date, symbol) before saving ────────
+        before = len(df)
+        df = df.drop_duplicates(subset=["date", "symbol"], keep="last")
+        df = df.reset_index(drop=True)
+        dupes = before - len(df)
+        if dupes:
+            logger.info(f"Deduped {market}: removed {dupes:,} rows")
+
+        # ── Save per-market parquet (CUMULATIVE upsert) ────────
+        market_path = DATA_DIR / f"{market}_cash.parquet"
+        merged = upsert_parquet(
+            new_df=df,
+            parquet_path=market_path,
+            date_col="date",
+            symbol_col="symbol",
+        )
+
+        all_dfs.append(merged)
+
+    if not all_dfs:
+        logger.warning("No data collected across any market")
+        return
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    # ── Final cross-market dedup (safety net) ──────────────────
+    combined = combined.drop_duplicates(
+        subset=["date", "symbol"], keep="last",
+    ).reset_index(drop=True)
+
+    combined_path = DATA_DIR / "universe_ohlcv.parquet"
+    combined.to_parquet(combined_path, index=False)
+    size_mb = combined_path.stat().st_size / (1024 * 1024)
+    logger.info(
+        f"Saved → {combined_path}  "
+        f"({size_mb:.1f} MB, {len(combined):,} rows, "
+        f"{combined['symbol'].nunique()} symbols — combined)"
+    )
+
+
+# ====================================================================
+#  CLI
+# ====================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ingest OHLCV data (yfinance + IBKR)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python src/ingest_cash.py --market all --period 2y        # 2-year backfill
+  python src/ingest_cash.py --market us  --days 365         # US, exactly 365 days
+  python src/ingest_cash.py --market all --days 180         # all markets, 180 days
+  python src/ingest_cash.py --market us  --period 5d --source ibkr
+  python src/ingest_cash.py --full --backfill
+        """,
+    )
+    parser.add_argument(
+        "--market",
+        choices=["us", "hk", "in", "all"],
+        default="all",
+        help="Which market(s) to download (default: all)",
+    )
+    parser.add_argument(
+        "--period",
+        default="2y",
+        help="Period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max (default: 2y)",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help=(
+            "Calendar days of data to download (overrides --period). "
+            "E.g. --days 365 downloads the last 365 calendar days."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        choices=["yfinance", "ibkr"],
+        default=None,
+        help="Force data source (default: auto based on period/days)",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Alias for --market all",
+    )
+    parser.add_argument(
+        "--backfill", action="store_true",
+        help="Alias for --period max",
+    )
+    args = parser.parse_args()
+
+    if args.full:
+        args.market = "all"
+    if args.backfill:
+        args.period = "max"
+        args.days = None       # --backfill wins over --days
+
+    if args.market == "all":
+        markets = ["us", "hk", "in"]
+    else:
+        markets = [args.market]
+
+    # ── Resolve effective days for display ─────────────────────
+    if args.days is not None:
+        effective_days = args.days
+        logger.info(f"--days {args.days} → downloading {effective_days} calendar days")
+    else:
+        effective_days = period_to_days(args.period)
+        logger.info(
+            f"Period={args.period} ({effective_days} days) → "
+            f"auto threshold: ≤{IBKR_THRESHOLD_DAYS}d uses IBKR"
+            + (f" [OVERRIDDEN → {args.source}]" if args.source else "")
+        )
+
+    # Show symbol counts
+    for mkt in markets:
+        syms = get_symbols_for_market(mkt)
+        src = choose_source(
+            period=args.period, market=mkt,
+            force_source=args.source, days=args.days,
+        )
+        logger.info(f"  {mkt.upper():6s}: {len(syms):>4d} symbols → {src}")
+
+    fetch_full_universe(
+        markets=markets,
+        period=args.period,
+        days=args.days,
+        force_source=args.source,
+    )
+
+    logger.info("Done")
+
+
+if __name__ == "__main__":
+    main()
+
+#####################################
+"""
 src/ingest_options.py
 Fetch option chains and save to parquet + CSV.
 
@@ -800,1063 +1524,16 @@ def main():
 if __name__ == "__main__":
     main()
 
-###################################################
-"""
-src/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
-
-Auto-selects data source:
-  Period ≤ 5 days   → IBKR TWS  (must be running)
-  Period > 5 days   → yfinance  (bulk backfill)
-
-Override with --source yfinance | ibkr
-
-Outputs:
-  data/{market}_cash.parquet   — per-market files (for load_db.py)
-  data/universe_ohlcv.parquet  — combined file   (for loader.py)
-
-Usage:
-    python src/ingest_cash.py --market all --period 2y
-    python src/ingest_cash.py --market all --days 180
-    python src/ingest_cash.py --market us  --days 365
-    python src/ingest_cash.py --market all --period 3d
-    python src/ingest_cash.py --market us --period 5d --source ibkr
-    python src/ingest_cash.py --full --backfill
-"""
-
-import sys
-from pathlib import Path
-_SRC  = Path(__file__).resolve().parent        # .../src
-_ROOT = _SRC.parent                            # .../SmartMoneyRotation
-for _p in (str(_ROOT), str(_SRC)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-import math
-import logging
-import argparse
-import re
-from datetime import datetime, date, timedelta
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import pandas as pd
-import yfinance as yf
-
-from common.credentials import IBKR_PORT
-from common.universe import (
-    get_us_only_etfs,
-    get_all_single_names,
-    get_hk_only,
-    get_india_only,
-    is_hk_ticker,
-    is_india_ticker,
-)
-
-try:
-    from common.credentials import IBKR_HOST
-except ImportError:
-    IBKR_HOST = "127.0.0.1"
-
-try:
-    from common.credentials import IBKR_CLIENT_ID_INGEST
-except ImportError:
-    IBKR_CLIENT_ID_INGEST = 10
-
-# ── Paths ──────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-)
-
-# ── Period → approximate calendar days ─────────────────────────
-PERIOD_DAYS_MAP = {
-    "1d": 1, "2d": 2, "3d": 3, "4d": 4, "5d": 5,
-    "1w": 7, "2w": 14, "1mo": 30, "3mo": 90, "6mo": 180,
-    "1y": 365, "2y": 730, "5y": 1825, "10y": 3650, "max": 9999,
-}
-
-IBKR_THRESHOLD_DAYS = 5
-IBKR_SUPPORTED_MARKETS = {"us", "hk"}
-
-
-# ====================================================================
-#  Symbol lists from universe.py
-# ====================================================================
-
-def get_symbols_for_market(market: str) -> list[str]:
-    """Build symbol list for a market using universe.py helpers."""
-    if market == "us":
-        etfs = get_us_only_etfs()
-        singles = [
-            s for s in get_all_single_names()
-            if not is_hk_ticker(s) and not is_india_ticker(s)
-        ]
-        combined = list(dict.fromkeys(etfs + singles))
-        return combined
-
-    elif market == "hk":
-        return get_hk_only()
-
-    elif market == "in":
-        return get_india_only()
-
-    else:
-        logger.warning(f"Unknown market: {market}")
-        return []
-
-
-# ====================================================================
-#  Helpers
-# ====================================================================
-
-def period_to_days(period: str) -> int:
-    """Convert a period string like '2y', '5d', '3mo' to approx calendar days."""
-    period = period.lower().strip()
-    if period in PERIOD_DAYS_MAP:
-        return PERIOD_DAYS_MAP[period]
-
-    m = re.match(r"^(\d+)\s*(d|w|mo|m|y)$", period)
-    if m:
-        n = int(m.group(1))
-        unit = m.group(2)
-        if unit == "d":
-            return n
-        if unit == "w":
-            return n * 7
-        if unit in ("mo", "m"):
-            return n * 30
-        if unit == "y":
-            return n * 365
-
-    logger.warning(f"Cannot parse period '{period}', defaulting to 9999 days (yfinance)")
-    return 9999
-
-
-def days_to_ibkr_duration(days: int) -> str:
-    """Convert a calendar-day count to IBKR durationStr format."""
-    if days <= 7:
-        return f"{days} D"
-    elif days <= 60:
-        weeks = max(1, days // 7)
-        return f"{weeks} W"
-    elif days <= 365:
-        months = max(1, days // 30)
-        return f"{months} M"
-    else:
-        years = max(1, days // 365)
-        return f"{years} Y"
-
-
-def period_to_ibkr_duration(period: str) -> str:
-    """Convert period string to IBKR durationStr format like '5 D'."""
-    days = period_to_days(period)
-    return days_to_ibkr_duration(days)
-
-
-def choose_source(period: str = None, market: str = "us",
-                  force_source: str = None, days: int = None) -> str:
-    """
-    Decide whether to use 'yfinance' or 'ibkr'.
-      1. If force_source is set, use that.
-      2. If period ≤ 5 days AND market is IBKR-supported → ibkr
-      3. Otherwise → yfinance
-    """
-    if force_source:
-        return force_source
-
-    effective_days = days if days is not None else period_to_days(period or "2y")
-    if effective_days <= IBKR_THRESHOLD_DAYS and market in IBKR_SUPPORTED_MARKETS:
-        return "ibkr"
-
-    return "yfinance"
-
-
-def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalise column names to lowercase for load_db.py compatibility.
-    """
-    df = df.copy()
-    df.columns = [str(c).lower().strip() for c in df.columns]
-
-    renames = {
-        "adj close": "adj_close",
-    }
-    df.rename(columns={k: v for k, v in renames.items() if k in df.columns},
-              inplace=True)
-
-    return df
-
-
-# ====================================================================
-#  IBKR contract helpers
-# ====================================================================
-
-def clean_hk_symbol(symbol: str) -> str:
-    """'0005.HK' → '5', '0700.HK' → '700'"""
-    sym = symbol.replace(".HK", "").lstrip("0")
-    return sym if sym else "0"
-
-
-def make_ibkr_contract(symbol: str, market: str):
-    """Build an ib_insync Stock contract from a yfinance-style symbol."""
-    from ib_insync import Stock
-
-    if market == "hk":
-        ibkr_sym = clean_hk_symbol(symbol)
-        return Stock(ibkr_sym, "SEHK", "HKD")
-    elif market == "in":
-        ibkr_sym = symbol.replace(".NS", "").replace(".BO", "")
-        return Stock(ibkr_sym, "NSE", "INR")
-    else:
-        ibkr_sym = symbol.split(".")[0]
-        return Stock(ibkr_sym, "SMART", "USD")
-
-
-# ====================================================================
-#  yfinance fetch
-# ====================================================================
-
-def fetch_yfinance(
-    symbols: list[str],
-    period: str = "2y",
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> pd.DataFrame:
-    if start_date and end_date:
-        logger.info(
-            f"[yfinance] Downloading {len(symbols)} symbols, "
-            f"{start_date} → {end_date}"
-        )
-        df = yf.download(
-            tickers=symbols,
-            start=start_date,
-            end=end_date,
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            threads=True,
-        )
-    else:
-        logger.info(
-            f"[yfinance] Downloading {len(symbols)} symbols, "
-            f"period={period}"
-        )
-        df = yf.download(
-            tickers=symbols,
-            period=period,
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            threads=True,
-        )
-
-    if df.empty:
-        logger.warning("[yfinance] Empty result")
-        return pd.DataFrame()
-
-    records = []
-
-    if len(symbols) == 1:
-        sym = symbols[0]
-        tmp = df.copy()
-        tmp = tmp.reset_index()
-        tmp["symbol"] = sym
-        records.append(tmp)
-    else:
-        for sym in symbols:
-            try:
-                tmp = df[sym].copy()
-                tmp = tmp.dropna(how="all")
-                if tmp.empty:
-                    continue
-                tmp = tmp.reset_index()
-                tmp["symbol"] = sym
-                records.append(tmp)
-            except KeyError:
-                logger.warning(f"[yfinance] No data for {sym}")
-                continue
-
-    if not records:
-        return pd.DataFrame()
-
-    result = pd.concat(records, ignore_index=True)
-
-    col_map = {}
-    for c in result.columns:
-        if c.lower() == "date":
-            col_map[c] = "Date"
-    result.rename(columns=col_map, inplace=True)
-
-    # ── Deduplicate at source ──────────────────────────────────
-    before = len(result)
-    result = result.drop_duplicates(subset=["Date", "symbol"], keep="last")
-    dupes = before - len(result)
-    if dupes:
-        logger.info(f"[yfinance] Dropped {dupes:,} duplicate (Date, symbol) rows")
-
-    logger.info(
-        f"[yfinance] Got {len(result):,} rows for "
-        f"{result['symbol'].nunique()} symbols"
-    )
-    return result
-
-
-# ====================================================================
-#  IBKR fetch
-# ====================================================================
-
-def fetch_ibkr(
-    symbols: list[str],
-    period: str = "5d",
-    market: str = "us",
-    days: int | None = None,
-) -> pd.DataFrame:
-    """
-    Fetch historical daily bars from IBKR TWS.
-
-    If *days* is given it is converted directly to an IBKR
-    duration string, bypassing the period-string parsing.
-    """
-    try:
-        from ib_insync import IB, util
-    except ImportError:
-        logger.error("ib_insync not installed. Run: pip install ib_insync")
-        return pd.DataFrame()
-
-    if days is not None:
-        duration = days_to_ibkr_duration(days)
-    else:
-        duration = period_to_ibkr_duration(period)
-
-    logger.info(
-        f"[IBKR] Fetching {len(symbols)} symbols, "
-        f"duration={duration}, market={market}"
-    )
-
-    ib = IB()
-    try:
-        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID_INGEST)
-        ib.reqMarketDataType(1)
-        logger.info(f"[IBKR] Connected to TWS at {IBKR_HOST}:{IBKR_PORT}")
-    except Exception as e:
-        logger.error(f"[IBKR] Cannot connect to TWS: {e}")
-        logger.warning("[IBKR] Falling back to yfinance")
-        if days is not None:
-            end_dt = datetime.now()
-            start_dt = end_dt - timedelta(days=days)
-            return fetch_yfinance(
-                symbols,
-                start_date=start_dt.strftime("%Y-%m-%d"),
-                end_date=end_dt.strftime("%Y-%m-%d"),
-            )
-        return fetch_yfinance(symbols, period)
-
-    all_records = []
-
-    try:
-        for idx, sym in enumerate(symbols, 1):
-            logger.info(f"[IBKR] [{idx}/{len(symbols)}] {sym}")
-
-            contract = make_ibkr_contract(sym, market)
-            qualified = ib.qualifyContracts(contract)
-
-            if not qualified:
-                logger.warning(f"[IBKR]   Could not qualify {sym}, skipping")
-                continue
-
-            contract = qualified[0]
-
-            try:
-                bars = ib.reqHistoricalData(
-                    contract,
-                    endDateTime="",
-                    durationStr=duration,
-                    barSizeSetting="1 day",
-                    whatToShow="TRADES",
-                    useRTH=True,
-                    formatDate=1,
-                )
-            except Exception as e:
-                logger.warning(f"[IBKR]   Error fetching {sym}: {e}")
-                continue
-
-            if not bars:
-                logger.warning(f"[IBKR]   No bars for {sym}")
-                continue
-
-            df = util.df(bars)
-            df["symbol"] = sym
-
-            df.rename(columns={
-                "date":     "Date",
-                "open":     "Open",
-                "high":     "High",
-                "low":      "Low",
-                "close":    "Close",
-                "volume":   "Volume",
-                "average":  "VWAP",
-                "barCount": "Trades",
-            }, inplace=True)
-
-            df["Adj Close"] = df["Close"]
-
-            all_records.append(df)
-            logger.info(f"[IBKR]   {sym}: {len(df)} bars")
-
-            ib.sleep(0.5)
-
-    finally:
-        ib.disconnect()
-        logger.info("[IBKR] Disconnected")
-
-    if not all_records:
-        return pd.DataFrame()
-
-    result = pd.concat(all_records, ignore_index=True)
-
-    # ── Deduplicate at source ──────────────────────────────────
-    before = len(result)
-    result = result.drop_duplicates(subset=["Date", "symbol"], keep="last")
-    dupes = before - len(result)
-    if dupes:
-        logger.info(f"[IBKR] Dropped {dupes:,} duplicate (Date, symbol) rows")
-
-    logger.info(
-        f"[IBKR] Got {len(result):,} rows for "
-        f"{result['symbol'].nunique()} symbols"
-    )
-    return result
-
-
-# ====================================================================
-#  Orchestration
-# ====================================================================
-
-def fetch_full_universe(
-    markets: list[str],
-    period: str = "2y",
-    days: int | None = None,
-    force_source: str = None,
-):
-    DATA_DIR.mkdir(exist_ok=True)
-    all_dfs = []
-
-    start_date: str | None = None
-    end_date: str | None = None
-    if days is not None:
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=days)
-        start_date = start_dt.strftime("%Y-%m-%d")
-        end_date = end_dt.strftime("%Y-%m-%d")
-
-    for market in markets:
-        symbols = get_symbols_for_market(market)
-        if not symbols:
-            logger.warning(f"No symbols for market: {market}")
-            continue
-
-        source = choose_source(
-            period=period, market=market,
-            force_source=force_source, days=days,
-        )
-
-        effective_label = (
-            f"{days} days" if days is not None else f"period={period}"
-        )
-        logger.info(
-            f"Market: {market.upper()} | "
-            f"{len(symbols)} symbols | "
-            f"{effective_label} | "
-            f"source: {source}"
-        )
-
-        if source == "ibkr":
-            df = fetch_ibkr(symbols, period, market, days=days)
-        else:
-            df = fetch_yfinance(
-                symbols,
-                period=period,
-                start_date=start_date,
-                end_date=end_date,
-            )
-
-        if df is None or df.empty:
-            logger.warning(f"No data returned for market: {market}")
-            continue
-
-        # ── Normalise columns to lowercase ─────────────────────
-        df = normalise_columns(df)
-
-        # ── Deduplicate by (date, symbol) before saving ────────
-        before = len(df)
-        df = df.drop_duplicates(subset=["date", "symbol"], keep="last")
-        df = df.reset_index(drop=True)
-        dupes = before - len(df)
-        if dupes:
-            logger.info(f"Deduped {market}: removed {dupes:,} rows")
-
-        # ── Save per-market parquet (what load_db.py expects) ──
-        market_path = DATA_DIR / f"{market}_cash.parquet"
-        df.to_parquet(market_path, index=False)
-        size_mb = market_path.stat().st_size / (1024 * 1024)
-        logger.info(
-            f"Saved → {market_path}  "
-            f"({size_mb:.1f} MB, {len(df):,} rows, "
-            f"{df['symbol'].nunique()} symbols)"
-        )
-
-        all_dfs.append(df)
-
-    if not all_dfs:
-        logger.warning("No data collected across any market")
-        return
-
-    combined = pd.concat(all_dfs, ignore_index=True)
-
-    # ── Final cross-market dedup (safety net) ──────────────────
-    combined = combined.drop_duplicates(
-        subset=["date", "symbol"], keep="last",
-    ).reset_index(drop=True)
-
-    combined_path = DATA_DIR / "universe_ohlcv.parquet"
-    combined.to_parquet(combined_path, index=False)
-    size_mb = combined_path.stat().st_size / (1024 * 1024)
-    logger.info(
-        f"Saved → {combined_path}  "
-        f"({size_mb:.1f} MB, {len(combined):,} rows, "
-        f"{combined['symbol'].nunique()} symbols — combined)"
-    )
-
-
-# ====================================================================
-#  CLI
-# ====================================================================
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Ingest OHLCV data (yfinance + IBKR)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  python src/ingest_cash.py --market all --period 2y        # 2-year backfill
-  python src/ingest_cash.py --market us  --days 365         # US, exactly 365 days
-  python src/ingest_cash.py --market all --days 180         # all markets, 180 days
-  python src/ingest_cash.py --market us  --period 5d --source ibkr
-  python src/ingest_cash.py --full --backfill
-        """,
-    )
-    parser.add_argument(
-        "--market",
-        choices=["us", "hk", "in", "all"],
-        default="all",
-        help="Which market(s) to download (default: all)",
-    )
-    parser.add_argument(
-        "--period",
-        default="2y",
-        help="Period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max (default: 2y)",
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=None,
-        help=(
-            "Calendar days of data to download (overrides --period). "
-            "E.g. --days 365 downloads the last 365 calendar days."
-        ),
-    )
-    parser.add_argument(
-        "--source",
-        choices=["yfinance", "ibkr"],
-        default=None,
-        help="Force data source (default: auto based on period/days)",
-    )
-    parser.add_argument(
-        "--full", action="store_true",
-        help="Alias for --market all",
-    )
-    parser.add_argument(
-        "--backfill", action="store_true",
-        help="Alias for --period max",
-    )
-    args = parser.parse_args()
-
-    if args.full:
-        args.market = "all"
-    if args.backfill:
-        args.period = "max"
-        args.days = None       # --backfill wins over --days
-
-    if args.market == "all":
-        markets = ["us", "hk", "in"]
-    else:
-        markets = [args.market]
-
-    # ── Resolve effective days for display ─────────────────────
-    if args.days is not None:
-        effective_days = args.days
-        logger.info(f"--days {args.days} → downloading {effective_days} calendar days")
-    else:
-        effective_days = period_to_days(args.period)
-        logger.info(
-            f"Period={args.period} ({effective_days} days) → "
-            f"auto threshold: ≤{IBKR_THRESHOLD_DAYS}d uses IBKR"
-            + (f" [OVERRIDDEN → {args.source}]" if args.source else "")
-        )
-
-    # Show symbol counts
-    for mkt in markets:
-        syms = get_symbols_for_market(mkt)
-        src = choose_source(
-            period=args.period, market=mkt,
-            force_source=args.source, days=args.days,
-        )
-        logger.info(f"  {mkt.upper():6s}: {len(syms):>4d} symbols → {src}")
-
-    fetch_full_universe(
-        markets=markets,
-        period=args.period,
-        days=args.days,
-        force_source=args.source,
-    )
-
-    logger.info("Done")
-
-
-if __name__ == "__main__":
-    main()
-
-#############################################################
-"""
-src/db/schema.py
-
-Single source of truth for all DB table definitions.
-
-Usage:
-    python src/db/schema.py create          # Create all tables
-    python src/db/schema.py drop --yes      # Drop all tables (confirm required)
-    python src/db/schema.py recreate --yes  # Drop + Create
-    python src/db/schema.py status          # Show which tables exist
-    python src/db/schema.py drop-options --yes  # Drop only options tables
-"""
-
-import argparse
-import logging
-import sys
-from pathlib import Path
-
-import psycopg2
-
-SRC = Path(__file__).resolve().parent.parent
-ROOT = SRC.parent
-sys.path.insert(0, str(ROOT))
-
-from common.credentials import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)-20s %(levelname)-10s %(message)s",
-)
-LOG = logging.getLogger(__name__)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  CONNECTION
-# ═══════════════════════════════════════════════════════════════
-
-def get_conn():
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
-#  CASH TABLE DDL  (unchanged from your current schema)
-# ═══════════════════════════════════════════════════════════════
-
-CASH_REGIONS = ["us", "hk", "in", "others"]
-
-def _cash_ddl(region: str) -> str:
-    """
-    Cash (equity/ETF) OHLCV table.
-
-    Columns:  date, symbol, open, high, low, close, volume
-    Unique:   (date, symbol)
-    Index:    symbol, date
-    """
-    table = f"{region}_cash"
-    return f"""
-    CREATE TABLE IF NOT EXISTS {table} (
-        id          SERIAL PRIMARY KEY,
-        date        DATE           NOT NULL,
-        symbol      VARCHAR(20)    NOT NULL,
-        open        NUMERIC(14,4),
-        high        NUMERIC(14,4),
-        low         NUMERIC(14,4),
-        close       NUMERIC(14,4)  NOT NULL,
-        volume      BIGINT,
-        created_at  TIMESTAMP DEFAULT NOW(),
-
-        CONSTRAINT uq_{table}_date_symbol
-            UNIQUE (date, symbol)
-    );
-
-    CREATE INDEX IF NOT EXISTS ix_{table}_symbol
-        ON {table} (symbol);
-
-    CREATE INDEX IF NOT EXISTS ix_{table}_date
-        ON {table} (date);
-
-    CREATE INDEX IF NOT EXISTS ix_{table}_symbol_date
-        ON {table} (symbol, date DESC);
-    """
-
-
-# ═══════════════════════════════════════════════════════════════
-#  OPTIONS TABLE DDL  (comprehensive — greeks, bid/ask, source)
-# ═══════════════════════════════════════════════════════════════
-
-OPTIONS_REGIONS = ["us", "hk"]  # Add "india" when ready
-
-def _options_ddl(region: str) -> str:
-    """
-    Options snapshot table — one row per (date, symbol, expiry, strike, opt_type).
-
-    Designed to hold data from both yfinance (no greeks) and IBKR (full greeks).
-    Columns that a source doesn't provide are simply NULL.
-
-    Columns:
-        Identification:  date, symbol, expiry, strike, opt_type
-        Market data:     bid, ask, last, volume, oi
-        Volatility:      iv
-        Greeks:          delta, gamma, theta, vega, rho
-        Context:         underlying_price, dte
-        Metadata:        source, created_at
-
-    Unique:  (date, symbol, expiry, strike, opt_type)
-    """
-    table = f"{region}_options"
-    return f"""
-    CREATE TABLE IF NOT EXISTS {table} (
-        id                SERIAL PRIMARY KEY,
-
-        -- ── Identification ────────────────────────────────────
-        date              DATE           NOT NULL,
-        symbol            VARCHAR(20)    NOT NULL,
-        expiry            DATE           NOT NULL,
-        strike            NUMERIC(14,4)  NOT NULL,
-        opt_type          CHAR(1)        NOT NULL CHECK (opt_type IN ('C', 'P')),
-
-        -- ── Market Data ───────────────────────────────────────
-        bid               NUMERIC(14,4),
-        ask               NUMERIC(14,4),
-        last              NUMERIC(14,4),
-        volume            INTEGER,
-        oi                INTEGER,
-
-        -- ── Implied Volatility ────────────────────────────────
-        iv                NUMERIC(10,6),
-
-        -- ── Greeks (NULL when source is yfinance) ─────────────
-        delta             NUMERIC(10,6),
-        gamma             NUMERIC(10,6),
-        theta             NUMERIC(10,6),
-        vega              NUMERIC(10,6),
-        rho               NUMERIC(10,6),
-
-        -- ── Context ──────────────────────────────────────────
-        underlying_price  NUMERIC(14,4),
-        dte               INTEGER,
-
-        -- ── Metadata ─────────────────────────────────────────
-        source            VARCHAR(20)    DEFAULT 'yfinance',
-        created_at        TIMESTAMP      DEFAULT NOW(),
-
-        -- ── Constraints ──────────────────────────────────────
-        CONSTRAINT uq_{table}_snapshot
-            UNIQUE (date, symbol, expiry, strike, opt_type)
-    );
-
-    -- Fast lookups by symbol
-    CREATE INDEX IF NOT EXISTS ix_{table}_symbol
-        ON {table} (symbol);
-
-    -- Fast lookups by date (for daily snapshots)
-    CREATE INDEX IF NOT EXISTS ix_{table}_date
-        ON {table} (date);
-
-    -- Composite: symbol + date (most common query pattern)
-    CREATE INDEX IF NOT EXISTS ix_{table}_symbol_date
-        ON {table} (symbol, date DESC);
-
-    -- Composite: symbol + expiry (for chain lookups)
-    CREATE INDEX IF NOT EXISTS ix_{table}_symbol_expiry
-        ON {table} (symbol, expiry);
-
-    -- Filtered: high-IV contracts
-    CREATE INDEX IF NOT EXISTS ix_{table}_iv
-        ON {table} (iv DESC)
-        WHERE iv IS NOT NULL;
-
-    -- Filtered: IBKR data with greeks
-    CREATE INDEX IF NOT EXISTS ix_{table}_greeks
-        ON {table} (symbol, expiry, strike)
-        WHERE delta IS NOT NULL;
-    """
-
-
-# ═══════════════════════════════════════════════════════════════
-#  AGGREGATE / DERIVED TABLE  (optional — for pipeline output)
-# ═══════════════════════════════════════════════════════════════
-
-def _signals_ddl() -> str:
-    """
-    Pipeline output: daily signals / scores per ticker.
-
-    This table is OPTIONAL. The pipeline can write to parquet instead.
-    Kept here so the DB can serve as a single reporting layer.
-    """
-    return """
-    CREATE TABLE IF NOT EXISTS signals (
-        id              SERIAL PRIMARY KEY,
-        date            DATE           NOT NULL,
-        symbol          VARCHAR(20)    NOT NULL,
-        market          VARCHAR(10)    NOT NULL,
-
-        -- ── Cash Metrics ──────────────────────────────────────
-        close           NUMERIC(14,4),
-        rsi_14          NUMERIC(8,4),
-        macd            NUMERIC(14,6),
-        macd_signal     NUMERIC(14,6),
-        bb_pct          NUMERIC(8,4),
-        atr_14          NUMERIC(14,4),
-        adx_14          NUMERIC(8,4),
-        vol_z_20        NUMERIC(8,4),
-
-        -- ── Options Metrics ───────────────────────────────────
-        iv_avg          NUMERIC(10,6),
-        iv_skew         NUMERIC(10,6),
-        put_call_ratio  NUMERIC(8,4),
-        max_oi_strike   NUMERIC(14,4),
-        total_oi        INTEGER,
-        total_volume    INTEGER,
-
-        -- ── Scores ────────────────────────────────────────────
-        cash_score      NUMERIC(8,4),
-        options_score   NUMERIC(8,4),
-        combined_score  NUMERIC(8,4),
-        regime          VARCHAR(20),
-        recommendation  VARCHAR(50),
-
-        -- ── Metadata ─────────────────────────────────────────
-        created_at      TIMESTAMP DEFAULT NOW(),
-
-        CONSTRAINT uq_signals_date_symbol
-            UNIQUE (date, symbol)
-    );
-
-    CREATE INDEX IF NOT EXISTS ix_signals_date
-        ON signals (date DESC);
-
-    CREATE INDEX IF NOT EXISTS ix_signals_symbol
-        ON signals (symbol);
-
-    CREATE INDEX IF NOT EXISTS ix_signals_score
-        ON signals (combined_score DESC)
-        WHERE combined_score IS NOT NULL;
-    """
-
-
-# ═══════════════════════════════════════════════════════════════
-#  REGISTRY — all tables managed by this schema
-# ═══════════════════════════════════════════════════════════════
-
-def all_table_names() -> list[str]:
-    """Every table this schema manages, in creation order."""
-    tables = [f"{r}_cash" for r in CASH_REGIONS]
-    tables += [f"{r}_options" for r in OPTIONS_REGIONS]
-    tables.append("signals")
-    return tables
-
-
-def all_ddl() -> list[str]:
-    """All DDL statements in creation order."""
-    stmts = [_cash_ddl(r) for r in CASH_REGIONS]
-    stmts += [_options_ddl(r) for r in OPTIONS_REGIONS]
-    stmts.append(_signals_ddl())
-    return stmts
-
-
-def options_table_names() -> list[str]:
-    return [f"{r}_options" for r in OPTIONS_REGIONS]
-
-
-# ═══════════════════════════════════════════════════════════════
-#  OPERATIONS
-# ═══════════════════════════════════════════════════════════════
-
-def create_all():
-    """Create all tables (idempotent — IF NOT EXISTS)."""
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        for ddl in all_ddl():
-            cur.execute(ddl)
-        conn.commit()
-        LOG.info(f"Created tables: {', '.join(all_table_names())}")
-    except Exception as e:
-        conn.rollback()
-        LOG.error(f"Create failed: {e}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-
-
-def drop_all():
-    """Drop ALL managed tables. Destructive!"""
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        for table in reversed(all_table_names()):
-            cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE;")
-            LOG.info(f"  Dropped: {table}")
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        LOG.error(f"Drop failed: {e}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-
-
-def drop_options():
-    """Drop only options tables. Preserves cash data."""
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        for table in options_table_names():
-            cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE;")
-            LOG.info(f"  Dropped: {table}")
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        LOG.error(f"Drop failed: {e}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-
-
-def table_status() -> dict[str, dict]:
-    """Check which tables exist and their row counts."""
-    conn = get_conn()
-    cur = conn.cursor()
-    status = {}
-    try:
-        for table in all_table_names():
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables
-                    WHERE table_name = %s
-                );
-            """, (table,))
-            exists = cur.fetchone()[0]
-
-            rows = 0
-            if exists:
-                cur.execute(f"SELECT COUNT(*) FROM {table};")
-                rows = cur.fetchone()[0]
-
-            status[table] = {"exists": exists, "rows": rows}
-    finally:
-        cur.close()
-        conn.close()
-
-    return status
-
-
-def print_status():
-    """Pretty-print table status."""
-    status = table_status()
-    LOG.info("=" * 50)
-    LOG.info(f"{'Table':<20s} {'Exists':<10s} {'Rows':>10s}")
-    LOG.info("-" * 50)
-    for table, info in status.items():
-        marker = "✓" if info["exists"] else "✗"
-        rows = f"{info['rows']:,}" if info["exists"] else "—"
-        LOG.info(f"{table:<20s} {marker:<10s} {rows:>10s}")
-    LOG.info("=" * 50)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  CLI
-# ═══════════════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Manage DB schema for options pipeline",
-    )
-    parser.add_argument(
-        "action",
-        choices=["create", "drop", "recreate", "status", "drop-options"],
-        help="Action to perform",
-    )
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="Required for destructive operations (drop, recreate)",
-    )
-    args = parser.parse_args()
-
-    if args.action == "create":
-        create_all()
-
-    elif args.action == "drop":
-        if not args.yes:
-            LOG.error("Pass --yes to confirm dropping ALL tables")
-            return
-        drop_all()
-
-    elif args.action == "recreate":
-        if not args.yes:
-            LOG.error("Pass --yes to confirm drop + recreate ALL tables")
-            return
-        drop_all()
-        create_all()
-
-    elif args.action == "drop-options":
-        if not args.yes:
-            LOG.error("Pass --yes to confirm dropping options tables")
-            return
-        drop_options()
-        LOG.info("Now run: python src/db/schema.py create")
-
-    elif args.action == "status":
-        print_status()
-
-
-if __name__ == "__main__":
-    main()
-
-##################################################
+###########################################
 """
 src/db/loader.py
 --------------
 Unified OHLCV data loader for the CASH compute pipeline.
 
 Reads from:
-  1. Local parquet files (data/universe_ohlcv.parquet, data/india_ohlcv.parquet)
-  2. PostgreSQL regional cash tables (if parquet unavailable)
-  3. yfinance (fallback for missing tickers)
+  1. PostgreSQL regional cash tables (canonical, accumulates via upsert)
+  2. Local parquet files (cumulative cache — fallback if DB unavailable)
+  3. yfinance (last-resort fallback for missing tickers)
 
 Returns DataFrames in the standard format expected by compute/:
   - Columns: open, high, low, close, volume
@@ -1896,6 +1573,10 @@ _parquet_cache: dict[Path, pd.DataFrame] = {}
 
 # ── SQLAlchemy engine cache (one engine per unique PG_CONFIG) ─
 _sa_engine = None
+
+# ── Minimum history thresholds ────────────────────────────────
+MIN_BARS_HARD  = 60    # pipeline refuses to run below this
+MIN_BARS_WARN  = 200   # warning: long-lookback indicators unreliable
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1978,6 +1659,60 @@ def _days_to_yf_period(days: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  MINIMUM HISTORY CHECK
+# ═══════════════════════════════════════════════════════════════
+
+def check_minimum_history(
+    universe_frames: dict[str, pd.DataFrame],
+    min_bars: int = MIN_BARS_HARD,
+    warn_bars: int = MIN_BARS_WARN,
+) -> None:
+    """
+    Verify the loaded universe has enough history for indicators.
+
+    Call this in runner_v2 right after loading data and before
+    computing any indicators.
+
+    Raises
+    ------
+    ValueError
+        If the median ticker has fewer than *min_bars* rows.
+        The error message tells the user to backfill.
+
+    Logs a warning if history is between *min_bars* and *warn_bars*.
+    """
+    if not universe_frames:
+        raise ValueError(
+            "Universe is empty — no ticker data loaded. "
+            "Run ingest_cash.py first."
+        )
+
+    lengths = [len(df) for df in universe_frames.values()]
+    median_len = sorted(lengths)[len(lengths) // 2]
+    min_len = min(lengths)
+
+    if median_len < min_bars:
+        raise ValueError(
+            f"Insufficient history: median ticker has {median_len} bars, "
+            f"need at least {min_bars} for indicators to compute. "
+            f"Run: python src/ingest_cash.py --market <mkt> --period 2y  "
+            f"to backfill, then: python src/db/load_db.py --type cash"
+        )
+
+    if median_len < warn_bars:
+        logger.warning(
+            "Limited history: median ticker has %d bars (ideal >= %d). "
+            "EMA(200) and long-lookback indicators may be unreliable.",
+            median_len, warn_bars,
+        )
+    else:
+        logger.info(
+            "History check OK: median=%d bars, min=%d bars, tickers=%d",
+            median_len, min_len, len(universe_frames),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PUBLIC API
 # ═══════════════════════════════════════════════════════════════
 
@@ -1997,7 +1732,7 @@ def load_ohlcv(
         "parquet" — local parquet files only
         "db"      — PostgreSQL only
         "yfinance"— yfinance download
-        "auto"    — try parquet → db → yfinance
+        "auto"    — try db → parquet → yfinance
     days : int, optional
         If given, only return the most recent *days* calendar days
         of data.  For DB and yfinance sources the filter is applied
@@ -2012,15 +1747,15 @@ def load_ohlcv(
         Empty DataFrame if loading fails.
     """
     if source == "auto":
-        # Try parquet first (fast, no network)
-        df = _load_from_parquet(ticker)
-        if not df.empty:
-            return _apply_days_filter(df, days)
-
-        # Try DB
+        # Try DB first (canonical store with full accumulated history)
         df = _load_from_db(ticker, days=days)
         if not df.empty:
             return df          # already filtered by SQL
+
+        # Try parquet (cumulative cache — works offline)
+        df = _load_from_parquet(ticker)
+        if not df.empty:
+            return _apply_days_filter(df, days)
 
         # Fallback to yfinance
         df = _load_from_yfinance(ticker, days=days)
@@ -2455,12 +2190,18 @@ if __name__ == "__main__":
         "--tickers", nargs="+", default=["SPY", "QQQ", "XLK"],
         help="Tickers to test (default: SPY QQQ XLK)",
     )
+    parser.add_argument(
+        "--source", default="auto",
+        choices=["auto", "db", "parquet", "yfinance"],
+        help="Force data source (default: auto = db → parquet → yfinance)",
+    )
     cli_args = parser.parse_args()
 
     print("\n" + "=" * 60)
     print("  DATA LOADER — Diagnostics")
     if cli_args.days:
         print(f"  Days filter: {cli_args.days}")
+    print(f"  Source priority: {cli_args.source}")
     print("=" * 60)
 
     # Summary
@@ -2481,7 +2222,7 @@ if __name__ == "__main__":
     print(f"\n  Test loading: {cli_args.tickers}"
           + (f" (last {cli_args.days} days)" if cli_args.days else ""))
     for t in cli_args.tickers:
-        df = load_ohlcv(t, days=cli_args.days)
+        df = load_ohlcv(t, source=cli_args.source, days=cli_args.days)
         if df.empty:
             print(f"    {t}: NO DATA")
         else:
@@ -2490,8 +2231,7 @@ if __name__ == "__main__":
                   f"close={df['close'].iloc[-1]:.2f}")
 
     print("\n" + "=" * 60)
-
-######################################################################
+####################################
 """
 src/db/load_db.py — Load parquet/CSV data into PostgreSQL (upsert).
 
@@ -2506,6 +2246,7 @@ Usage:
     python src/db/load_db.py --type options              # options tables only
     python src/db/load_db.py --market us --type cash     # US cash only
     python src/db/load_db.py --dry-run                   # preview, no DB writes
+    python src/db/load_db.py --status                    # show row counts only
 """
 
 import sys
@@ -2536,7 +2277,7 @@ LOG = logging.getLogger(__name__)
 
 DATA_DIR = _ROOT / "data"
 
-CASH_REGIONS    = ["us", "hk", "india"]
+CASH_REGIONS    = ["us", "hk", "in"]
 OPTIONS_REGIONS = ["us", "hk"]
 
 BATCH_SIZE = 2000
@@ -2554,6 +2295,96 @@ def get_conn():
         user=DB_USER,
         password=DB_PASS,
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STATUS — row counts for every table in the database
+# ═══════════════════════════════════════════════════════════════
+
+# Tables we expect to exist (in display order).
+# Any table found in the DB but not listed here is still shown,
+# appended at the end.
+KNOWN_TABLES = [
+    "us_cash",
+    "hk_cash",
+    "india_cash",
+    "us_options",
+    "hk_options",
+]
+
+
+def _discover_tables(conn) -> list[str]:
+    """
+    Return all user tables in the public schema, ordered so that
+    KNOWN_TABLES appear first (in their defined order) followed
+    by any extras alphabetically.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT table_name
+        FROM   information_schema.tables
+        WHERE  table_schema = 'public'
+          AND  table_type   = 'BASE TABLE'
+        ORDER  BY table_name
+        """
+    )
+    all_tables = [row[0] for row in cur.fetchall()]
+    cur.close()
+
+    # Preserve KNOWN_TABLES ordering, then append anything else
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for t in KNOWN_TABLES:
+        if t in all_tables:
+            ordered.append(t)
+            seen.add(t)
+    for t in all_tables:
+        if t not in seen:
+            ordered.append(t)
+
+    return ordered
+
+
+def load_status() -> None:
+    """Show row counts for all tables in the database."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        tables = _discover_tables(conn)
+
+        LOG.info("=" * 55)
+        LOG.info(f"  {'Table':<30s} {'Rows':>12s}  {'Date range':>25s}")
+        LOG.info("-" * 55)
+
+        for table in tables:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
+                count = cur.fetchone()[0]
+
+                # Best-effort date range (works for tables with a 'date' column)
+                date_range = ""
+                try:
+                    cur.execute(
+                        f"SELECT MIN(date)::text, MAX(date)::text FROM {table}"  # noqa: S608
+                    )
+                    row = cur.fetchone()
+                    if row and row[0] and row[1]:
+                        date_range = f"{row[0]} → {row[1]}"
+                except Exception:
+                    pass  # table has no 'date' column — that's fine
+
+                LOG.info(f"  {table:<30s} {count:>12,}  {date_range:>25s}")
+
+            except Exception:
+                LOG.info(f"  {table:<30s} {'(error)':>12s}")
+
+        LOG.info("=" * 55)
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2813,7 +2644,7 @@ def main():
     )
     parser.add_argument(
         "--market",
-        choices=["us", "hk", "india", "all"],
+        choices=["us", "hk", "in", "all"],
         default="all",
     )
     parser.add_argument(
@@ -2826,7 +2657,17 @@ def main():
         action="store_true",
         help="Preview row counts — no DB writes",
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show row counts for all tables and exit (no loading)",
+    )
     args = parser.parse_args()
+
+    # ── Status-only mode: print table counts and exit ──────────
+    if args.status:
+        load_status()
+        return
 
     if args.market == "all":
         cash_markets    = CASH_REGIONS
@@ -2855,11 +2696,14 @@ def main():
     LOG.info(f"TOTAL: {total:,} rows processed")
     LOG.info("=" * 60)
 
+    # ── Show status after loading ──────────────────────────────
+    load_status()
+
 
 if __name__ == "__main__":
     main()
 
-##############################################################
+####################################################
 """
 src/db/db.py
 
@@ -2937,4 +2781,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     test_connection()
 
-################################################################
+########################################

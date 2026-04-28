@@ -4,9 +4,9 @@ src/db/loader.py
 Unified OHLCV data loader for the CASH compute pipeline.
 
 Reads from:
-  1. Local parquet files (data/universe_ohlcv.parquet, data/india_ohlcv.parquet)
-  2. PostgreSQL regional cash tables (if parquet unavailable)
-  3. yfinance (fallback for missing tickers)
+  1. PostgreSQL regional cash tables (canonical, accumulates via upsert)
+  2. Local parquet files (cumulative cache — fallback if DB unavailable)
+  3. yfinance (last-resort fallback for missing tickers)
 
 Returns DataFrames in the standard format expected by compute/:
   - Columns: open, high, low, close, volume
@@ -46,6 +46,10 @@ _parquet_cache: dict[Path, pd.DataFrame] = {}
 
 # ── SQLAlchemy engine cache (one engine per unique PG_CONFIG) ─
 _sa_engine = None
+
+# ── Minimum history thresholds ────────────────────────────────
+MIN_BARS_HARD  = 60    # pipeline refuses to run below this
+MIN_BARS_WARN  = 200   # warning: long-lookback indicators unreliable
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -128,6 +132,60 @@ def _days_to_yf_period(days: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  MINIMUM HISTORY CHECK
+# ═══════════════════════════════════════════════════════════════
+
+def check_minimum_history(
+    universe_frames: dict[str, pd.DataFrame],
+    min_bars: int = MIN_BARS_HARD,
+    warn_bars: int = MIN_BARS_WARN,
+) -> None:
+    """
+    Verify the loaded universe has enough history for indicators.
+
+    Call this in runner_v2 right after loading data and before
+    computing any indicators.
+
+    Raises
+    ------
+    ValueError
+        If the median ticker has fewer than *min_bars* rows.
+        The error message tells the user to backfill.
+
+    Logs a warning if history is between *min_bars* and *warn_bars*.
+    """
+    if not universe_frames:
+        raise ValueError(
+            "Universe is empty — no ticker data loaded. "
+            "Run ingest_cash.py first."
+        )
+
+    lengths = [len(df) for df in universe_frames.values()]
+    median_len = sorted(lengths)[len(lengths) // 2]
+    min_len = min(lengths)
+
+    if median_len < min_bars:
+        raise ValueError(
+            f"Insufficient history: median ticker has {median_len} bars, "
+            f"need at least {min_bars} for indicators to compute. "
+            f"Run: python src/ingest_cash.py --market <mkt> --period 2y  "
+            f"to backfill, then: python src/db/load_db.py --type cash"
+        )
+
+    if median_len < warn_bars:
+        logger.warning(
+            "Limited history: median ticker has %d bars (ideal >= %d). "
+            "EMA(200) and long-lookback indicators may be unreliable.",
+            median_len, warn_bars,
+        )
+    else:
+        logger.info(
+            "History check OK: median=%d bars, min=%d bars, tickers=%d",
+            median_len, min_len, len(universe_frames),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PUBLIC API
 # ═══════════════════════════════════════════════════════════════
 
@@ -147,7 +205,7 @@ def load_ohlcv(
         "parquet" — local parquet files only
         "db"      — PostgreSQL only
         "yfinance"— yfinance download
-        "auto"    — try parquet → db → yfinance
+        "auto"    — try db → parquet → yfinance
     days : int, optional
         If given, only return the most recent *days* calendar days
         of data.  For DB and yfinance sources the filter is applied
@@ -162,15 +220,15 @@ def load_ohlcv(
         Empty DataFrame if loading fails.
     """
     if source == "auto":
-        # Try parquet first (fast, no network)
-        df = _load_from_parquet(ticker)
-        if not df.empty:
-            return _apply_days_filter(df, days)
-
-        # Try DB
+        # Try DB first (canonical store with full accumulated history)
         df = _load_from_db(ticker, days=days)
         if not df.empty:
             return df          # already filtered by SQL
+
+        # Try parquet (cumulative cache — works offline)
+        df = _load_from_parquet(ticker)
+        if not df.empty:
+            return _apply_days_filter(df, days)
 
         # Fallback to yfinance
         df = _load_from_yfinance(ticker, days=days)
@@ -605,12 +663,18 @@ if __name__ == "__main__":
         "--tickers", nargs="+", default=["SPY", "QQQ", "XLK"],
         help="Tickers to test (default: SPY QQQ XLK)",
     )
+    parser.add_argument(
+        "--source", default="auto",
+        choices=["auto", "db", "parquet", "yfinance"],
+        help="Force data source (default: auto = db → parquet → yfinance)",
+    )
     cli_args = parser.parse_args()
 
     print("\n" + "=" * 60)
     print("  DATA LOADER — Diagnostics")
     if cli_args.days:
         print(f"  Days filter: {cli_args.days}")
+    print(f"  Source priority: {cli_args.source}")
     print("=" * 60)
 
     # Summary
@@ -631,7 +695,7 @@ if __name__ == "__main__":
     print(f"\n  Test loading: {cli_args.tickers}"
           + (f" (last {cli_args.days} days)" if cli_args.days else ""))
     for t in cli_args.tickers:
-        df = load_ohlcv(t, days=cli_args.days)
+        df = load_ohlcv(t, source=cli_args.source, days=cli_args.days)
         if df.empty:
             print(f"    {t}: NO DATA")
         else:

@@ -394,14 +394,16 @@ def compute_composite_v2(
     #   For long-biased strategies, lower vol is favorable — but we dampen
     #   the mapping so "calm" is favorable without being maximal:
     #
-    #     0.0  (calm)     → 0.70  (favorable, not max)
+    #     0.10 (calm)     → 0.64  (favorable)
     #     0.35 (normal)   → 0.49  (neutral)
-    #     0.50 (elevated) → 0.40  (mildly unfavorable)
+    #     0.60 (elevated) → 0.34  (mildly unfavorable)
     #     1.0  (chaotic)  → 0.10  (very unfavorable)
     #
     #   Old formula:  1.0 − volreg   (calm → 1.0)  ← pushed regime to ~0.81
     #   New formula:  0.70 − 0.60 × volreg          ← caps at 0.70
     vol_favorable = (0.70 - 0.60 * volreg).clip(0.10, 0.70)
+
+    out["volfavorability"] = vol_favorable                           # ← NEW: display column
 
     out["scoreregime"] = (
         p["regime"]["w_breadth"] * breadth

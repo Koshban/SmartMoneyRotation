@@ -282,6 +282,17 @@ def _compute_etf_indicators(df: pd.DataFrame) -> dict:
     except Exception as e:
         logger.error("_compute_etf_indicators: RVOL computation failed: %s", e)
 
+    # ── Dollar volume 20d average ────────────────────────────────────────  # ← NEW
+    try:
+        if volume is not None and close is not None and n >= 20:
+            dv = volume * close
+            dv_avg = dv.rolling(20, min_periods=15).mean()
+            val = dv_avg.iloc[-1]
+            if pd.notna(val) and val > 0:
+                out["dollarvolume20d"] = float(val)
+    except Exception as e:
+        logger.error("_compute_etf_indicators: dollar volume computation failed: %s", e)
+
     # ── Realized volatility 20d (annualized) ─────────────────────────────
     try:
         if n >= 22:
@@ -364,9 +375,19 @@ def _compute_etf_composite(row: dict, params: dict) -> dict[str, float]:
 
     momentum = 0.50 * rs_z_sc + 0.30 * ret_sc + 0.20 * macd_sc
 
-    # ── participation ─────────────────────────────────────────────────────────
-    rvol = _safe_float(_get(row, "relativevolume", "relative_volume"), 1.0)
-    participation = _normalize(rvol, 0.5, 2.0)
+    # ── participation (FIXED: wider rvol range + dollar volume) ───────────  # ← FIXED
+    rvol = _safe_float(_get(row, "relativevolume", "relative_volume"), 0.0)
+    rvol_sc = _normalize(rvol, 0.05, 1.5)                                   # ← FIXED: was (0.5, 2.0)
+
+    dvol_raw = _safe_float(                                                  # ← NEW
+        _get(row, "dollarvolume20d", "dollarvolumeavg20",
+             "dollar_volume_avg_20"),
+        0.0,
+    )
+    log_dvol = math.log1p(dvol_raw) if dvol_raw > 0 else 0.0                # ← NEW
+    dvol_sc = _normalize(log_dvol, 14.0, 22.0)                              # ← NEW
+
+    participation = 0.60 * rvol_sc + 0.40 * dvol_sc                          # ← FIXED: was just rvol
 
     # ── risk adjustment (higher = lower risk = better) ────────────────────────
     real_vol = _safe_float(_get(row, "realizedvol20d", "realized_vol_20d"), 0.20)
@@ -424,13 +445,14 @@ def _extract_etf_row(df: pd.DataFrame) -> dict | None:
             row[k] = v  # overwrite — computed from real prices is always better
         logger.debug(
             "_extract_etf_row(%s): computed %d indicators inline "
-            "(rsi=%.1f adx=%.1f rvol=%.2f ema_pct=%.4f atr_pct=%.4f)",
+            "(rsi=%.1f adx=%.1f rvol=%.2f ema_pct=%.4f atr_pct=%.4f dvol=%.0f)",
             ticker, len(computed),
             _safe_float(computed.get("rsi14"), -1),
             _safe_float(computed.get("adx14"), -1),
             _safe_float(computed.get("relativevolume"), -1),
             _safe_float(computed.get("closevsema30pct"), -1),
             _safe_float(computed.get("atr14pct"), -1),
+            _safe_float(computed.get("dollarvolume20d"), -1),              # ← NEW
         )
     else:
         n = len(df) if df is not None else 0
@@ -456,7 +478,7 @@ def score_etf_universe(
       ticker, theme, parent_sector, is_sector_etf, is_broad, etf_composite,
       sub_trend, sub_momentum, sub_participation, sub_risk_adj,
       rsi14, adx14, rszscore, relativevolume, closevsema30pct, return20d,
-      realizedvol20d
+      realizedvol20d, dollarvolume20d
     """
     params = params or {}
     scoreable = ALL_TRACKED_ETFS
@@ -548,6 +570,9 @@ def score_etf_universe(
             "return20d":         _safe_float(_get(raw, "return20d"), 0.0),
             "realizedvol20d":    _safe_float(
                 _get(raw, "realizedvol20d", "realized_vol_20d"), 0.20
+            ),
+            "dollarvolume20d":   _safe_float(                                # ← NEW
+                _get(raw, "dollarvolume20d", "dollarvolumeavg20"), 0.0
             ),
         })
 
