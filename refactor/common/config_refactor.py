@@ -187,6 +187,7 @@ CONVERGENCEPARAMS_V2 = {
 # is determined by score + percentile only — no secondary gate cascade.
 
 ACTIONPARAMS_V2 = {
+# If you ever want to loosen it back (e.g., broader market with 4 leading sectors), just lower min_score to 0.70 or raise max_strong_buy to 20.
     "strong_buy": {
     "min_percentile": 0.90,        # was 0.85
     "min_score": 0.75,             # was 0.68
