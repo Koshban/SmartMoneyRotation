@@ -126,151 +126,200 @@ def _compute_etf_indicators(df: pd.DataFrame) -> dict:
     """
     Compute technical indicators from a raw OHLCV DataFrame.
 
-    Called when ETF frames have not been through the stock indicator pipeline.
-    Returns dict keyed by the canonical column names that _compute_etf_composite
-    expects: rsi14, adx14, closevsema30pct, closevssma50pct, macdhist,
-    relativevolume, realizedvol20d, gaprate20, atr14pct.
+    Called when ETF frames have not been through the stock indicator
+    pipeline (or when ensure_columns has backfilled meaningless defaults).
+
+    Each indicator is independently try/excepted so a failure in one
+    (e.g. ADX) does not prevent the others from being computed.
     """
     out: dict[str, float] = {}
     if df is None or len(df) < 2:
         return out
 
-    close = pd.to_numeric(df["close"], errors="coerce") if "close" in df.columns else None
+    try:
+        close = pd.to_numeric(df["close"], errors="coerce") if "close" in df.columns else None
+    except Exception as e:
+        logger.error("_compute_etf_indicators: failed to read close column: %s", e)
+        return out
+
     if close is None or close.dropna().empty:
+        logger.warning(
+            "_compute_etf_indicators: close is None or all-NaN "
+            "(columns=%s rows=%d)",
+            list(df.columns)[:8], len(df),
+        )
         return out
 
     high = (
         pd.to_numeric(df["high"], errors="coerce")
-        if "high" in df.columns
-        else close
+        if "high" in df.columns else close
     )
     low = (
         pd.to_numeric(df["low"], errors="coerce")
-        if "low" in df.columns
-        else close
+        if "low" in df.columns else close
     )
     open_ = (
         pd.to_numeric(df["open"], errors="coerce")
-        if "open" in df.columns
-        else close
+        if "open" in df.columns else close
     )
     volume = (
         pd.to_numeric(df["volume"], errors="coerce")
-        if "volume" in df.columns
-        else None
+        if "volume" in df.columns else None
     )
 
     n = len(close)
     alpha14 = 1.0 / 14
 
     # ── RSI-14 (Wilder smoothing) ─────────────────────────────────────────
-    if n >= 16:
-        delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100.0 - 100.0 / (1.0 + rs)
-        val = rsi.iloc[-1]
-        if pd.notna(val):
-            out["rsi14"] = float(np.clip(val, 0, 100))
+    try:
+        if n >= 16:
+            delta = close.diff()
+            gain = delta.clip(lower=0)
+            loss = -delta.clip(upper=0)
+            avg_gain = gain.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+            rs = avg_gain / avg_loss.replace(0, np.nan)
+            rsi = 100.0 - 100.0 / (1.0 + rs)
+            val = rsi.iloc[-1]
+            if pd.notna(val):
+                out["rsi14"] = float(np.clip(val, 0, 100))
+    except Exception as e:
+        logger.error("_compute_etf_indicators: RSI computation failed: %s", e)
 
     # ── ADX-14 + ATR-14 pct ──────────────────────────────────────────────
-    if n >= 30:
-        prev_close = close.shift(1)
-        tr = pd.concat(
-            [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
-            axis=1,
-        ).max(axis=1)
+    try:
+        if n >= 30:
+            prev_close = close.shift(1)
+            tr = pd.concat(
+                [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+                axis=1,
+            ).max(axis=1)
 
-        up_move = high - high.shift(1)
-        dn_move = low.shift(1) - low
+            up_move = high - high.shift(1)
+            dn_move = low.shift(1) - low
 
-        plus_dm = pd.Series(
-            np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0),
-            index=close.index,
-        )
-        minus_dm = pd.Series(
-            np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0),
-            index=close.index,
-        )
+            plus_dm = pd.Series(
+                np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0),
+                index=close.index,
+            )
+            minus_dm = pd.Series(
+                np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0),
+                index=close.index,
+            )
 
-        atr_s = tr.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
-        plus_di = (
-            100
-            * plus_dm.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
-            / atr_s.replace(0, np.nan)
-        )
-        minus_di = (
-            100
-            * minus_dm.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
-            / atr_s.replace(0, np.nan)
-        )
+            atr_s = tr.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+            plus_di = (
+                100
+                * plus_dm.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+                / atr_s.replace(0, np.nan)
+            )
+            minus_di = (
+                100
+                * minus_dm.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+                / atr_s.replace(0, np.nan)
+            )
 
-        di_sum = plus_di + minus_di
-        dx = 100 * (plus_di - minus_di).abs() / di_sum.replace(0, np.nan)
-        adx = dx.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
+            di_sum = plus_di + minus_di
+            dx = 100 * (plus_di - minus_di).abs() / di_sum.replace(0, np.nan)
+            adx = dx.ewm(alpha=alpha14, min_periods=14, adjust=False).mean()
 
-        adx_val = adx.iloc[-1]
-        if pd.notna(adx_val):
-            out["adx14"] = float(np.clip(adx_val, 0, 100))
+            adx_val = adx.iloc[-1]
+            if pd.notna(adx_val):
+                out["adx14"] = float(np.clip(adx_val, 0, 100))
 
-        atr_val = atr_s.iloc[-1]
-        c_val = close.iloc[-1]
-        if pd.notna(atr_val) and pd.notna(c_val) and c_val > 0:
-            out["atr14pct"] = float(atr_val / c_val)
+            atr_val = atr_s.iloc[-1]
+            c_val = close.iloc[-1]
+            if pd.notna(atr_val) and pd.notna(c_val) and c_val > 0:
+                out["atr14pct"] = float(atr_val / c_val)
+    except Exception as e:
+        logger.error("_compute_etf_indicators: ADX/ATR computation failed: %s", e)
 
     # ── Close vs EMA-30 % ────────────────────────────────────────────────
-    if n >= 30:
-        ema30 = close.ewm(span=30, min_periods=30, adjust=False).mean()
-        e_val = ema30.iloc[-1]
-        c_val = close.iloc[-1]
-        if pd.notna(e_val) and pd.notna(c_val) and e_val > 0:
-            out["closevsema30pct"] = float(c_val / e_val - 1.0)
+    try:
+        if n >= 30:
+            ema30 = close.ewm(span=30, min_periods=30, adjust=False).mean()
+            e_val = ema30.iloc[-1]
+            c_val = close.iloc[-1]
+            if pd.notna(e_val) and pd.notna(c_val) and e_val > 0:
+                out["closevsema30pct"] = float(c_val / e_val - 1.0)
+    except Exception as e:
+        logger.error("_compute_etf_indicators: EMA-30 computation failed: %s", e)
 
     # ── Close vs SMA-50 % ────────────────────────────────────────────────
-    if n >= 50:
-        sma50 = close.rolling(50).mean()
-        s_val = sma50.iloc[-1]
-        c_val = close.iloc[-1]
-        if pd.notna(s_val) and pd.notna(c_val) and s_val > 0:
-            out["closevssma50pct"] = float(c_val / s_val - 1.0)
+    try:
+        if n >= 50:
+            sma50 = close.rolling(50).mean()
+            s_val = sma50.iloc[-1]
+            c_val = close.iloc[-1]
+            if pd.notna(s_val) and pd.notna(c_val) and s_val > 0:
+                out["closevssma50pct"] = float(c_val / s_val - 1.0)
+    except Exception as e:
+        logger.error("_compute_etf_indicators: SMA-50 computation failed: %s", e)
 
     # ── MACD histogram (12, 26, 9) ───────────────────────────────────────
-    if n >= 35:
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        macd_line = ema12 - ema26
-        signal = macd_line.ewm(span=9, adjust=False).mean()
-        hist = macd_line - signal
-        val = hist.iloc[-1]
-        if pd.notna(val):
-            out["macdhist"] = float(val)
+    try:
+        if n >= 35:
+            ema12 = close.ewm(span=12, adjust=False).mean()
+            ema26 = close.ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            signal = macd_line.ewm(span=9, adjust=False).mean()
+            hist = macd_line - signal
+            val = hist.iloc[-1]
+            if pd.notna(val):
+                out["macdhist"] = float(val)
+    except Exception as e:
+        logger.error("_compute_etf_indicators: MACD computation failed: %s", e)
 
     # ── Relative volume (current bar vs 20d average) ─────────────────────
-    if volume is not None and n >= 21:
-        vol_clean = volume.dropna()
-        if len(vol_clean) >= 21:
-            avg_20 = vol_clean.iloc[-21:-1].mean()
-            cur = vol_clean.iloc[-1]
-            if pd.notna(avg_20) and avg_20 > 0 and pd.notna(cur):
-                out["relativevolume"] = float(cur / avg_20)
+    try:
+        if volume is not None and n >= 21:
+            vol_clean = volume.dropna()
+            if len(vol_clean) >= 21:
+                avg_20 = vol_clean.iloc[-21:-1].mean()
+                cur = vol_clean.iloc[-1]
+                if pd.notna(avg_20) and avg_20 > 0 and pd.notna(cur):
+                    out["relativevolume"] = float(cur / avg_20)
+    except Exception as e:
+        logger.error("_compute_etf_indicators: RVOL computation failed: %s", e)
 
     # ── Realized volatility 20d (annualized) ─────────────────────────────
-    if n >= 22:
-        log_ret = np.log(close / close.shift(1)).dropna()
-        if len(log_ret) >= 20:
-            out["realizedvol20d"] = float(log_ret.iloc[-20:].std() * np.sqrt(252))
+    try:
+        if n >= 22:
+            log_ret = np.log(close / close.shift(1)).dropna()
+            if len(log_ret) >= 20:
+                out["realizedvol20d"] = float(
+                    log_ret.iloc[-20:].std() * np.sqrt(252)
+                )
+    except Exception as e:
+        logger.error("_compute_etf_indicators: realized vol computation failed: %s", e)
 
     # ── Gap rate 20 (fraction of days with |gap| > 1%) ───────────────────
-    if n >= 22 and "open" in df.columns:
-        prev_c = close.shift(1)
-        gap_pct = ((open_ - prev_c) / prev_c.replace(0, np.nan)).abs()
-        last_20 = gap_pct.iloc[-20:]
-        valid = last_20.dropna()
-        if len(valid) > 0:
-            out["gaprate20"] = float((valid > 0.01).sum() / len(valid))
+    try:
+        if n >= 22 and "open" in df.columns:
+            prev_c = close.shift(1)
+            gap_pct = ((open_ - prev_c) / prev_c.replace(0, np.nan)).abs()
+            last_20 = gap_pct.iloc[-20:]
+            valid = last_20.dropna()
+            if len(valid) > 0:
+                out["gaprate20"] = float((valid > 0.01).sum() / len(valid))
+    except Exception as e:
+        logger.error("_compute_etf_indicators: gap rate computation failed: %s", e)
+
+    if out:
+        logger.debug(
+            "_compute_etf_indicators: n=%d computed=%d indicators: %s",
+            n, len(out), {k: round(v, 4) for k, v in out.items()},
+        )
+    else:
+        logger.warning(
+            "_compute_etf_indicators: n=%d but produced ZERO indicators "
+            "(close_valid=%d high_in_cols=%s low_in_cols=%s vol_in_cols=%s)",
+            n,
+            int(close.notna().sum()),
+            "high" in df.columns,
+            "low" in df.columns,
+            "volume" in df.columns,
+        )
 
     return out
 
@@ -346,9 +395,11 @@ def _extract_etf_row(df: pd.DataFrame) -> dict | None:
     """
     Extract the last row of an ETF frame as a dict.
 
-    If key indicator columns are absent (i.e. the frame was never run through
-    the stock indicator pipeline), compute them inline from OHLCV so that
-    _compute_etf_composite gets real values instead of defaults.
+    ALWAYS computes indicators from OHLCV and overwrites whatever is
+    in the row.  This is necessary because ensure_columns backfills
+    neutral defaults (RSI=50.0, ADX=20.0, RVOL=1.0 …) that are
+    indistinguishable from real computed values — if we only compute
+    when values are "missing", we never compute at all.
     """
     if df is None or df.empty:
         return None
@@ -362,31 +413,33 @@ def _extract_etf_row(df: pd.DataFrame) -> dict | None:
         if pd.notna(c_now) and pd.notna(c_20) and c_20 > 0:
             row["return20d"] = float(c_now / c_20 - 1.0)
 
-    # ── Inline indicator computation if upstream didn't provide them ──────
-    # Check for ANY of the canonical indicator names
-    has_rsi = _get(row, "rsi14", "rsi_14") is not None
-    has_adx = _get(row, "adx14", "adx_14") is not None
-    has_rvol = _get(row, "relativevolume", "relative_volume") is not None
-    has_ema = _get(row, "closevsema30pct", "close_vs_ema_30_pct") is not None
+    # ── ALWAYS compute indicators from OHLCV ─────────────────────────────
+    # Do NOT gate this on "are indicators already present" — they may be
+    # ensure_columns defaults that look real but carry zero information.
+    computed = _compute_etf_indicators(df)
+    ticker = row.get("ticker", row.get("symbol", "?"))
 
-    if not (has_rsi and has_adx and has_rvol and has_ema):
-        computed = _compute_etf_indicators(df)
-        n_filled = 0
+    if computed:
         for k, v in computed.items():
-            if row.get(k) is None:
-                row[k] = v
-                n_filled += 1
-        ticker = row.get("ticker", row.get("symbol", "?"))
-        if n_filled > 0:
-            logger.debug(
-                "_extract_etf_row(%s): computed %d indicators inline "
-                "(rsi=%.1f adx=%.1f rvol=%.2f ema_pct=%.4f)",
-                ticker, n_filled,
-                _safe_float(row.get("rsi14"), 50.0),
-                _safe_float(row.get("adx14"), 15.0),
-                _safe_float(row.get("relativevolume"), 1.0),
-                _safe_float(row.get("closevsema30pct"), 0.0),
-            )
+            row[k] = v  # overwrite — computed from real prices is always better
+        logger.debug(
+            "_extract_etf_row(%s): computed %d indicators inline "
+            "(rsi=%.1f adx=%.1f rvol=%.2f ema_pct=%.4f atr_pct=%.4f)",
+            ticker, len(computed),
+            _safe_float(computed.get("rsi14"), -1),
+            _safe_float(computed.get("adx14"), -1),
+            _safe_float(computed.get("relativevolume"), -1),
+            _safe_float(computed.get("closevsema30pct"), -1),
+            _safe_float(computed.get("atr14pct"), -1),
+        )
+    else:
+        n = len(df) if df is not None else 0
+        has_close = "close" in df.columns if df is not None else False
+        logger.warning(
+            "_extract_etf_row(%s): _compute_etf_indicators returned EMPTY "
+            "(rows=%d has_close=%s) — ETF will use adapter defaults",
+            ticker, n, has_close,
+        )
 
     return row
 

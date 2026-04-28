@@ -42,8 +42,7 @@ import pandas as pd
 
 from compute.indicators import compute_all_indicators
 
-from common.sector_map import get_sector_or_class, get_theme          # ── CHANGED: added get_theme
-# At the top of pipeline_v2.py, add the import:
+from common.sector_map import get_sector_or_class, get_theme
 from refactor.strategy.enrich_v2 import enrich_with_rotation
 from refactor.strategy.adapters_v2 import ensure_columns
 from refactor.strategy.breadth_v2 import compute_breadth
@@ -264,7 +263,6 @@ def _build_leadership_snapshot(leadership_frames: dict[str, pd.DataFrame]) -> pd
         if not row.get("sector") or row["sector"] == "Unknown":
             row["sector"] = get_sector_or_class(ticker)
         row["sector"] = row.get("sector") or "Unknown"
-        # ── CHANGED: enrich theme in leadership snapshot ──────────────────────
         if not row.get("theme") or row["theme"] == "Unknown":
             row["theme"] = get_theme(ticker) or "Unknown"
         rows.append(row)
@@ -562,7 +560,6 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
         vol_down_streak = int((vol_col.diff().dropna() < 0).tail(3).sum()) if vol_col.notna().all() else 0
         price_5d_change = float(close_col.iloc[-1] / close_col.iloc[0] - 1.0) if close_col.notna().all() and close_col.iloc[0] != 0 else None
 
-        # ── CHANGED: enrich sector and theme for exhaustion candidates ────────
         sector = get_sector_or_class(ticker) or "Unknown"
         theme = get_theme(ticker) or "Unknown"
 
@@ -622,8 +619,8 @@ def _build_selling_exhaustion_table(tradable_frames: dict[str, pd.DataFrame], br
             "price_vs_ema30_pct": last_ext, "atr_14_pct": last_atr,
             "gap_rate_20": last_gap, "leadership_strength": leadership,
             "breadthregime": breadth_regime, "volregime": vol_regime,
-            "sector": sector,                                              # ── CHANGED: was tail.iloc[-1].get(...)
-            "theme": theme,                                                # ── CHANGED: was tail.iloc[-1].get(...)
+            "sector": sector,
+            "theme": theme,
             "decision_hint": "Use only with confirmation; stronger when RSI turns up, price firms, and volume re-expands",
         })
 
@@ -755,7 +752,7 @@ def run_pipeline_v2(
     sector_regimes = rotation_result["sector_regimes"]
     ticker_regimes = rotation_result["ticker_regimes"]
     sector_summary = rotation_result["sector_summary"]
-    etf_ranking    = rotation_result.get("etf_ranking", pd.DataFrame())   # ── NEW
+    etf_ranking    = rotation_result.get("etf_ranking", pd.DataFrame())
 
     # ── E. leadership snapshot ────────────────────────────────────────────────
     if precomputed:
@@ -845,7 +842,6 @@ def run_pipeline_v2(
             row["sector"] = get_sector_or_class(ticker)
         row["sector"] = row.get("sector") or "Unknown"
 
-        # ── CHANGED: enrich theme from sector_map ─────────────────────────────
         if not row.get("theme") or row["theme"] == "Unknown":
             row["theme"] = get_theme(ticker) or "Unknown"
 
@@ -905,7 +901,7 @@ def run_pipeline_v2(
                 row.get("volregime", "unknown"),
                 row.get("dispersion20", "missing"),
                 row.get("sector", "Unknown"),
-                row.get("theme", "Unknown"),                               # ── CHANGED: log theme
+                row.get("theme", "Unknown"),
             )
             prep_logged += 1
 
@@ -938,7 +934,6 @@ def run_pipeline_v2(
             sr_dist = latest["sectrsregime"].value_counts().to_dict()
             logger.info("Scoreable set sectrsregime distribution: %s", sr_dist)
 
-        # ── CHANGED: log theme distribution ───────────────────────────────────
         if "theme" in latest.columns:
             theme_dist = latest["theme"].value_counts().to_dict()
             logger.info("Scoreable set theme distribution: %s", theme_dist)
@@ -953,7 +948,51 @@ def run_pipeline_v2(
             ] if c in latest.columns]
             logger.debug("Latest snapshot preview:\n%s", latest[cols].head(30).to_string(index=False))
 
-    scored = compute_composite_v2(latest, weights=scoring_weights, params=scoring_params) if not latest.empty else pd.DataFrame()
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── CHANGED: extract market-level scalars for scoreregime ─────────────────
+    # breadth_info["breadthscore"] and last_vol["volregimescore"] are
+    # single scalars for the most recent date.  Passing them as kwargs
+    # prevents compute_composite_v2 from reading the per-row columns
+    # (which are almost always the ensure_columns defaults of 0.5 / 0.0).
+    # ══════════════════════════════════════════════════════════════════════════
+    _market_breadth_score: float | None = None
+    _raw_breadth = breadth_info.get("breadthscore")
+    if _raw_breadth is not None:
+        try:
+            _market_breadth_score = float(_raw_breadth)
+            if math.isnan(_market_breadth_score):
+                _market_breadth_score = None
+        except (TypeError, ValueError):
+            _market_breadth_score = None
+
+    _market_vol_score: float | None = None
+    _raw_vol = last_vol.get("volregimescore")
+    if _raw_vol is not None:
+        try:
+            _market_vol_score = float(_raw_vol)
+            if math.isnan(_market_vol_score):
+                _market_vol_score = None
+        except (TypeError, ValueError):
+            _market_vol_score = None
+
+    logger.info(
+        "Market-level scores for composite: breadth_score=%s vol_regime_score=%s",
+        f"{_market_breadth_score:.4f}" if _market_breadth_score is not None else "None",
+        f"{_market_vol_score:.4f}" if _market_vol_score is not None else "None",
+    )
+    # ══════════════════════════════════════════════════════════════════════════
+
+    scored = (
+        compute_composite_v2(
+            latest,
+            weights=scoring_weights,
+            params=scoring_params,
+            market_breadth_score=_market_breadth_score,        # ← NEW
+            market_vol_regime_score=_market_vol_score,         # ← NEW
+        )
+        if not latest.empty
+        else pd.DataFrame()
+    )
     logger.info("Scored rows=%d", len(scored))
     if not scored.empty:
         _ap = action_params if action_params is not None else ACTIONPARAMS_V2
@@ -963,14 +1002,7 @@ def run_pipeline_v2(
             + _lead_w * scored.get("leadership_strength", 0.0)
         ).clip(0, 1)
 
-            # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────────
-        #   This replaces the binary scorerotation (0 or 1) with a graded
-        #   value (0.0–1.0) based on blended regime + ETF composite boost,
-        #   then recomputes scorecomposite_v2.
-        #
-        #   Must run AFTER scoring (D1) and rotation (D2),
-        #   but BEFORE action assignment (E) and portfolio construction (F).
-
+        # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────
         enrich_params = {
             "regime_scores": {
                 "leading":    1.00,
@@ -989,9 +1021,41 @@ def run_pipeline_v2(
                 "scorerotation":      0.20,
             },
         }
+        # ── TEMPORARY DIAGNOSTIC: score component audit for STRONG_BUY candidates ──
+    if not scored.empty and logger.isEnabledFor(logging.INFO):
+        _diag = scored.nlargest(30, "scorecomposite_v2")[
+            [c for c in [
+                "ticker", "sector", "sectrsregime",
+                "scoretrend", "scoreparticipation", "scorerisk",
+                "scoreregime", "scorerotation", "scorepenalty",
+                "scorecomposite_v2",
+                "breadthscore", "volregimescore",
+                "rsi14", "adx14", "relativevolume", "rszscore",
+            ] if c in scored.columns]
+        ].copy()
+        logger.info(
+            "DIAGNOSTIC — Top 30 score component breakdown:\n%s",
+            _diag.to_string(index=False, float_format="%.4f"),
+        )
 
+        # Borderline analysis: names near the 0.68 cutoff
+        _border = scored[
+            scored["scorecomposite_v2"].between(0.65, 0.72)
+        ].sort_values("scorecomposite_v2", ascending=False)
+        if not _border.empty:
+            logger.info(
+                "DIAGNOSTIC — Borderline names (0.65–0.72):\n%s",
+                _border[
+                    [c for c in [
+                        "ticker", "scoretrend", "scoreparticipation",
+                        "scorerisk", "scoreregime", "scorerotation",
+                        "scorecomposite_v2", "sectrsregime",
+                    ] if c in _border.columns]
+                ].to_string(index=False, float_format="%.4f"),
+            )
+    # ── END DIAGNOSTIC ──
         scored = enrich_with_rotation(
-            scored_df=scored,          # your scored DataFrame from step D1
+            scored_df=scored,
             rotation_result=rotation_result,
             params=enrich_params,
         )
@@ -1007,7 +1071,6 @@ def run_pipeline_v2(
             int((scored["scorecomposite_v2"] >= 0.50).sum()),
         )
         if logger.isEnabledFor(logging.DEBUG):
-            # ── CHANGED: added scorerotation to debug preview ─────────────────
             cols = [c for c in ["ticker", "scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorerotation", "scorepenalty", "scorecomposite_v2", "rsi14", "adx14", "relativevolume", "sectrsregime"] if c in scored.columns]
             logger.debug("Top scored names:\n%s", scored.sort_values("scorecomposite_v2", ascending=False)[cols].head(30).to_string(index=False))
 
