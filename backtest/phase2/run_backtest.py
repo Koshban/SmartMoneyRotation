@@ -16,6 +16,8 @@ from pathlib import Path
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
 
 from backtest.phase2.data_source import BacktestDataSource
 from backtest.phase2.engine import BacktestEngine
@@ -181,65 +183,201 @@ CONFIG = {
 
 
 # ══════════════════════════════════════════════════════════════════
+#  EDGE-STYLING HELPER
+# ══════════════════════════════════════════════════════════════════
+
+def _edge(port_val: float, bench_val: float, higher_is_better: bool = True) -> str:
+    """Return a Rich-styled string for the edge column."""
+    diff = port_val - bench_val
+    # For metrics where lower is better (vol, drawdown), flip sign for colour
+    is_good = diff > 0 if higher_is_better else diff < 0
+    colour = "green" if is_good else ("red" if (diff != 0) else "dim")
+    return f"[{colour}]{diff:+.2%}[/{colour}]"
+
+
+def _edge_ratio(port_val: float, bench_val: float) -> str:
+    """Edge for ratio metrics (not percentages)."""
+    diff = port_val - bench_val
+    colour = "green" if diff > 0 else ("red" if diff < 0 else "dim")
+    return f"[{colour}]{diff:+.3f}[/{colour}]"
+
+
+# ══════════════════════════════════════════════════════════════════
 #  METRICS DISPLAY
 # ══════════════════════════════════════════════════════════════════
 
-def _print_metrics(metrics: dict) -> None:
-    """Pretty-print backtest metrics as a Rich table."""
-    table = Table(
-        title="Backtest Results",
+def _print_metrics(
+    metrics: dict,
+    market: str = "",
+    benchmark_name: str = "",
+) -> None:
+    """Pretty-print backtest metrics with side-by-side comparison."""
+    m = metrics  # shorthand
+
+    actual_start = m.get("actual_start", "?")
+    actual_end = m.get("actual_end", "?")
+    years = m.get("years", 0)
+    n_days = m.get("trading_days", 0)
+    expected = m.get("expected_trading_days", 0)
+    initial = m.get("initial_capital", 0)
+    final = m.get("final_value", 0)
+
+    # ── Header Panel ──────────────────────────────────────────────
+    header_lines = [
+        f"[bold]Period :[/]  {actual_start}  →  {actual_end}   "
+        f"([cyan]{n_days}[/] trading days  /  [cyan]{years:.2f}[/] years)",
+        f"[bold]Capital:[/]  \({initial:,.0f}  →  [bold green]\){final:,.0f}[/]",
+        f"[bold]Bench  :[/]  {benchmark_name or '—'}",
+    ]
+    console.print()
+    console.print(Panel(
+        "\n".join(header_lines),
+        title=f"[bold cyan]Backtest Results — {market}[/]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+
+    # ── Data coverage warning ─────────────────────────────────────
+    if expected > 0 and n_days < expected * 0.85:
+        console.print(
+            f"  [yellow]⚠  Data coverage:[/] {n_days} trading days found vs "
+            f"~{expected} expected for {years:.1f} years.  "
+            f"Check parquet data completeness.\n"
+        )
+
+    # ══════════════════════════════════════════════════════════════
+    #  TABLE 1 — Performance Comparison
+    # ══════════════════════════════════════════════════════════════
+    t1 = Table(
+        title="Performance Comparison",
         show_header=True,
         header_style="bold cyan",
+        title_style="bold",
+        min_width=64,
     )
-    table.add_column("Metric", style="bold", min_width=22)
-    table.add_column("Value", justify="right")
+    t1.add_column("Metric", style="bold", min_width=20)
+    t1.add_column("Portfolio", justify="right", min_width=12)
+    t1.add_column(f"Benchmark ({benchmark_name})", justify="right", min_width=12)
+    t1.add_column("Edge", justify="right", min_width=10)
 
-    rows = [
-        # ── returns ──────────────────────────────────────────
-        ("Total Return",          "total_return",          lambda v: f"{v:+.2%}"),
-        ("Ann. Return",           "annualized_return",     lambda v: f"{v:+.2%}"),
-        ("Final Value",           "final_value",           lambda v: f"${v:,.0f}"),
-        ("Ann. Volatility",       "annualized_vol",        lambda v: f"{v:.2%}"),
-        ("Sharpe Ratio",          "sharpe_ratio",          lambda v: f"{v:.3f}"),
-        ("Sortino Ratio",         "sortino_ratio",         lambda v: f"{v:.3f}"),
-        ("Max Drawdown",          "max_drawdown",          lambda v: f"{v:.2%}"),
-        ("Max DD Duration",       "max_dd_duration_days",  lambda v: f"{v:.0f} days"),
-        ("Calmar Ratio",          "calmar_ratio",          lambda v: f"{v:.3f}"),
-        # ── benchmark ────────────────────────────────────────
-        ("Benchmark Return",      "benchmark_total_return", lambda v: f"{v:+.2%}"),
-        ("Benchmark Ann. Return", "benchmark_ann_return",   lambda v: f"{v:+.2%}"),
-        ("Benchmark Max DD",      "benchmark_max_dd",       lambda v: f"{v:.2%}"),
-        ("Alpha (Jensen)",        "alpha",                  lambda v: f"{v:+.2%}"),
-        ("Beta",                  "beta",                   lambda v: f"{v:.3f}"),
-        ("Tracking Error",        "tracking_error",         lambda v: f"{v:.2%}"),
-        ("Information Ratio",     "information_ratio",      lambda v: f"{v:.3f}"),
-        # ── trades ───────────────────────────────────────────
-        ("Total Trades",          "total_trades",          lambda v: f"{v:.0f}"),
-        ("Winning Trades",        "winning_trades",        lambda v: f"{v:.0f}"),
-        ("Losing Trades",         "losing_trades",         lambda v: f"{v:.0f}"),
-        ("Win Rate",              "win_rate",              lambda v: f"{v:.1%}"),
-        ("Avg Win",               "avg_win_pct",           lambda v: f"{v:+.2%}"),
-        ("Avg Loss",              "avg_loss_pct",          lambda v: f"{v:+.2%}"),
-        ("Profit Factor",         "profit_factor",         lambda v: f"{v:.2f}"),
-        ("Avg PnL",               "avg_pnl_pct",           lambda v: f"{v:+.2%}"),
-        ("Median PnL",            "median_pnl_pct",        lambda v: f"{v:+.2%}"),
-        ("Avg Holding Days",      "avg_holding_days",      lambda v: f"{v:.1f}"),
-        ("Best Trade",            "best_trade_pct",        lambda v: f"{v:+.2%}"),
-        ("Worst Trade",           "worst_trade_pct",       lambda v: f"{v:+.2%}"),
-        ("Expectancy ($)",        "expectancy_dollar",     lambda v: f"${v:,.0f}"),
-        # ── utilisation ──────────────────────────────────────
-        ("Avg Positions",         "avg_positions",         lambda v: f"{v:.1f}"),
-        ("Max Positions Held",    "max_positions_held",    lambda v: f"{v:.0f}"),
-        ("Trading Days",          "trading_days",          lambda v: f"{v:.0f}"),
-        ("Total Buy Signals",     "total_buy_signals",     lambda v: f"{v:.0f}"),
-        ("Total Sell Signals",    "total_sell_signals",    lambda v: f"{v:.0f}"),
-    ]
+    # helper: percentage row
+    def _pct_row(label, port_key, bench_key, higher_is_better=True):
+        pv = m.get(port_key, 0)
+        bv = m.get(bench_key, 0)
+        t1.add_row(
+            label,
+            f"{pv:+.2%}",
+            f"{bv:+.2%}" if bv != 0 else "—",
+            _edge(pv, bv, higher_is_better) if bv != 0 else "—",
+        )
 
-    for label, key, formatter in rows:
-        if key in metrics:
-            table.add_row(label, formatter(metrics[key]))
+    def _ratio_row(label, port_key, bench_key):
+        pv = m.get(port_key, 0)
+        bv = m.get(bench_key, 0)
+        t1.add_row(
+            label,
+            f"{pv:.3f}",
+            f"{bv:.3f}" if bv != 0 else "—",
+            _edge_ratio(pv, bv) if bv != 0 else "—",
+        )
 
-    console.print(table)
+    _pct_row("Total Return",    "total_return",       "benchmark_total_return")
+    _pct_row("CAGR",            "annualized_return",   "benchmark_ann_return")
+    _pct_row("Volatility",      "annualized_vol",      "benchmark_ann_vol",      higher_is_better=False)
+    _ratio_row("Sharpe Ratio",  "sharpe_ratio",        "benchmark_sharpe")
+    _ratio_row("Sortino Ratio", "sortino_ratio",       "benchmark_sortino")
+    _pct_row("Max Drawdown",    "max_drawdown",        "benchmark_max_dd",       higher_is_better=False)
+    _ratio_row("Calmar Ratio",  "calmar_ratio",        "benchmark_calmar")
+
+    # Max DD duration (portfolio only)
+    dd_dur = m.get("max_dd_duration_days", 0)
+    t1.add_row("Max DD Duration", f"{dd_dur:.0f} days", "—", "—")
+
+    console.print(t1)
+    console.print()
+
+    # ══════════════════════════════════════════════════════════════
+    #  TABLE 2 — Risk-Adjusted Alpha
+    # ══════════════════════════════════════════════════════════════
+    t2 = Table(
+        title="Risk-Adjusted Alpha",
+        show_header=True,
+        header_style="bold cyan",
+        title_style="bold",
+        min_width=40,
+    )
+    t2.add_column("Metric", style="bold", min_width=20)
+    t2.add_column("Value", justify="right", min_width=12)
+
+    alpha_val = m.get("alpha", 0)
+    alpha_colour = "green" if alpha_val > 0 else "red"
+    t2.add_row("Alpha (Jensen)", f"[{alpha_colour}]{alpha_val:+.2%}[/{alpha_colour}]")
+    t2.add_row("Beta", f"{m.get('beta', 0):.3f}")
+    t2.add_row("Tracking Error", f"{m.get('tracking_error', 0):.2%}")
+
+    ir = m.get("information_ratio", 0)
+    ir_colour = "green" if ir > 0 else "red"
+    t2.add_row("Information Ratio", f"[{ir_colour}]{ir:.3f}[/{ir_colour}]")
+
+    console.print(t2)
+    console.print()
+
+    # ══════════════════════════════════════════════════════════════
+    #  TABLE 3 — Trade Statistics
+    # ══════════════════════════════════════════════════════════════
+    t3 = Table(
+        title="Trade Statistics",
+        show_header=True,
+        header_style="bold cyan",
+        title_style="bold",
+        min_width=40,
+    )
+    t3.add_column("Metric", style="bold", min_width=20)
+    t3.add_column("Value", justify="right", min_width=14)
+
+    total_t = m.get("total_trades", 0)
+    win_t = m.get("winning_trades", 0)
+    lose_t = m.get("losing_trades", 0)
+
+    t3.add_row("Total Trades", f"{total_t:.0f}")
+    t3.add_row("Win / Loss", f"[green]{win_t}[/] / [red]{lose_t}[/]")
+    t3.add_row("Win Rate", f"{m.get('win_rate', 0):.1%}")
+    t3.add_row("Avg Win", f"[green]{m.get('avg_win_pct', 0):+.2%}[/]")
+    t3.add_row("Avg Loss", f"[red]{m.get('avg_loss_pct', 0):+.2%}[/]")
+    t3.add_row("Profit Factor", f"{m.get('profit_factor', 0):.2f}")
+    t3.add_row("Avg PnL", f"{m.get('avg_pnl_pct', 0):+.2%}")
+    t3.add_row("Median PnL", f"{m.get('median_pnl_pct', 0):+.2%}")
+    t3.add_row("Avg Holding Days", f"{m.get('avg_holding_days', 0):.1f}")
+    t3.add_row(
+        "Best / Worst Trade",
+        f"[green]{m.get('best_trade_pct', 0):+.1%}[/]  /  "
+        f"[red]{m.get('worst_trade_pct', 0):+.1%}[/]",
+    )
+    t3.add_row("Expectancy ($)", f"${m.get('expectancy_dollar', 0):,.0f}")
+
+    console.print(t3)
+    console.print()
+
+    # ══════════════════════════════════════════════════════════════
+    #  TABLE 4 — Portfolio Utilisation
+    # ══════════════════════════════════════════════════════════════
+    t4 = Table(
+        title="Portfolio Utilisation",
+        show_header=True,
+        header_style="bold cyan",
+        title_style="bold",
+        min_width=40,
+    )
+    t4.add_column("Metric", style="bold", min_width=20)
+    t4.add_column("Value", justify="right", min_width=12)
+
+    t4.add_row("Avg Positions", f"{m.get('avg_positions', 0):.1f}")
+    t4.add_row("Max Positions Held", f"{m.get('max_positions_held', 0):.0f}")
+    t4.add_row("Total Buy Signals", f"{m.get('total_buy_signals', 0):,.0f}")
+    t4.add_row("Total Sell Signals", f"{m.get('total_sell_signals', 0):,.0f}")
+
+    console.print(t4)
+    console.print()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -298,22 +436,29 @@ def main():
     results["metrics"] = metrics
 
     # ── display ───────────────────────────────────────────────
-    console.print()
-    _print_metrics(metrics)
+    benchmark_name = BENCHMARKS.get(args.market, "?")
+    _print_metrics(metrics, market=args.market, benchmark_name=benchmark_name)
 
     # ── log metrics to file ───────────────────────────────────
     log.info("--- Metrics ---")
     for key, val in metrics.items():
         log.info("  %-30s  %s", key, val)
 
-    # ── summary ───────────────────────────────────────────────
+    # ── compact summary for quick scan ────────────────────────
     bench_ret = metrics.get("benchmark_total_return", 0)
+    ann_ret = metrics.get("annualized_return", 0)
+    bench_cagr = metrics.get("benchmark_ann_return", 0)
+    alpha = metrics.get("alpha", 0)
+    years = metrics.get("years", 0)
+
     summary_lines = [
         f"Market          : {args.market}",
-        f"Period          : {args.start} -> {args.end}",
+        f"Period          : {args.start} -> {args.end}  ({years:.2f} years)",
         f"Start capital   : ${args.capital:,.0f}",
-        f"Benchmark       : {BENCHMARKS.get(args.market, '?')}  ({bench_ret:+.1%})",
-        f"Strategy        : ${results['final_value']:,.0f}  (alpha {metrics.get('alpha', 0):+.1%})",
+        f"Benchmark       : {benchmark_name}  "
+        f"(total {bench_ret:+.1%} / CAGR {bench_cagr:+.1%})",
+        f"Strategy        : ${results['final_value']:,.0f}  "
+        f"(total {metrics['total_return']:+.1%} / CAGR {ann_ret:+.1%} / alpha {alpha:+.1%})",
     ]
     console.print()
     for line in summary_lines:

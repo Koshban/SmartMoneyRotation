@@ -11,6 +11,10 @@ Outputs:
   data/{market}_cash.parquet   — per-market files (for load_db.py)
   data/universe_ohlcv.parquet  — combined file   (for loader.py)
 
+Incremental mode:
+  Each run MERGES new rows into the existing parquet.  Old history
+  is NEVER deleted unless you explicitly pass --trim-days N.
+
 Usage:
     python src/ingest_cash.py --market all --period 2y
     python src/ingest_cash.py --market all --days 180
@@ -18,6 +22,8 @@ Usage:
     python src/ingest_cash.py --market all --period 3d
     python src/ingest_cash.py --market us --period 5d --source ibkr
     python src/ingest_cash.py --full --backfill
+    python src/ingest_cash.py --market us --days 5          # daily incremental
+    python src/ingest_cash.py --market us --trim-days 900   # keep only last 900 cal days
 """
 
 import sys
@@ -77,11 +83,6 @@ PERIOD_DAYS_MAP = {
 
 IBKR_THRESHOLD_DAYS = 5
 IBKR_SUPPORTED_MARKETS = {"us", "hk"}
-
-# ── Rolling parquet window ─────────────────────────────────────
-# 450 calendar days ≈ 310 trading days — enough for EMA(200) +
-# convergence runway.  Data older than this is trimmed on save.
-MAX_PARQUET_CALENDAR_DAYS = 450
 
 
 # ====================================================================
@@ -193,7 +194,7 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ====================================================================
-#  Cumulative parquet upsert
+#  Cumulative parquet upsert  (NO TRIM by default)
 # ====================================================================
 
 def upsert_parquet(
@@ -201,15 +202,14 @@ def upsert_parquet(
     parquet_path: Path,
     date_col: str = "date",
     symbol_col: str = "symbol",
-    max_calendar_days: int = MAX_PARQUET_CALENDAR_DAYS,
+    trim_calendar_days: int | None = None,
 ) -> pd.DataFrame:
     """
     Append *new_df* to the existing parquet at *parquet_path*,
-    deduplicate by (symbol, date), trim to rolling window,
-    and overwrite the file.
+    deduplicate by (symbol, date), optionally trim, and overwrite.
 
     This turns a simple daily fetch into a cumulative local store
-    with enough history for long-lookback indicators (EMA-200, etc.).
+    that grows over time — suitable for multi-year backtests.
 
     Parameters
     ----------
@@ -219,14 +219,14 @@ def upsert_parquet(
         Where the cumulative parquet lives.
     date_col / symbol_col : str
         Column names used for dedup and trimming.
-    max_calendar_days : int
-        How far back to keep.  450 calendar days ≈ 310 trading
-        days — enough for EMA(200) + convergence runway.
+    trim_calendar_days : int | None
+        If set, discard rows older than this many calendar days
+        from today.  **None** (the default) keeps ALL history.
 
     Returns
     -------
     pd.DataFrame
-        The merged, deduplicated, trimmed DataFrame (also saved to disk).
+        The merged, deduplicated DataFrame (also saved to disk).
     """
     parquet_path = Path(parquet_path)
 
@@ -261,23 +261,40 @@ def upsert_parquet(
     if dupes:
         logger.info(f"  Parquet dedup: removed {dupes:,} duplicate rows")
 
-    # ── Trim to rolling window ────────────────────────────────
-    cutoff = pd.Timestamp.now() - pd.Timedelta(days=max_calendar_days)
-    before_trim = len(combined)
-    combined = combined[combined[date_col] >= cutoff].copy()
-    trimmed = before_trim - len(combined)
-    if trimmed:
-        logger.info(f"  Parquet trim: removed {trimmed:,} rows older than {cutoff.date()}")
+    # ── Optional trim (ONLY if explicitly requested) ──────────
+    if trim_calendar_days is not None:
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=trim_calendar_days)
+        before_trim = len(combined)
+        combined = combined[combined[date_col] >= cutoff].copy()
+        trimmed = before_trim - len(combined)
+        if trimmed:
+            logger.info(
+                f"  Parquet trim: removed {trimmed:,} rows older than "
+                f"{cutoff.date()} (--trim-days {trim_calendar_days})"
+            )
+        else:
+            logger.info(
+                f"  Parquet trim: no rows older than {cutoff.date()} to remove"
+            )
+    else:
+        logger.info("  No trim applied — keeping all history")
 
     # ── Sort and save ─────────────────────────────────────────
     combined = combined.sort_values([symbol_col, date_col]).reset_index(drop=True)
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(parquet_path, index=False)
 
+    date_min = combined[date_col].min()
+    date_max = combined[date_col].max()
+    n_symbols = combined[symbol_col].nunique()
+    calendar_span = (date_max - date_min).days if pd.notna(date_min) and pd.notna(date_max) else 0
+
     logger.info(
         f"  Saved {parquet_path.name}: {len(combined):,} rows, "
-        f"{combined[symbol_col].nunique()} symbols, "
-        f"{combined[date_col].min().date()} → {combined[date_col].max().date()}"
+        f"{n_symbols} symbols, "
+        f"{date_min.date() if pd.notna(date_min) else '?'} → "
+        f"{date_max.date() if pd.notna(date_max) else '?'} "
+        f"({calendar_span} calendar days)"
     )
 
     return combined
@@ -533,6 +550,7 @@ def fetch_full_universe(
     period: str = "2y",
     days: int | None = None,
     force_source: str = None,
+    trim_calendar_days: int | None = None,
 ):
     DATA_DIR.mkdir(exist_ok=True)
     all_dfs = []
@@ -598,6 +616,7 @@ def fetch_full_universe(
             parquet_path=market_path,
             date_col="date",
             symbol_col="symbol",
+            trim_calendar_days=trim_calendar_days,
         )
 
         all_dfs.append(merged)
@@ -616,10 +635,18 @@ def fetch_full_universe(
     combined_path = DATA_DIR / "universe_ohlcv.parquet"
     combined.to_parquet(combined_path, index=False)
     size_mb = combined_path.stat().st_size / (1024 * 1024)
+
+    date_min = combined["date"].min()
+    date_max = combined["date"].max()
+    calendar_span = (date_max - date_min).days if pd.notna(date_min) and pd.notna(date_max) else 0
+
     logger.info(
         f"Saved → {combined_path}  "
         f"({size_mb:.1f} MB, {len(combined):,} rows, "
-        f"{combined['symbol'].nunique()} symbols — combined)"
+        f"{combined['symbol'].nunique()} symbols, "
+        f"{date_min.date() if pd.notna(date_min) else '?'} → "
+        f"{date_max.date() if pd.notna(date_max) else '?'}, "
+        f"{calendar_span} calendar days — combined)"
     )
 
 
@@ -633,11 +660,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
+  # ── Initial backfill (run once) ──────────────────────────────
   python src/ingest_cash.py --market all --period 2y        # 2-year backfill
-  python src/ingest_cash.py --market us  --days 365         # US, exactly 365 days
-  python src/ingest_cash.py --market all --days 180         # all markets, 180 days
-  python src/ingest_cash.py --market us  --period 5d --source ibkr
-  python src/ingest_cash.py --full --backfill
+  python src/ingest_cash.py --market us  --period 5y        # 5-year deep history
+  python src/ingest_cash.py --full --backfill               # max available history
+
+  # ── Daily incremental (cron / scheduled) ─────────────────────
+  python src/ingest_cash.py --market all --days 7           # last week (safe overlap)
+  python src/ingest_cash.py --market us  --days 5           # last 5 calendar days
+
+  # ── Explicit trim (rarely needed) ────────────────────────────
+  python src/ingest_cash.py --market us --days 5 --trim-days 900
+
+  # ── Source override ──────────────────────────────────────────
+  python src/ingest_cash.py --market us --period 5d --source ibkr
         """,
     )
     parser.add_argument(
@@ -658,6 +694,17 @@ examples:
         help=(
             "Calendar days of data to download (overrides --period). "
             "E.g. --days 365 downloads the last 365 calendar days."
+        ),
+    )
+    parser.add_argument(
+        "--trim-days",
+        type=int,
+        default=None,
+        dest="trim_days",
+        help=(
+            "If set, discard parquet rows older than this many calendar "
+            "days from today.  Default: no trimming (keep all history). "
+            "E.g. --trim-days 900 keeps ~2.5 years."
         ),
     )
     parser.add_argument(
@@ -699,6 +746,11 @@ examples:
             + (f" [OVERRIDDEN → {args.source}]" if args.source else "")
         )
 
+    if args.trim_days is not None:
+        logger.info(f"--trim-days {args.trim_days} → will discard data older than {args.trim_days} calendar days")
+    else:
+        logger.info("No --trim-days set → all existing history will be preserved")
+
     # Show symbol counts
     for mkt in markets:
         syms = get_symbols_for_market(mkt)
@@ -713,6 +765,7 @@ examples:
         period=args.period,
         days=args.days,
         force_source=args.source,
+        trim_calendar_days=args.trim_days,
     )
 
     logger.info("Done")
