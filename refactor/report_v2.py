@@ -88,6 +88,30 @@ def _count_actions(actions: pd.DataFrame | None) -> dict[str, int]:
     return summary
 
 
+# ── Column-name resolution helper ────────────────────────────────────────
+# rotation_v2 uses short names (rs_mom, etf_composite, …) while earlier
+# report code assumed longer names (rs_momentum, excess_return_20d, …).
+# _resolve_col tries a prioritised list and returns the first match.
+
+def _resolve_col(row_or_dict, *candidates, default=""):
+    """Return the value for the first key in *candidates* that exists
+    and is not None / NaN.  Works with dicts and pd.Series."""
+    for key in candidates:
+        val = None
+        if isinstance(row_or_dict, dict):
+            val = row_or_dict.get(key)
+        else:
+            val = getattr(row_or_dict, key, None)
+        if val is not None:
+            try:
+                if isinstance(val, float) and math.isnan(val):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return val
+    return default
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Section builders
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -117,7 +141,14 @@ def _build_regime_section(meta: dict, breadth_info: dict | None) -> dict:
 
 
 def _build_rotation_section(result: dict) -> dict:
-    """Build sector rotation heatmap and quadrant summary."""
+    """Build sector rotation heatmap and quadrant summary.
+
+    .. note::
+       Column names emitted by ``rotation_v2`` are short-form
+       (``rs_mom``, ``blended_score``, …).  This function resolves
+       both short and legacy long-form names so the heatmap is
+       populated regardless of which version of rotation was used.
+    """
     sector_summary = result.get("sector_summary", pd.DataFrame())
     sector_regimes = result.get("sector_regimes", {})
 
@@ -128,21 +159,44 @@ def _build_rotation_section(result: dict) -> dict:
             "quadrant_counts": {},
         }
 
-    # Heatmap: one entry per sector, sorted by rs_rank
-    heatmap = []
+    # ── Columns we want in the heatmap (short-form preferred) ─────────
+    # We list both the canonical short name AND legacy aliases so that
+    # the intersection with actual columns picks up whatever is present.
     display_cols = [
-        "sector", "etf", "regime", "rs_rank", "momentum_rank",
-        "rs_level", "rs_momentum", "excess_return_20d",
+        "sector", "etf", "regime",
+        "rs_rank", "momentum_rank",
+        "rs_level",
+        "rs_mom", "rs_momentum",                         # ← CHANGED: added short-form
+        "blended_score",                                  # ← ADDED
+        "rrg_quadrant",                                   # ← ADDED
+        "etf_composite",                                  # ← ADDED
+        "theme_avg_score",                                # ← ADDED
+        "excess_20d", "excess_return_20d",                # ← CHANGED: try both names
+        "excess_ret_20d", "ret_vs_bench_20d",             # ← ADDED extra fallbacks
     ]
     cols = [c for c in display_cols if c in sector_summary.columns]
-    sorted_df = sector_summary.sort_values("rs_rank") if "rs_rank" in sector_summary.columns else sector_summary
 
+    # Sort by blended_score (descending) or rs_rank (ascending) ────────
+    if "blended_score" in sector_summary.columns:                       # ← CHANGED
+        sorted_df = sector_summary.sort_values(
+            "blended_score", ascending=False,
+        )
+    elif "rs_rank" in sector_summary.columns:
+        sorted_df = sector_summary.sort_values("rs_rank")
+    else:
+        sorted_df = sector_summary
+
+    heatmap = []
     for _, row in sorted_df.iterrows():
         entry = {}
         for c in cols:
             val = row.get(c)
             if isinstance(val, float) and not math.isnan(val):
-                entry[c] = round(val, 4) if c not in ("rs_rank", "momentum_rank") else int(val)
+                entry[c] = (
+                    round(val, 4)
+                    if c not in ("rs_rank", "momentum_rank")
+                    else int(val)
+                )
             elif isinstance(val, (int,)):
                 entry[c] = int(val)
             else:
@@ -504,22 +558,34 @@ def to_text_v2(report: dict) -> str:
             lines.append(
                 f"  {'Rank':>4s}  {'Sector':<22s}  {'ETF':<5s}  "
                 f"{'Regime':<11s}  {'RS Level':>9s}  {'RS Mom':>8s}  "
-                f"{'Excess 20d':>10s}"
+                f"{'Blended':>8s}  {'Excess 20d':>10s}"       # ← CHANGED: added Blended
             )
-            lines.append("  " + "-" * 80)
-            for entry in heatmap:
-                rank = entry.get("rs_rank", "")
-                sector = entry.get("sector", "")
-                etf = entry.get("etf", "")
-                regime = entry.get("regime", "")
-                rs_lvl = entry.get("rs_level", "")
-                rs_mom = entry.get("rs_momentum", "")
-                excess = entry.get("excess_return_20d", "")
+            lines.append("  " + "-" * 88)                     # ← CHANGED: wider rule
+            for idx, entry in enumerate(heatmap, 1):
+                sector  = _resolve_col(entry, "sector", default="")
+                etf     = _resolve_col(entry, "etf", default="")
+                regime  = _resolve_col(entry, "regime", default="")
+                rs_lvl  = _resolve_col(entry, "rs_level", default="")
+                # ── CHANGED: resolve rs_mom with fallback to rs_momentum ──
+                rs_mom  = _resolve_col(
+                    entry, "rs_mom", "rs_momentum", default="",
+                )
+                blended = _resolve_col(
+                    entry, "blended_score", default="",
+                )
+                # ── CHANGED: resolve excess with multiple fallback names ──
+                excess  = _resolve_col(
+                    entry,
+                    "excess_20d", "excess_return_20d",
+                    "excess_ret_20d", "ret_vs_bench_20d",
+                    default="",
+                )
                 lines.append(
-                    f"  {str(rank):>4s}  {str(sector):<22s}  {str(etf):<5s}  "
+                    f"  {idx:>4d}  {str(sector):<22s}  {str(etf):<5s}  "
                     f"{str(regime):<11s}  "
                     f"{_safe_float(rs_lvl):>9.4f}  "
                     f"{_safe_float(rs_mom):>8.4f}  "
+                    f"{_safe_float(blended):>8.4f}  "
                     f"{_safe_float(excess):>10.4f}"
                 )
     else:

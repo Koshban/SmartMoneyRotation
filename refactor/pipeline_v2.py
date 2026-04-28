@@ -395,10 +395,26 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         "sigeffectiveentrymin_v2", pd.Series(0.50, index=out.index),
     ).fillna(0.50)
 
+    # ── STRONG_BUY qualification gates ────────────────────────────────
+    sig_confirmed = out.get(
+        "sigconfirmed_v2", pd.Series(False, index=out.index),
+    ).fillna(False).astype(bool)
+
+    sect_regime = (
+        out.get("sectrsregime", pd.Series("unknown", index=out.index))
+        .fillna("unknown").astype(str).str.lower().str.strip()
+    )
+
+    sb_require_confirmed = sb.get("require_confirmed", True)
+    sb_allowed_regimes = set(
+        sb.get("allowed_regimes", ["leading", "improving"]),
+    )
+    max_strong_buy = ap.get("max_strong_buy", 15)
+
     sell_floor = se.get("floor_score", 0.35)
     sell_pct_floor = se.get("floor_percentile", 0.10)
-    sb_min_pct = sb.get("min_percentile", 0.85)
-    sb_min_score = sb.get("min_score", 0.68)
+    sb_min_pct = sb.get("min_percentile", 0.90)
+    sb_min_score = sb.get("min_score", 0.75)
     sb_above = sb.get("score_above_entry", 0.06)
     bu_min_pct = bu.get("min_percentile", 0.50)
     bu_min_score = bu.get("min_score", 0.52)
@@ -408,11 +424,12 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     ho_below = ho.get("score_below_entry", 0.06)
 
     logger.info(
-        "Simplified action thresholds: sell_floor=%.3f sell_pct=%.3f "
-        "sb_pct=%.2f sb_score=%.3f bu_pct=%.2f bu_score=%.3f "
-        "ho_pct=%.2f ho_score=%.3f",
+        "Action thresholds: sell_floor=%.3f sell_pct=%.3f "
+        "sb_pct=%.2f sb_score=%.3f sb_confirmed=%s sb_regimes=%s "
+        "max_sb=%d bu_pct=%.2f bu_score=%.3f ho_pct=%.2f ho_score=%.3f",
         sell_floor, sell_pct_floor,
         sb_min_pct, sb_min_score,
+        sb_require_confirmed, sb_allowed_regimes, max_strong_buy,
         bu_min_pct, bu_min_score,
         ho_min_pct, ho_min_score,
     )
@@ -427,13 +444,23 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         s = float(score.loc[i])
         pv = float(pct.loc[i])
         e = float(entry.loc[i])
+        confirmed_i = bool(sig_confirmed.loc[i])
+        regime_i = str(sect_regime.loc[i])
 
         if s < sell_floor or pv <= sell_pct_floor:
             action = "SELL"
             reason = "Below sell floor"
-        elif pv >= sb_min_pct and s >= max(sb_min_score, e + sb_above):
+        elif (
+            pv >= sb_min_pct
+            and s >= max(sb_min_score, e + sb_above)
+            and (not sb_require_confirmed or confirmed_i)
+            and (not sb_allowed_regimes or regime_i in sb_allowed_regimes)
+        ):
             action = "STRONG_BUY"
-            reason = "Top-tier score and percentile"
+            reason = (
+                f"Top-tier: score={s:.3f} pct={pv:.0%} "
+                f"confirmed={confirmed_i} regime={regime_i}"
+            )
         elif pv >= bu_min_pct and s >= max(bu_min_score, e + bu_above):
             action = "BUY"
             reason = "Above buy threshold"
@@ -455,13 +482,62 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         convictions.append(conviction)
         sort_keys.append(action_rank[action] * 10 + pv + s / 10.0)
 
+    # ── STRONG_BUY hard cap ───────────────────────────────────────────
+    sb_count = sum(1 for a in actions if a == "STRONG_BUY")
+    if sb_count > max_strong_buy:
+        sb_items = [
+            (idx, sort_keys[idx])
+            for idx, a in enumerate(actions)
+            if a == "STRONG_BUY"
+        ]
+        sb_items.sort(key=lambda x: x[1], reverse=True)
+        demoted = 0
+        for idx, _ in sb_items[max_strong_buy:]:
+            actions[idx] = "BUY"
+            reasons[idx] = "Demoted from STRONG_BUY: cap exceeded"
+            sort_keys[idx] -= 10  # shift from SB tier (40+) to BUY tier (30+)
+            demoted += 1
+        logger.info(
+            "STRONG_BUY cap applied: %d → %d (demoted %d to BUY)",
+            sb_count, max_strong_buy, demoted,
+        )
+    else:
+        logger.info(
+            "STRONG_BUY count=%d (within cap=%d)", sb_count, max_strong_buy,
+        )
+
+    # Log gate impact for diagnostics
+    _total = len(actions)
+    _sb_before_cap = sb_count
+    _sb_blocked_confirmed = 0
+    _sb_blocked_regime = 0
+    for i_idx, i_val in enumerate(out.index):
+        s = float(score.loc[i_val])
+        pv = float(pct.loc[i_val])
+        e = float(entry.loc[i_val])
+        if pv >= sb_min_pct and s >= max(sb_min_score, e + sb_above):
+            if sb_require_confirmed and not bool(sig_confirmed.loc[i_val]):
+                _sb_blocked_confirmed += 1
+            elif sb_allowed_regimes and str(sect_regime.loc[i_val]) not in sb_allowed_regimes:
+                _sb_blocked_regime += 1
+    logger.info(
+        "STRONG_BUY gate impact: score+pct qualified=%d "
+        "blocked_by_confirmation=%d blocked_by_regime=%d "
+        "passed_all_gates=%d after_cap=%d",
+        _sb_before_cap + _sb_blocked_confirmed + _sb_blocked_regime,
+        _sb_blocked_confirmed,
+        _sb_blocked_regime,
+        _sb_before_cap,
+        sum(1 for a in actions if a == "STRONG_BUY"),
+    )
+
     out["action_v2"] = actions
     out["conviction_v2"] = convictions
     out["action_reason_v2"] = reasons
     out["action_sort_key_v2"] = sort_keys
 
     counts = pd.Series(actions).value_counts().to_dict()
-    logger.info("Action counts (simplified): %s", counts)
+    logger.info("Action counts: %s", counts)
 
     sort_col = (
         "scoreadjusted_v2"

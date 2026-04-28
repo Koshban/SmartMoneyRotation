@@ -188,10 +188,13 @@ CONVERGENCEPARAMS_V2 = {
 
 ACTIONPARAMS_V2 = {
     "strong_buy": {
-        "min_percentile": 0.85,       # was 0.90
-        "min_score": 0.68,            # was 0.76
-        "score_above_entry": 0.06,    # was 0.08
-    },
+    "min_percentile": 0.90,        # was 0.85
+    "min_score": 0.75,             # was 0.68
+    "score_above_entry": 0.06,
+    "require_confirmed": True,     # NEW
+    "allowed_regimes": ["leading", "improving"],  # NEW
+},
+"max_strong_buy": 15,              # NEW
     "buy": {
         "min_percentile": 0.50,       # was 0.65
         "min_score": 0.52,            # was 0.62

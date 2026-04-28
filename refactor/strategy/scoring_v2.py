@@ -9,6 +9,11 @@ Revision notes
   ``amihud20``, ``gaprate20``) are absent or produce flat scores, adaptive
   proxies (relative volume, dollar volume, RSI distance) are used and
   percentile-rank fallback prevents a flat ``scorerisk``.
+- **Participation weight redistribution**: when ``obvslope10d`` and/or
+  ``adlineslope10d`` have zero variance (missing from data source),
+  their weights are redistributed to ``relativevolume`` and
+  ``dollarvolume20d`` so that ``scoreparticipation`` differentiates
+  stocks instead of clustering at ~0.297.
 - **Extension**: continuous [0 → 1] scale replaces the original
   3-step function for finer differentiation.
 - **Vol regime dampening**: calm markets map to 0.70 favorability
@@ -147,31 +152,107 @@ def compute_composite_v2(
         + p["trend"]["w_trend_confirm"] * trend_confirm
     ).clip(0, 1)
 
-    # ── Participation ─────────────────────────────────────────────────────
-    rvol = _s(
-        out.get("relativevolume", pd.Series(1, index=out.index)).fillna(1),
-        0.8, 2.2,
+    # ── Participation (adaptive, with weight redistribution) ──────────── # ← CHANGED
+    #
+    # When obvslope10d and/or adlineslope10d have zero variance (all-zero
+    # because the data source doesn't populate them), their weights are
+    # dead — every stock gets the same constant contribution (~0.294).
+    # This collapses scoreparticipation differentiation to just rvol and
+    # dvol, producing the 0.297-cluster seen in diagnostics.
+    #
+    # Fix: detect dead components, redistribute their weight proportionally
+    # to the live components (rvol, dvol), and use _adaptive_fwd for the
+    # live components so rank-based fallback is available if needed.
+    # ──────────────────────────────────────────────────────────────────────
+
+    rvol_raw = out.get(
+        "relativevolume", pd.Series(1, index=out.index),
+    ).fillna(1)
+
+    obv_raw, obv_col_ok = _col_or_default(out, "obvslope10d", 0.0)
+    adl_raw, adl_col_ok = _col_or_default(out, "adlineslope10d", 0.0)
+
+    dvol_raw_input = out.get(
+        "dollarvolume20d", pd.Series(0, index=out.index),
+    ).fillna(0)
+    dvol_raw = pd.Series(np.log1p(dvol_raw_input), index=out.index)
+
+    # Check if OBV and ADL have meaningful variance
+    obv_has_variance = obv_col_ok and float(obv_raw.std()) > 1e-8
+    adl_has_variance = adl_col_ok and float(adl_raw.std()) > 1e-8
+
+    # Base weights from params
+    w_rvol = p["participation"]["w_rvol"]
+    w_obv  = p["participation"]["w_obv"]
+    w_adl  = p["participation"]["w_adline"]
+    w_dvol = p["participation"]["w_dollar_volume"]
+
+    # Redistribute dead weights to live components
+    dead_weight = 0.0
+    _part_sources = []
+
+    if obv_has_variance:
+        _part_sources.append("obvslope10d")
+    else:
+        dead_weight += w_obv
+        w_obv = 0.0
+
+    if adl_has_variance:
+        _part_sources.append("adlineslope10d")
+    else:
+        dead_weight += w_adl
+        w_adl = 0.0
+
+    _part_sources.extend(["relativevolume", "dollarvolume20d"])
+
+    if dead_weight > 0:
+        live_total = w_rvol + w_dvol
+        if live_total > 0:
+            w_rvol += dead_weight * (w_rvol / live_total)
+            w_dvol += dead_weight * (w_dvol / live_total)
+        else:
+            # Edge case: all components dead — split evenly
+            w_rvol = 0.5
+            w_dvol = 0.5
+        logger.info(
+            "scoreparticipation: redistributed %.3f dead weight "
+            "(obv_ok=%s adl_ok=%s) → w_rvol=%.3f w_obv=%.3f "
+            "w_adl=%.3f w_dvol=%.3f",
+            dead_weight, obv_has_variance, adl_has_variance,
+            w_rvol, w_obv, w_adl, w_dvol,
+        )
+
+    # Scale live components (adaptive for rvol/dvol, fixed for obv/adl)
+    rvol = _adaptive_fwd(rvol_raw, 0.8, 2.2, label="rvol")
+    dvol = _adaptive_fwd(dvol_raw, 10, 18, label="dvol")
+    obv  = (
+        _s(obv_raw, -0.05, 0.12)
+        if obv_has_variance
+        else pd.Series(0.0, index=out.index)
     )
-    obv = _s(
-        out.get("obvslope10d", pd.Series(0, index=out.index)).fillna(0),
-        -0.05, 0.12,
+    adl  = (
+        _s(adl_raw, -0.05, 0.12)
+        if adl_has_variance
+        else pd.Series(0.0, index=out.index)
     )
-    adl = _s(
-        out.get("adlineslope10d", pd.Series(0, index=out.index)).fillna(0),
-        -0.05, 0.12,
-    )
-    dvol = _s(
-        np.log1p(
-            out.get("dollarvolume20d", pd.Series(0, index=out.index)).fillna(0)
-        ),
-        10, 18,
-    )
+
     out["scoreparticipation"] = (
-        p["participation"]["w_rvol"] * rvol
-        + p["participation"]["w_obv"] * obv
-        + p["participation"]["w_adline"] * adl
-        + p["participation"]["w_dollar_volume"] * dvol
+        w_rvol * rvol
+        + w_obv * obv
+        + w_adl * adl
+        + w_dvol * dvol
     ).clip(0, 1)
+
+    # Participation diagnostics
+    _sp = out["scoreparticipation"]
+    logger.info(
+        "scoreparticipation: sources=%s  min=%.4f med=%.4f max=%.4f "
+        "std=%.4f uniq=%d  weights=[rvol=%.3f obv=%.3f adl=%.3f dvol=%.3f]",
+        _part_sources,
+        _sp.min(), _sp.median(), _sp.max(),
+        float(_sp.std()), int(_sp.nunique()),
+        w_rvol, w_obv, w_adl, w_dvol,
+    )
 
     # ── Risk (adaptive, with proxy fallbacks) ─────────────────────────────
     #
@@ -348,6 +429,9 @@ def compute_composite_v2(
         out["volregimescore"] = float(market_vol_regime_score)
 
     # ── Rotation ──────────────────────────────────────────────────────────
+    # Initial rotation scores — aligned with enrich_v2 regime scores
+    # so that the incremental enrichment delta is small (mostly just
+    # the ETF composite boost).                              ← CHANGED
     sect_regime = (
         out.get("sectrsregime", pd.Series("unknown", index=out.index))
         .fillna("unknown")
@@ -363,7 +447,7 @@ def compute_composite_v2(
                 sect_regime == "weakening",
                 sect_regime == "lagging",
             ],
-            [1.0, 0.65, 0.35, 0.0],
+            [1.0, 0.70, 0.40, 0.15],                       # ← CHANGED: aligned with enrich_v2
             default=0.30,
         ),
         index=out.index,

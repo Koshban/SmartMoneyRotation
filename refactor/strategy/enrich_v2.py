@@ -1,4 +1,17 @@
-"""refactor/strategy/enrich_v2.py – Enrich scored tickers with blended rotation data."""
+"""refactor/strategy/enrich_v2.py – Enrich scored tickers with blended rotation data.
+
+Revision notes
+--------------
+- **Compressed regime scores**: lagging raised from 0.00 → 0.15,
+  weakening from 0.30 → 0.40, improving from 0.65 → 0.70.
+  This reduces the punitive spread while still meaningfully
+  differentiating sectors.
+- **Incremental composite update**: instead of recomputing the full
+  composite from sub-scores (which silently drops the leadership
+  boost applied in pipeline_v2), only the rotation delta is applied.
+  This preserves all prior adjustments and keeps the enrichment
+  delta small and predictable.
+"""
 from __future__ import annotations
 
 import logging
@@ -16,14 +29,21 @@ logger = logging.getLogger(__name__)
 #  REGIME → scorerotation mapping
 # ═══════════════════════════════════════════════════════════════
 #  Old behaviour: leading=1.0, everything else=0.0
-#  New behaviour: graded so "improving" and "weakening" get partial credit
+#  V2 behaviour:  graded so "improving" and "weakening" get partial
+#                 credit; lagging has a non-zero floor so the
+#                 rotation penalty doesn't dominate the composite.
+#
+#  These values are intentionally aligned with the initial rotation
+#  scores set in scoring_v2.py so that the enrichment delta is
+#  small (dominated by the ETF composite boost, not a regime
+#  reclassification).
 
 DEFAULT_REGIME_SCORES: dict[str, float] = {
     "leading":    1.00,
-    "improving":  0.65,
-    "weakening":  0.30,
-    "lagging":    0.00,
-    "unknown":    0.15,   # no rotation data available for this sector
+    "improving":  0.70,       # ← CHANGED from 0.65
+    "weakening":  0.40,       # ← CHANGED from 0.30
+    "lagging":    0.15,       # ← CHANGED from 0.00
+    "unknown":    0.30,       # ← CHANGED from 0.15
 }
 
 
@@ -118,7 +138,7 @@ def enrich_with_rotation(
       - scorerotation        : float (graded 0.0–1.0, replaces old binary)
       - etf_boost            : float (±0.10 from ETF composite vs median)
       - rotation_blended     : float (blended score from sector_summary)
-      - scorecomposite_v2    : float (recomputed if weight columns present)
+      - scorecomposite_v2    : float (incrementally updated)
 
     Returns the enriched DataFrame (modified in place for efficiency,
     but also returned for chaining).
@@ -147,13 +167,13 @@ def enrich_with_rotation(
         logger.warning("enrich_with_rotation: no ticker column found in scored_df")
         return scored_df
 
-    # ── Pre-enrichment stats ──────────────────────────────────────────────
-    old_rotation_col = "scorerotation"
-    had_old = old_rotation_col in scored_df.columns
-    if had_old:
-        old_mean = scored_df[old_rotation_col].mean()
-        old_median = scored_df[old_rotation_col].median()
+    # ── Save old scorerotation for incremental update ─────────────────── # ← CHANGED
+    if "scorerotation" in scored_df.columns:
+        old_rotation = scored_df["scorerotation"].copy()
+        old_mean = float(old_rotation.mean())
+        old_median = float(old_rotation.median())
     else:
+        old_rotation = pd.Series(0.0, index=scored_df.index)
         old_mean = old_median = 0.0
 
     # ── Build sector lookup from sector_summary for ETF boost ─────────────
@@ -181,7 +201,7 @@ def enrich_with_rotation(
         regimes.append(regime)
 
         # 2. Graded scorerotation
-        base_score = regime_scores.get(regime, regime_scores.get("unknown", 0.15))
+        base_score = regime_scores.get(regime, regime_scores.get("unknown", 0.30))
 
         # 3. ETF composite boost
         if apply_etf_boost:
@@ -208,9 +228,14 @@ def enrich_with_rotation(
     scored_df["etf_boost"] = etf_boosts
     scored_df["rotation_blended"] = blended_vals
 
-    # ── Recompute composite if weights are available ──────────────────────
-    if recompute_composite:
-        _recompute_composite(scored_df, params)
+    # ── Incremental composite update ──────────────────────────────────── # ← CHANGED
+    #
+    # Instead of recomputing the full composite from sub-scores (which
+    # drops the leadership boost applied in pipeline_v2), apply only
+    # the rotation delta to the existing composite.  This preserves
+    # all prior adjustments and keeps the enrichment effect predictable.
+    if recompute_composite and "scorecomposite_v2" in scored_df.columns:
+        _incremental_composite_update(scored_df, old_rotation, params)
 
     # ── Post-enrichment stats ─────────────────────────────────────────────
     new_mean = scored_df["scorerotation"].mean()
@@ -235,58 +260,47 @@ def enrich_with_rotation(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Composite recomputation
+#  Incremental composite update                    ← CHANGED
 # ═══════════════════════════════════════════════════════════════
 
-def _recompute_composite(scored_df: pd.DataFrame, params: dict) -> None:
+def _incremental_composite_update(
+    scored_df: pd.DataFrame,
+    old_rotation: pd.Series,
+    params: dict,
+) -> None:
     """
-    Recompute scorecomposite_v2 using the updated scorerotation.
+    Apply the scorerotation delta to scorecomposite_v2 *incrementally*.
 
-    Only runs if all required sub-score columns are present.
-    Uses the same weights as the original composite calculator.
+    Instead of recomputing the entire weighted sum (which drops the
+    leadership boost and any other post-scoring adjustments), this
+    computes::
+
+        delta = (new_scorerotation − old_scorerotation) × rotation_weight
+        scorecomposite_v2 += delta
+
+    This preserves all prior adjustments and only changes the
+    composite by the rotation enrichment amount.
     """
-    required = ["scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorerotation"]
-    missing = [c for c in required if c not in scored_df.columns]
-    if missing:
-        logger.debug(
-            "enrich_with_rotation: skipping composite recompute — missing columns: %s",
-            missing,
-        )
-        return
+    rotation_weight = params.get("composite_weights", {}).get(
+        "scorerotation", 0.20,
+    )
 
-    # Default weights (should match scoring_v2 weights)
-    weights = params.get("composite_weights", {
-        "scoretrend":         0.30,
-        "scoreparticipation": 0.20,
-        "scorerisk":          0.15,
-        "scoreregime":        0.15,
-        "scorerotation":      0.20,
-    })
+    old_composite_mean = float(scored_df["scorecomposite_v2"].mean())
 
-    old_composite_col = "scorecomposite_v2"
-    had_old = old_composite_col in scored_df.columns
-    if had_old:
-        old_mean = scored_df[old_composite_col].mean()
-    else:
-        old_mean = 0.0
+    delta = (scored_df["scorerotation"] - old_rotation) * rotation_weight
+    scored_df["scorecomposite_v2"] = (
+        scored_df["scorecomposite_v2"] + delta
+    ).clip(0.0, 1.0)
 
-    composite = pd.Series(0.0, index=scored_df.index)
-    for col, weight in weights.items():
-        if col in scored_df.columns:
-            composite += scored_df[col].fillna(0.0).astype(float) * weight
+    new_composite_mean = float(scored_df["scorecomposite_v2"].mean())
 
-    # Apply penalty if present
-    if "scorepenalty" in scored_df.columns:
-        composite = composite - scored_df["scorepenalty"].fillna(0.0).astype(float)
-
-    composite = composite.clip(0.0, 1.0)
-    scored_df[old_composite_col] = composite.round(4)
-
-    new_mean = scored_df[old_composite_col].mean()
     logger.info(
-        "enrich_with_rotation: recomputed %s  mean %.4f → %.4f  (delta=%+.4f)",
-        old_composite_col,
-        old_mean,
-        new_mean,
-        new_mean - old_mean,
+        "enrich_with_rotation: recomputed scorecomposite_v2  "
+        "mean %.4f → %.4f  (delta=%+.4f)  "
+        "[incremental: rotation_weight=%.2f avg_rot_delta=%+.4f]",
+        old_composite_mean,
+        new_composite_mean,
+        new_composite_mean - old_composite_mean,
+        rotation_weight,
+        float(delta.mean()),
     )
