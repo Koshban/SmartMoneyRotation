@@ -1178,6 +1178,7 @@ def run_pipeline_v2(
         ).clip(0, 1)
 
         # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────
+        # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────
         enrich_params = {
             "regime_scores": {
                 "leading":    1.00,
@@ -1186,7 +1187,7 @@ def run_pipeline_v2(
                 "lagging":    0.00,
                 "unknown":    0.15,
             },
-            "apply_etf_boost": True,
+            "apply_etf_boost": not etf_ranking.empty,   # ← CHANGED: was True
             "recompute_composite": True,
             "composite_weights": {
                 "scoretrend":         0.30,

@@ -292,6 +292,77 @@ NON_SECTOR_ASSETS: dict[str, str] = {
     "DBC": "Commodities",
 }
 
+INDIA_SECTOR_MAP = {
+    "AARTIIND": "Materials",
+    "ABB": "Industrials",
+    "ADANIENT": "Energy",
+    "ADANIGREEN": "Utilities",
+    "ADANIPORTS": "Industrials",
+    "ALLCARGO": "Industrials",
+    "ANDHRSUGAR": "Materials",
+    "APOLLOHOSP": "Healthcare",
+    "ASAHISONG": "Materials",
+    "ASHIANA": "Real Estate",
+    "ASHOKLEY": "Industrials",
+    "ASIANPAINT": "Materials",
+    "BAJAJ-AUTO": "Consumer Discretionary",
+    "BAJAJFINSV": "Financials",
+    "BAJFINANCE": "Financials",
+    "BHAGERIA": "Materials",
+    "BHARTIARTL": "Communication Services",
+    "BHEL": "Industrials",
+    "BIOCON": "Healthcare",
+    "BRITANNIA": "Consumer Staples",
+    "CAPLIPOINT": "Healthcare",
+    "CGPOWER": "Industrials",
+    "CIPLA": "Healthcare",
+    "COALINDIA": "Energy",
+    "COFORGE": "Technology",
+    "DABUR": "Consumer Staples",
+    "DIVISLAB": "Healthcare",
+    "DRREDDY": "Healthcare",
+    "GRASIM": "Materials",
+    "HCLTECH": "Technology",
+    "HEIDELBERG": "Materials",
+    "HEROMOTOCO": "Consumer Discretionary",
+    "HIKAL": "Healthcare",
+    "HINDALCO": "Materials",
+    "HINDUNILVR": "Consumer Staples",
+    "ICICIPRULI": "Financials",
+    "INDUSINDBK": "Financials",
+    "INFY": "Technology",
+    "INSECTICID": "Materials",
+    "ITC": "Consumer Staples",
+    "JSWSTEEL": "Materials",
+    "JUBLFOOD": "Consumer Discretionary",
+    "JYOTHYLAB": "Consumer Staples",
+    "KALYANIFRG": "Consumer Discretionary",
+    "LAOPALA": "Consumer Discretionary",
+    "LTF": "Financials",
+    "MANAPPURAM": "Financials",
+    "MARICO": "Consumer Staples",
+    "MARUTI": "Consumer Discretionary",
+    "MINDACORP": "Consumer Discretionary",
+    "MPHASIS": "Technology",
+    "MUTHOOTFIN": "Financials",
+    "NESTLEIND": "Consumer Staples",
+    "NMDC": "Materials",
+    "NRBBEARING": "Consumer Discretionary",
+    "NTPC": "Utilities",
+    "ONGC": "Energy",
+    "PERSISTENT": "Technology",
+    "POWERGRID": "Utilities",
+    "SBIN": "Financials",
+    "SIEMENS": "Industrials",
+    "SUNPHARMA": "Healthcare",
+    "TATASTEEL": "Materials",
+    "TCS": "Technology",
+    "TECHM": "Technology",
+    "TITAN": "Consumer Discretionary",
+    "ULTRACEMCO": "Materials",
+    "WIPRO": "Technology",
+}
+
 TICKER_SECTOR_MAP: dict[str, str] = {}
 
 for _sector, _etf in SECTOR_ETFS.items():
@@ -313,12 +384,31 @@ def get_asset_class(ticker: str) -> str | None:
     return NON_SECTOR_ASSETS.get(ticker)
 
 def get_sector_or_class(ticker: str) -> str:
-    return (
+    """
+    Resolve sector for any ticker.
+
+    Lookup order:
+      1. Existing maps (TICKER_SECTOR_MAP, NON_SECTOR_ASSETS, THEME_MAP)
+         — these use the full ticker string as-is.
+      2. INDIA_SECTOR_MAP — keyed by bare symbol (strips .NS / .BO).
+      3. Fallback: "Unknown"
+    """
+    # ── Existing maps first (full ticker, preserves current behaviour) ────
+    hit = (
         TICKER_SECTOR_MAP.get(ticker)
         or NON_SECTOR_ASSETS.get(ticker)
         or THEME_MAP.get(ticker)
-        or "Unknown"
     )
+    if hit:
+        return hit
+
+    # ── India bare-symbol lookup ──────────────────────────────────────────
+    bare = ticker.replace(".NS", "").replace(".BO", "").upper()
+    india_hit = INDIA_SECTOR_MAP.get(bare)
+    if india_hit:
+        return india_hit
+
+    return "Unknown"
 
 def get_tickers_for_sector(sector: str) -> list[str]:
     return [

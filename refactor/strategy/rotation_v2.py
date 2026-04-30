@@ -1,4 +1,10 @@
-"""refactor/strategy/rotation_v2.py – Sector rotation with ETF composite scoring."""
+"""refactor/strategy/rotation_v2.py – Sector rotation with ETF composite scoring.
+
+US markets:     Uses sector SPDR ETFs + thematic ETFs for RRG + composite blend.
+Non-US markets: Computes sector rotation from constituent stocks grouped by
+                sector, using an equal-weighted synthetic close per sector
+                vs the local benchmark.  ETF scoring is skipped.
+"""
 from __future__ import annotations
 
 import logging
@@ -14,7 +20,15 @@ from refactor.common.config_refactor import ROTATIONPARAMS
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ETF ↔ Sector / Theme mappings
+# Market classification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Markets where US sector ETFs (XLK, XLF, …) are present in the data.
+# All other markets use constituent-based rotation.
+_US_LIKE_MARKETS = {"US"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ETF ↔ Sector / Theme mappings  (US only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SECTOR_ETF = {
@@ -282,7 +296,7 @@ def _compute_etf_indicators(df: pd.DataFrame) -> dict:
     except Exception as e:
         logger.error("_compute_etf_indicators: RVOL computation failed: %s", e)
 
-    # ── Dollar volume 20d average ────────────────────────────────────────  # ← NEW
+    # ── Dollar volume 20d average ────────────────────────────────────────
     try:
         if volume is not None and close is not None and n >= 20:
             dv = volume * close
@@ -336,7 +350,7 @@ def _compute_etf_indicators(df: pd.DataFrame) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ETF composite scoring
+# ETF composite scoring  (US only — skipped for non-US markets)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_etf_composite(row: dict, params: dict) -> dict[str, float]:
@@ -375,19 +389,19 @@ def _compute_etf_composite(row: dict, params: dict) -> dict[str, float]:
 
     momentum = 0.50 * rs_z_sc + 0.30 * ret_sc + 0.20 * macd_sc
 
-    # ── participation (FIXED: wider rvol range + dollar volume) ───────────  # ← FIXED
+    # ── participation ─────────────────────────────────────────────────────────
     rvol = _safe_float(_get(row, "relativevolume", "relative_volume"), 0.0)
-    rvol_sc = _normalize(rvol, 0.05, 1.5)                                   # ← FIXED: was (0.5, 2.0)
+    rvol_sc = _normalize(rvol, 0.05, 1.5)
 
-    dvol_raw = _safe_float(                                                  # ← NEW
+    dvol_raw = _safe_float(
         _get(row, "dollarvolume20d", "dollarvolumeavg20",
              "dollar_volume_avg_20"),
         0.0,
     )
-    log_dvol = math.log1p(dvol_raw) if dvol_raw > 0 else 0.0                # ← NEW
-    dvol_sc = _normalize(log_dvol, 14.0, 22.0)                              # ← NEW
+    log_dvol = math.log1p(dvol_raw) if dvol_raw > 0 else 0.0
+    dvol_sc = _normalize(log_dvol, 14.0, 22.0)
 
-    participation = 0.60 * rvol_sc + 0.40 * dvol_sc                          # ← FIXED: was just rvol
+    participation = 0.60 * rvol_sc + 0.40 * dvol_sc
 
     # ── risk adjustment (higher = lower risk = better) ────────────────────────
     real_vol = _safe_float(_get(row, "realizedvol20d", "realized_vol_20d"), 0.20)
@@ -435,14 +449,12 @@ def _extract_etf_row(df: pd.DataFrame) -> dict | None:
             row["return20d"] = float(c_now / c_20 - 1.0)
 
     # ── ALWAYS compute indicators from OHLCV ─────────────────────────────
-    # Do NOT gate this on "are indicators already present" — they may be
-    # ensure_columns defaults that look real but carry zero information.
     computed = _compute_etf_indicators(df)
     ticker = row.get("ticker", row.get("symbol", "?"))
 
     if computed:
         for k, v in computed.items():
-            row[k] = v  # overwrite — computed from real prices is always better
+            row[k] = v
         logger.debug(
             "_extract_etf_row(%s): computed %d indicators inline "
             "(rsi=%.1f adx=%.1f rvol=%.2f ema_pct=%.4f atr_pct=%.4f dvol=%.0f)",
@@ -452,7 +464,7 @@ def _extract_etf_row(df: pd.DataFrame) -> dict | None:
             _safe_float(computed.get("relativevolume"), -1),
             _safe_float(computed.get("closevsema30pct"), -1),
             _safe_float(computed.get("atr14pct"), -1),
-            _safe_float(computed.get("dollarvolume20d"), -1),              # ← NEW
+            _safe_float(computed.get("dollarvolume20d"), -1),
         )
     else:
         n = len(df) if df is not None else 0
@@ -484,8 +496,6 @@ def score_etf_universe(
     scoreable = ALL_TRACKED_ETFS
 
     # ── Optionally compute RS z-score for each ETF vs benchmark ───────────
-    # This gives the momentum sub-score its full signal rather than
-    # defaulting rszscore to 0.0 for every ETF.
     etf_rs_z: dict[str, float] = {}
     if bench_df is not None and not bench_df.empty and "close" in bench_df.columns:
         bench_close = pd.to_numeric(bench_df["close"], errors="coerce").dropna()
@@ -508,7 +518,6 @@ def score_etf_universe(
             if len(rets_20) >= 5:
                 excess_20 = {t: r - bench_ret_20 for t, r in rets_20.items()}
                 excess_60 = {t: r - bench_ret_60 for t, r in rets_60.items()}
-                # Blend 60% short + 40% long, then z-score
                 blended = {
                     t: 0.6 * excess_20.get(t, 0) + 0.4 * excess_60.get(t, 0)
                     for t in excess_20
@@ -528,11 +537,9 @@ def score_etf_universe(
         if raw is None:
             continue
 
-        # Inject computed RS z-score if available and not already present
         if ticker in etf_rs_z and _get(raw, "rszscore") is None:
             raw["rszscore"] = etf_rs_z[ticker]
 
-        # Track how many ETFs still fall back to defaults
         if _get(raw, "rsi14", "rsi_14") is None:
             default_counts["rsi14"] += 1
         if _get(raw, "adx14", "adx_14") is None:
@@ -571,7 +578,7 @@ def score_etf_universe(
             "realizedvol20d":    _safe_float(
                 _get(raw, "realizedvol20d", "realized_vol_20d"), 0.20
             ),
-            "dollarvolume20d":   _safe_float(                                # ← NEW
+            "dollarvolume20d":   _safe_float(
                 _get(raw, "dollarvolume20d", "dollarvolumeavg20"), 0.0
             ),
         })
@@ -581,7 +588,6 @@ def score_etf_universe(
         logger.warning("score_etf_universe: no ETFs found in frames")
         return df
 
-    # ── Data quality check ────────────────────────────────────────────────
     n_etfs = len(df)
     for col, cnt in default_counts.items():
         if cnt == n_etfs:
@@ -596,7 +602,6 @@ def score_etf_universe(
                 col, cnt, n_etfs,
             )
 
-    # Check for constant sub-scores (the symptom from the previous run)
     for sub in ("sub_trend", "sub_participation", "sub_risk_adj"):
         if sub in df.columns and df[sub].std() < 1e-6:
             logger.error(
@@ -662,27 +667,41 @@ def _align_close_series(
 
 
 def _compute_sector_rs(
-    sector_etf_ticker: str,
+    sector_label: str,
     all_frames: dict[str, pd.DataFrame],
     bench_df: pd.DataFrame,
     lookback: int = 20,
     smooth: int = 5,
+    override_df: pd.DataFrame | None = None,
 ) -> dict[str, float]:
     """
-    Compute RS level, RS momentum, and excess return for a sector ETF.
+    Compute RS level, RS momentum, and excess return for a sector.
 
     Uses DATE-ALIGNED close series to prevent positional misalignment
     when frames have different row counts or trading calendars.
+
+    Parameters
+    ----------
+    sector_label : str
+        Ticker or descriptive label (used for logging only).
+    all_frames : dict
+        Ticker → DataFrame mapping.  Looked up by *sector_label*
+        unless *override_df* is provided.
+    bench_df : pd.DataFrame
+        Benchmark OHLCV with DatetimeIndex.
+    override_df : pd.DataFrame | None
+        If provided, used directly instead of looking up *sector_label*
+        in *all_frames*.  Enables synthetic sector close series.
     """
     null = {"rs_level": 0.0, "rs_mom": 0.0, "excess_20d": 0.0}
 
-    etf_df = all_frames.get(sector_etf_ticker)
+    etf_df = override_df if override_df is not None else all_frames.get(sector_label)
     aligned = _align_close_series(etf_df, bench_df)
     if aligned is None:
         logger.warning(
             "_compute_sector_rs(%s): date alignment failed — "
             "etf_rows=%s bench_rows=%s",
-            sector_etf_ticker,
+            sector_label,
             len(etf_df) if etf_df is not None else 0,
             len(bench_df) if bench_df is not None else 0,
         )
@@ -696,7 +715,7 @@ def _compute_sector_rs(
         logger.warning(
             "_compute_sector_rs(%s): too few aligned bars: "
             "n=%d required=%d",
-            sector_etf_ticker, n, min_required,
+            sector_label, n, min_required,
         )
         return null
 
@@ -714,7 +733,7 @@ def _compute_sector_rs(
     if pd.isna(rs_mean.iloc[-1]) or rs_mean.iloc[-1] <= 0:
         logger.warning(
             "_compute_sector_rs(%s): rs_mean[-1] invalid (%.6f)",
-            sector_etf_ticker,
+            sector_label,
             float(rs_mean.iloc[-1]) if pd.notna(rs_mean.iloc[-1]) else float("nan"),
         )
         return null
@@ -734,7 +753,7 @@ def _compute_sector_rs(
     else:
         logger.warning(
             "_compute_sector_rs(%s): rs_mom fallback — n=%d half=%d",
-            sector_etf_ticker, n, half,
+            sector_label, n, half,
         )
 
     # ── Excess return ─────────────────────────────────────────────────────
@@ -747,7 +766,7 @@ def _compute_sector_rs(
 
     logger.debug(
         "_compute_sector_rs(%s): n=%d rs_level=%.6f rs_mom=%.6f excess=%.6f",
-        sector_etf_ticker, n, rs_level, rs_mom, excess,
+        sector_label, n, rs_level, rs_mom, excess,
     )
 
     return {"rs_level": rs_level, "rs_mom": rs_mom, "excess_20d": excess}
@@ -811,6 +830,183 @@ def _classify_blended_regime(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Constituent-based rotation  (non-US markets)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_sector_synthetic_close(
+    tickers: list[str],
+    all_frames: dict[str, pd.DataFrame],
+    min_tickers: int = 2,
+    min_bars: int = 25,
+) -> pd.DataFrame | None:
+    """
+    Build an equal-weighted synthetic close for a group of tickers.
+
+    Each constituent is normalized to base-100 before averaging so that
+    different price levels don't dominate.  The result is a DataFrame
+    with a single 'close' column and a DatetimeIndex — compatible with
+    ``_align_close_series`` and ``_compute_sector_rs``.
+    """
+    normed: dict[str, pd.Series] = {}
+    for t in tickers:
+        df = all_frames.get(t)
+        if df is None or df.empty or "close" not in df.columns:
+            continue
+        c = pd.to_numeric(df["close"], errors="coerce").dropna()
+        if len(c) < min_bars:
+            continue
+        first_valid = c.iloc[0]
+        if not np.isfinite(first_valid) or first_valid <= 0:
+            continue
+        normed[t] = c / first_valid * 100.0
+
+    if len(normed) < min_tickers:
+        return None
+
+    combined = pd.DataFrame(normed)
+    # Equal-weighted average across available tickers per date.
+    # NaN columns on dates where a ticker doesn't trade are ignored.
+    synthetic = combined.mean(axis=1).dropna()
+
+    if len(synthetic) < min_bars:
+        return None
+
+    return pd.DataFrame({"close": synthetic})
+
+
+def _compute_rotation_from_constituents(
+    all_symbol_frames: dict[str, pd.DataFrame],
+    bench_df: pd.DataFrame,
+    market: str,
+    params: dict,
+) -> dict:
+    """
+    Compute sector rotation for non-US markets by grouping constituent
+    stocks by sector, building an equal-weighted synthetic close per
+    sector, and running the same RRG RS math against the local benchmark.
+
+    ETF scoring is skipped entirely — ``etf_ranking`` is returned empty.
+    """
+    lookback   = params.get("rs_lookback", 20)
+    smooth     = params.get("rs_smooth", 5)
+    thresholds = params.get("regime_thresholds", {})
+
+    # ── Group tickers by sector ───────────────────────────────────────────
+    _skip_sectors = {"Unknown", "ETF", "Index", "Cash", "Other"}
+    sector_tickers: dict[str, list[str]] = {}
+    for ticker in all_symbol_frames:
+        sector = get_sector_or_class(ticker) or "Unknown"
+        if sector in _skip_sectors:
+            continue
+        sector_tickers.setdefault(sector, []).append(ticker)
+
+    logger.info(
+        "Constituent-based rotation for %s: %d sectors from %d tickers",
+        market, len(sector_tickers), len(all_symbol_frames),
+    )
+    for sec in sorted(sector_tickers):
+        logger.debug("  %s: %d tickers", sec, len(sector_tickers[sec]))
+
+    # ── Per-sector: build synthetic close → RS → regime ───────────────────
+    sector_rows: list[dict] = []
+    sector_regimes: dict[str, str] = {}
+    zero_mom_count = 0
+
+    for sector in sorted(sector_tickers):
+        tickers = sector_tickers[sector]
+        synthetic_df = _build_sector_synthetic_close(
+            tickers, all_symbol_frames, min_tickers=2, min_bars=lookback + smooth,
+        )
+        if synthetic_df is None:
+            logger.debug(
+                "Sector '%s' (%s): insufficient data for synthetic close "
+                "(%d tickers, need ≥2 with ≥%d bars)",
+                sector, market, len(tickers), lookback + smooth,
+            )
+            sector_regimes[sector] = "unknown"
+            continue
+
+        label = f"[{market}:{sector}]"
+        rs = _compute_sector_rs(
+            label, {}, bench_df, lookback, smooth,
+            override_df=synthetic_df,
+        )
+
+        rrg_quad  = _rrg_quadrant(rs["rs_level"], rs["rs_mom"])
+        rrg_score = _rrg_to_score(rs["rs_level"], rs["rs_mom"])
+
+        # No ETF component — blended = pure RRG score.
+        # Pass neutral etf_composite so the etf_accel_override doesn't fire.
+        regime = _classify_blended_regime(
+            rrg_score, rs["rs_mom"], 0.50, thresholds,
+        )
+        sector_regimes[sector] = regime
+
+        if rs["rs_mom"] == 0.0:
+            zero_mom_count += 1
+
+        sector_rows.append({
+            "sector":          sector,
+            "etf":             f"({len(tickers)} names)",
+            "regime":          regime,
+            "rrg_quadrant":    rrg_quad,
+            "blended_score":   round(rrg_score, 4),
+            "rs_level":        round(rs["rs_level"], 4),
+            "rs_mom":          round(rs["rs_mom"], 4),
+            "excess_20d":      round(rs["excess_20d"], 4),
+            "etf_composite":   float("nan"),
+            "theme_avg_score": float("nan"),
+            "n_constituents":  len(tickers),
+        })
+
+    n_sectors = len([s for s in sector_tickers if sector_regimes.get(s) != "unknown"])
+    if zero_mom_count == n_sectors and n_sectors > 0:
+        logger.error(
+            "⚠️  ALL %d constituent sectors have rs_mom=0.0 — "
+            "check frame alignment (%s)",
+            n_sectors, market,
+        )
+
+    sector_summary = pd.DataFrame(sector_rows)
+    if not sector_summary.empty:
+        sector_summary = sector_summary.sort_values(
+            "blended_score", ascending=False,
+        ).reset_index(drop=True)
+
+    # ── Map every ticker to its sector regime ─────────────────────────────
+    ticker_regimes: dict[str, str] = {}
+    for ticker in all_symbol_frames:
+        sector = get_sector_or_class(ticker) or "Unknown"
+        ticker_regimes[ticker] = sector_regimes.get(sector, "unknown")
+
+    # ── Logging ───────────────────────────────────────────────────────────
+    regime_counts: dict[str, int] = {}
+    for r in sector_regimes.values():
+        regime_counts[r] = regime_counts.get(r, 0) + 1
+    logger.info(
+        "Constituent rotation regimes (%s): %s", market, regime_counts,
+    )
+    if not sector_summary.empty:
+        display_cols = [
+            c for c in [
+                "sector", "etf", "regime", "rrg_quadrant", "blended_score",
+                "rs_level", "rs_mom", "excess_20d", "n_constituents",
+            ] if c in sector_summary.columns
+        ]
+        logger.info(
+            "Sector summary (%s):\n%s",
+            market, sector_summary[display_cols].to_string(index=False),
+        )
+
+    return {
+        "sector_regimes": sector_regimes,
+        "ticker_regimes": ticker_regimes,
+        "sector_summary": sector_summary,
+        "etf_ranking":    pd.DataFrame(),   # no ETFs for non-US
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -822,8 +1018,9 @@ def compute_sector_rotation(
 ) -> dict:
     """
     Enhanced sector rotation combining:
-      1. Traditional RRG-style RS analysis per sector ETF
-      2. Composite scoring of the full ETF universe
+      1. Traditional RRG-style RS analysis per sector ETF  (US)
+         — or per synthetic sector close from constituents  (non-US)
+      2. Composite scoring of the full ETF universe  (US only)
       3. Blended regime classification via strength × direction matrix
 
     Returns dict with keys:
@@ -831,8 +1028,23 @@ def compute_sector_rotation(
       ticker_regimes  – {ticker: regime_str}
       sector_summary  – DataFrame with full detail per sector
       etf_ranking     – DataFrame with every ETF scored and ranked
+                        (empty for non-US markets)
     """
     params = params or ROTATIONPARAMS or {}
+
+    # ── Dispatch: non-US markets use constituent-based rotation ───────────
+    if market.upper() not in _US_LIKE_MARKETS:
+        logger.info(
+            "Market %s is not in %s — using constituent-based sector rotation",
+            market, _US_LIKE_MARKETS,
+        )
+        return _compute_rotation_from_constituents(
+            all_symbol_frames, bench_df, market, params,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  US path (unchanged)
+    # ══════════════════════════════════════════════════════════════════════
     lookback   = params.get("rs_lookback", 20)
     smooth     = params.get("rs_smooth", 5)
     etf_weight = params.get("etf_score_weight", 0.35)

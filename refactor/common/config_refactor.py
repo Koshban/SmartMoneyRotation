@@ -93,6 +93,11 @@ SCORINGPARAMS_V2 = {
 # ██  SIGNALS  (simplified from ~30 params to ~20)                           ██
 # ═══════════════════════════════════════════════════════════════════════════════
 SIGNALPARAMS_V2 = {
+    # ── Mechanical risk controls (NEW) ──
+    "trailing_stop_pct": 0.18,        # sell if price drops 18% from peak
+    "max_hold_days": 120,             # force review after 120 days
+    "upgrade_min_score_gap": 999,    # swap if candidate beats held by 0.12+
+    
     # ── Core thresholds (these are the 3 real gates) ──
     "base_entry_threshold": 0.50,     # was 0.58 — let the score do the work
     "base_exit_threshold": 0.35,      # was 0.42 — wider hold band
@@ -212,6 +217,8 @@ ACTIONPARAMS_V2 = {
     "overextended": {
     "max_ema_pct": 0.15,
     "max_rsi": 80.0,
+    "buy_top_n": 5,              # only top 5 composite scores → BUY
+    "buy_min_percentile": 0.85,  # or: must be in top 15%
 },
 }
 

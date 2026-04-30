@@ -17,6 +17,7 @@ smartmoneyrotation/
         ├── metrics.py            # Performance calculations
         ├── compare.py            # Side-by-side comparison + Rich output
         └── run_backtest.py       # CLI entry point
+        └── diagnostics.py
 ├── backtest_results/
 ├── common/
 │   ├── __init__.py
@@ -71,6 +72,7 @@ refactor/
     ├── __init__.py
     ├── adapters_v2.py
     ├── breadth_v2.py
+    ├── enrich_v2.py
     ├── portfolio_v2.py
     ├── regime_v2.py
     ├── rotation_v2.py
@@ -138,5 +140,44 @@ refactor/
 ├── pyproject.toml
 ├── requirements.txt
 └── .gitignore
+
+"""
+"""
+├── common/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── credentials.py
+│   ├── universe.py
+│   ├── sector_map.py
+│   └── expiry.py
+├── data/
+|   ├── backtest_results/
+│   ├── us_cash.parquet
+│   ├── us_options.parquet
+│   ├── hk_cash.parquet
+│   ├── in_cash.parquet
+│   ├── universe_cash.parquet
+│   ├── staging.json
+│   └── options/
+├── refactor/
+|    └── common/
+        ├── __init__.py
+        ├── config_refactor.py
+        ├── market_config_v2.py
+        ├── universe_loader_v2.py
+├── pipeline_v2.py
+├── report_v2.py 
+└── runner_v2.py         
+└── strategy/
+    ├── __init__.py
+    ├── adapters_v2.py
+    ├── breadth_v2.py
+    ├── enrich_v2.py
+    ├── portfolio_v2.py
+    ├── regime_v2.py
+    ├── rotation_v2.py
+    ├── rs_v2.py
+    ├── scoring_v2.py
+    └── signals_v2.py
 
 """

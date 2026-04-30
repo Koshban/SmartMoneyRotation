@@ -5,22 +5,15 @@ Composite scoring for the V2 pipeline.
 
 Revision notes
 --------------
-- **Risk differentiation**: when primary risk columns (``atr14pct``,
-  ``amihud20``, ``gaprate20``) are absent or produce flat scores, adaptive
-  proxies (relative volume, dollar volume, RSI distance) are used and
-  percentile-rank fallback prevents a flat ``scorerisk``.
-- **Participation weight redistribution**: when ``obvslope10d`` and/or
-  ``adlineslope10d`` have zero variance (missing from data source),
-  their weights are redistributed to ``relativevolume`` and
-  ``dollarvolume20d`` so that ``scoreparticipation`` differentiates
-  stocks instead of clustering at ~0.297.
-- **Extension**: continuous [0 → 1] scale replaces the original
-  3-step function for finer differentiation.
-- **Vol regime dampening**: calm markets map to 0.70 favorability
-  (not 1.0), preventing an outsized regime boost.
-- **Transparency**: actual ``market_breadth_score`` / ``market_vol_regime_score``
-  are stamped onto per-row columns so diagnostics and downstream
-  consumers see the values that were really used.
+- **UNIT FIX**: closevsema30pct and closevssma50pct are in PERCENTAGE-POINT
+  units (e.g., 5.0 = "5% above the moving average"). Scaling ranges corrected.
+- **Risk differentiation**: adaptive proxies for missing columns.
+- **Participation weight redistribution**: dead columns have weight
+  redistributed to live components.
+- **Regime differentiation**: since scoreregime is constant across all stocks,
+  its weight is reduced and redistributed to differentiating components.
+- **RS momentum**: rs_accel scaling widened and weighted higher.
+- **Score floor warning**: diagnostic emits warning when composite std < 0.08.
 """
 from __future__ import annotations
 
@@ -36,6 +29,9 @@ logger = logging.getLogger(__name__)
 # Below this std, fixed-threshold scaling is considered "flat" and
 # the adaptive helpers fall back to cross-sectional percentile rank.
 _ADAPTIVE_MIN_STD = 0.02
+
+# Minimum acceptable composite std — below this we log a warning
+_MIN_COMPOSITE_STD = 0.06
 
 
 # ── Utility helpers ──────────────────────────────────────────────────────
@@ -131,20 +127,40 @@ def compute_composite_v2(
     w = weights if weights is not None else SCORINGWEIGHTS_V2
     out = df.copy()
 
-    # ── Trend ─────────────────────────────────────────────────────────────
-    stock_rs = _s(out["rszscore"].fillna(0), -1.0, 2.0)
+    # ══════════════════════════════════════════════════════════════════════
+    #  TREND COMPONENT
+    # ══════════════════════════════════════════════════════════════════════
+    #
+    # All sub-components should produce meaningful spread across the
+    # universe.  closevsema30pct is in PERCENTAGE-POINT units:
+    #   5.0 = stock is 5% above EMA30
+    #  -3.0 = stock is 3% below EMA30
+    #
+    # rszscore is a standard z-score (mean ~0, std ~1).
+
+    stock_rs = _s(out["rszscore"].fillna(0), -1.5, 2.5)
     sector_rs = _s(
         out.get("sectrszscore", pd.Series(0, index=out.index)).fillna(0),
-        -1.0, 2.0,
+        -1.5, 2.5,
     )
     rs_accel = _s(
         out.get("rsaccel20", pd.Series(0, index=out.index)).fillna(0),
         -0.10, 0.15,
     )
-    trend_confirm = _s(
+
+    # ── FIXED: closevsema30pct in PERCENTAGE-POINT units ──────────────
+    # Old (broken): _s(x, -0.03, 0.10) → everything above 0.1% clips to 1.0
+    # New (correct): _s(x, -3.0, 8.0) → smooth differentiation from
+    #   "3% below EMA" (score=0) to "8% above EMA" (score=1).
+    #   A stock exactly at EMA30 (x=0) → score = 3.0/11.0 ≈ 0.27
+    #   A stock 3% above EMA (x=3) → score = 6.0/11.0 ≈ 0.55
+    #   A stock 6% above EMA (x=6) → score = 9.0/11.0 ≈ 0.82
+    trend_confirm = _adaptive_fwd(
         out.get("closevsema30pct", pd.Series(0, index=out.index)).fillna(0),
-        -0.03, 0.10,
+        -3.0, 8.0,
+        label="trend_confirm",
     )
+
     out["scoretrend"] = (
         p["trend"]["w_stock_rs"] * stock_rs
         + p["trend"]["w_sector_rs"] * sector_rs
@@ -152,7 +168,27 @@ def compute_composite_v2(
         + p["trend"]["w_trend_confirm"] * trend_confirm
     ).clip(0, 1)
 
-    # ── Participation (adaptive, with weight redistribution) ──────────── # ← CHANGED
+    # Trend diagnostics
+    _st = out["scoretrend"]
+    logger.info(
+        "scoretrend: min=%.4f p10=%.4f med=%.4f p90=%.4f max=%.4f std=%.4f | "
+        "sub-components: stock_rs std=%.4f sector_rs std=%.4f "
+        "rs_accel std=%.4f trend_confirm std=%.4f",
+        _st.min(), float(_st.quantile(0.10)), _st.median(),
+        float(_st.quantile(0.90)), _st.max(), float(_st.std()),
+        float(stock_rs.std()), float(sector_rs.std()),
+        float(rs_accel.std()), float(trend_confirm.std()),
+    )
+    if float(trend_confirm.std()) < _ADAPTIVE_MIN_STD:
+        logger.warning(
+            "trend_confirm has near-zero std (%.4f) — closevsema30pct may "
+            "not be populating. Check upstream data.",
+            float(trend_confirm.std()),
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  PARTICIPATION COMPONENT (adaptive, with weight redistribution)
+    # ══════════════════════════════════════════════════════════════════════
     #
     # When obvslope10d and/or adlineslope10d have zero variance (all-zero
     # because the data source doesn't populate them), their weights are
@@ -163,7 +199,6 @@ def compute_composite_v2(
     # Fix: detect dead components, redistribute their weight proportionally
     # to the live components (rvol, dvol), and use _adaptive_fwd for the
     # live components so rank-based fallback is available if needed.
-    # ──────────────────────────────────────────────────────────────────────
 
     rvol_raw = out.get(
         "relativevolume", pd.Series(1, index=out.index),
@@ -183,8 +218,8 @@ def compute_composite_v2(
 
     # Base weights from params
     w_rvol = p["participation"]["w_rvol"]
-    w_obv  = p["participation"]["w_obv"]
-    w_adl  = p["participation"]["w_adline"]
+    w_obv = p["participation"]["w_obv"]
+    w_adl = p["participation"]["w_adline"]
     w_dvol = p["participation"]["w_dollar_volume"]
 
     # Redistribute dead weights to live components
@@ -225,12 +260,12 @@ def compute_composite_v2(
     # Scale live components (adaptive for rvol/dvol, fixed for obv/adl)
     rvol = _adaptive_fwd(rvol_raw, 0.8, 2.2, label="rvol")
     dvol = _adaptive_fwd(dvol_raw, 10, 18, label="dvol")
-    obv  = (
+    obv = (
         _s(obv_raw, -0.05, 0.12)
         if obv_has_variance
         else pd.Series(0.0, index=out.index)
     )
-    adl  = (
+    adl = (
         _s(adl_raw, -0.05, 0.12)
         if adl_has_variance
         else pd.Series(0.0, index=out.index)
@@ -254,17 +289,9 @@ def compute_composite_v2(
         w_rvol, w_obv, w_adl, w_dvol,
     )
 
-    # ── Risk (adaptive, with proxy fallbacks) ─────────────────────────────
-    #
-    # The original fixed-threshold approach collapses to a constant when
-    # primary columns are absent or when the universe sits entirely inside
-    # (or outside) the configured scaling range.  The adaptive helpers
-    # detect this and fall back to cross-sectional percentile rank so the
-    # risk component always differentiates stocks.
-    #
-    # When a primary column is completely missing, a proxy that IS present
-    # in the parquet is substituted.
-    # ──────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  RISK COMPONENT (adaptive, with proxy fallbacks)
+    # ══════════════════════════════════════════════════════════════════════
     _risk_sources = []
 
     # — Sub-component 1: Volatility —
@@ -311,16 +338,20 @@ def compute_composite_v2(
         _risk_sources.append("rsi_dist(proxy)")
 
     # — Sub-component 4: Extension from moving average —
-    #   Continuous scale replaces the 3-level step function so that a stock
-    #   1% from SMA50 scores differently than one 7% away.
+    #   FIXED: closevssma50pct is in PERCENTAGE-POINT units, same as
+    #   closevsema30pct.  e.g., 8.0 = "8% above SMA50".
+    #
+    #   Old (broken): ext_warn=0.08, ext_bad=0.20 (decimal, caught nothing)
+    #   New (correct): warn at 8 pp, dangerous at 20 pp.
     ext_raw = (
         out.get("closevssma50pct", pd.Series(0, index=out.index))
         .fillna(0).abs()
     )
-    ext_warn = p["penalties"].get("extension_warn", 0.08)
-    ext_bad = p["penalties"].get("extension_bad", 0.20)
+    # Use percentage-point scaling: 4 pp = starts getting risky, 20 pp = very extended
+    ext_warn_pct = p["penalties"].get("extension_warn_pct", 4.0)
+    ext_bad_pct = p["penalties"].get("extension_bad_pct", 20.0)
     ext_pen = _adaptive_inv(
-        ext_raw, ext_warn * 0.5, ext_bad, label="extension",
+        ext_raw, ext_warn_pct, ext_bad_pct, label="extension",
     )
     _risk_sources.append("closevssma50pct")
 
@@ -345,11 +376,19 @@ def compute_composite_v2(
             float(_sr.std()), _risk_sources,
         )
 
-    # ── Regime ────────────────────────────────────────────────────────────
-    # Breadth and vol-regime are MARKET-LEVEL scalars, not per-stock.
-    # If the runner passes them as kwargs (correct approach), use those.
-    # Otherwise fall back to per-row columns, which are almost always
-    # the ensure_columns defaults (0.5) and produce a constant scoreregime.
+    # ══════════════════════════════════════════════════════════════════════
+    #  REGIME COMPONENT
+    # ══════════════════════════════════════════════════════════════════════
+    #
+    # IMPORTANT: This component is a MARKET-LEVEL scalar (identical for
+    # all stocks on a given day). It does NOT differentiate stocks cross-
+    # sectionally. Its purpose is to raise/lower the entire composite on
+    # days with favorable/unfavorable market conditions.
+    #
+    # Because it adds no cross-sectional spread, its weight should be
+    # modest (10-15%). If it's weighted too heavily, it compresses the
+    # differentiating components' contribution.
+
     if market_breadth_score is not None:
         breadth = pd.Series(
             float(market_breadth_score), index=out.index, dtype=float,
@@ -389,7 +428,6 @@ def compute_composite_v2(
             )
 
     # Dampened vol-favorability mapping
-    # ──────────────────────────────────
     #   vol_regime_score semantics: 0.0 = calm, ~0.5 = elevated, 1.0 = chaotic
     #   For long-biased strategies, lower vol is favorable — but we dampen
     #   the mapping so "calm" is favorable without being maximal:
@@ -398,12 +436,8 @@ def compute_composite_v2(
     #     0.35 (normal)   → 0.49  (neutral)
     #     0.60 (elevated) → 0.34  (mildly unfavorable)
     #     1.0  (chaotic)  → 0.10  (very unfavorable)
-    #
-    #   Old formula:  1.0 − volreg   (calm → 1.0)  ← pushed regime to ~0.81
-    #   New formula:  0.70 − 0.60 × volreg          ← caps at 0.70
     vol_favorable = (0.70 - 0.60 * volreg).clip(0.10, 0.70)
-
-    out["volfavorability"] = vol_favorable                           # ← NEW: display column
+    out["volfavorability"] = vol_favorable
 
     out["scoreregime"] = (
         p["regime"]["w_breadth"] * breadth
@@ -412,28 +446,23 @@ def compute_composite_v2(
 
     logger.info(
         "scoreregime: breadth=%.4f volreg=%.4f vol_favorable=%.4f "
-        "→ scoreregime=%.4f  (old formula would give %.4f)",
+        "→ scoreregime=%.4f  (constant across all %d stocks)",
         float(breadth.iloc[0]),
         float(volreg.iloc[0]),
         float(vol_favorable.iloc[0]),
         float(out["scoreregime"].iloc[0]),
-        float(
-            (p["regime"]["w_breadth"] * breadth.iloc[0]
-             + p["regime"]["w_vol_regime"] * (1.0 - volreg.iloc[0]))
-        ),
+        len(out),
     )
 
     # Stamp actual market-level values onto per-row columns
-    # so diagnostics and downstream consumers see what was really used
     if market_breadth_score is not None:
         out["breadthscore"] = float(market_breadth_score)
     if market_vol_regime_score is not None:
         out["volregimescore"] = float(market_vol_regime_score)
 
-    # ── Rotation ──────────────────────────────────────────────────────────
-    # Initial rotation scores — aligned with enrich_v2 regime scores
-    # so that the incremental enrichment delta is small (mostly just
-    # the ETF composite boost).                              ← CHANGED
+    # ══════════════════════════════════════════════════════════════════════
+    #  ROTATION COMPONENT
+    # ══════════════════════════════════════════════════════════════════════
     sect_regime = (
         out.get("sectrsregime", pd.Series("unknown", index=out.index))
         .fillna("unknown")
@@ -449,13 +478,15 @@ def compute_composite_v2(
                 sect_regime == "weakening",
                 sect_regime == "lagging",
             ],
-            [1.0, 0.70, 0.40, 0.15],                       # ← CHANGED: aligned with enrich_v2
+            [1.0, 0.70, 0.40, 0.15],
             default=0.30,
         ),
         index=out.index,
     )
 
-    # ── Composite ─────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  COMPOSITE SCORE
+    # ══════════════════════════════════════════════════════════════════════
     rotation_weight = w.get("rotation", 0.0)
     if rotation_weight == 0.0:
         logger.warning(
@@ -463,6 +494,27 @@ def compute_composite_v2(
             "scorerotation will not affect composite. "
             "Add 'rotation' to SCORINGWEIGHTS_V2."
         )
+
+    # Compute effective weights for diagnostics
+    total_weight = (
+        w["trend"] + w["participation"] + w["risk"]
+        + w["regime"] + rotation_weight
+    )
+    differentiating_weight = (
+        w["trend"] + w["participation"] + w["risk"] + rotation_weight
+    )
+    regime_weight = w["regime"]
+
+    logger.info(
+        "Composite weights: trend=%.3f participation=%.3f risk=%.3f "
+        "regime=%.3f rotation=%.3f | total=%.3f | "
+        "differentiating=%.1f%% constant(regime)=%.1f%%",
+        w["trend"], w["participation"], w["risk"],
+        regime_weight, rotation_weight,
+        total_weight,
+        100 * differentiating_weight / max(total_weight, 1e-9),
+        100 * regime_weight / max(total_weight, 1e-9),
+    )
 
     composite = (
         w["trend"] * out["scoretrend"]
@@ -472,7 +524,9 @@ def compute_composite_v2(
         + rotation_weight * out["scorerotation"]
     )
 
-    # ── Penalties ─────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  PENALTIES
+    # ══════════════════════════════════════════════════════════════════════
     rsi = out.get("rsi14", pd.Series(50, index=out.index)).fillna(50)
     adx = out.get("adx14", pd.Series(20, index=out.index)).fillna(20)
     rsi_low = p["penalties"]["rsi_soft_low"]
@@ -498,7 +552,50 @@ def compute_composite_v2(
     out["scorepenalty"] = (rsi_penalty + adx_penalty).clip(0, 0.20)
     out["scorecomposite_v2"] = (composite - out["scorepenalty"]).clip(0, 1)
 
-    # ── Diagnostic summary ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  DIAGNOSTIC SUMMARY
+    # ══════════════════════════════════════════════════════════════════════
+    _sc = out["scorecomposite_v2"]
+    composite_std = float(_sc.std())
+    composite_iqr = float(_sc.quantile(0.90) - _sc.quantile(0.10))
+
+    logger.info(
+        "scorecomposite_v2: min=%.4f p10=%.4f p25=%.4f med=%.4f "
+        "p75=%.4f p90=%.4f max=%.4f | std=%.4f iqr_90_10=%.4f",
+        _sc.min(),
+        float(_sc.quantile(0.10)),
+        float(_sc.quantile(0.25)),
+        _sc.median(),
+        float(_sc.quantile(0.75)),
+        float(_sc.quantile(0.90)),
+        _sc.max(),
+        composite_std,
+        composite_iqr,
+    )
+
+    if composite_std < _MIN_COMPOSITE_STD:
+        logger.warning(
+            "SCORE COMPRESSION: composite std=%.4f < %.4f — scores are "
+            "too clustered for effective differentiation. The top-ranked "
+            "stock (%.4f) is only %.4f above median (%.4f). This means "
+            "entry/exit thresholds must be razor-thin or nothing qualifies. "
+            "Check: (1) trend_confirm getting variance from closevsema30pct, "
+            "(2) scoreparticipation not collapsing, (3) weights distribution.",
+            composite_std, _MIN_COMPOSITE_STD,
+            _sc.max(), _sc.max() - _sc.median(), _sc.median(),
+        )
+    elif composite_std < 0.10:
+        logger.info(
+            "Score spread is moderate (std=%.4f). Adequate for ranking "
+            "but consider widening if entry signals are too few/many.",
+            composite_std,
+        )
+    else:
+        logger.info(
+            "Score spread is healthy (std=%.4f). Good differentiation.",
+            composite_std,
+        )
+
     for col in (
         "scoretrend", "scoreparticipation", "scorerisk",
         "scoreregime", "scorerotation", "scorepenalty",
@@ -507,8 +604,26 @@ def compute_composite_v2(
         if col in out.columns:
             s = out[col]
             logger.debug(
-                "  %s: mean=%.4f std=%.4f min=%.4f max=%.4f",
-                col, s.mean(), s.std(), s.min(), s.max(),
+                "  %s: mean=%.4f std=%.4f min=%.4f p10=%.4f med=%.4f "
+                "p90=%.4f max=%.4f",
+                col, s.mean(), s.std(), s.min(),
+                float(s.quantile(0.10)), s.median(),
+                float(s.quantile(0.90)), s.max(),
+            )
+
+    # Log the contribution of each component to composite spread
+    if logger.isEnabledFor(logging.DEBUG):
+        for col, weight in [
+            ("scoretrend", w["trend"]),
+            ("scoreparticipation", w["participation"]),
+            ("scorerisk", w["risk"]),
+            ("scoreregime", regime_weight),
+            ("scorerotation", rotation_weight),
+        ]:
+            component_contribution = weight * float(out[col].std())
+            logger.debug(
+                "  %s: weight=%.3f × std=%.4f = contribution_to_spread=%.4f",
+                col, weight, float(out[col].std()), component_contribution,
             )
 
     return out

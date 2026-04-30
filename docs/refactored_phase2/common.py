@@ -1,6 +1,5 @@
-""" Heres the common files """
-""" refactor/common/config_refactor.py 
-
+# refactor/common/config_refactor.py
+"""
 Unified simplified config.
 Built from the original Loose config, with structural simplifications:
 - Regime weight slashed (irrelevant when breadth disabled for HK/IN)
@@ -48,10 +47,11 @@ VOLREGIMEPARAMS = {
 # was based on missing data.  Redistributed to trend + participation.
 
 SCORINGWEIGHTS_V2 = {
-    "trend": 0.45,            # was 0.38
-    "participation": 0.25,    # was 0.22
-    "risk": 0.25,             # was 0.25 (unchanged)
-    "regime": 0.05,           # was 0.15
+    "trend":         0.30,
+    "participation": 0.20,
+    "risk":          0.20,
+    "regime":        0.15,
+    "rotation":      0.15,   # ← ADD THIS
 }
 
 SCORINGPARAMS_V2 = {
@@ -187,11 +187,15 @@ CONVERGENCEPARAMS_V2 = {
 # is determined by score + percentile only — no secondary gate cascade.
 
 ACTIONPARAMS_V2 = {
+# If you ever want to loosen it back (e.g., broader market with 4 leading sectors), just lower min_score to 0.70 or raise max_strong_buy to 20.
     "strong_buy": {
-        "min_percentile": 0.85,       # was 0.90
-        "min_score": 0.68,            # was 0.76
-        "score_above_entry": 0.06,    # was 0.08
-    },
+    "min_percentile": 0.90,        # was 0.85
+    "min_score": 0.75,             # was 0.68
+    "score_above_entry": 0.06,
+    "require_confirmed": True,     # NEW
+    "allowed_regimes": ["leading", "improving"],  # NEW
+},
+"max_strong_buy": 15,              # NEW
     "buy": {
         "min_percentile": 0.50,       # was 0.65
         "min_score": 0.52,            # was 0.62
@@ -205,6 +209,10 @@ ACTIONPARAMS_V2 = {
         "floor_score": 0.35,          # was 0.50
         "floor_percentile": 0.10,     # was 0.15
     },
+    "overextended": {
+    "max_ema_pct": 0.15,
+    "max_rsi": 80.0,
+},
 }
 
 
@@ -232,13 +240,27 @@ BREADTHPARAMS = {
 # ██  ROTATION                                                               ██
 # ═══════════════════════════════════════════════════════════════════════════════
 ROTATIONPARAMS = {
-    "rs_sma_period": 50,
-    "rs_momentum_period": 20,
-    "smooth_span": 10,
-    "min_history": 60,
+    "rs_lookback": 20,
+    "rs_smooth": 5,
+    "rs_weight": 0.65,
+    "etf_score_weight": 0.35,
+    "regime_thresholds": {
+        "leading_min": 0.60,
+        "moderate_min": 0.42,
+        "weak_min": 0.30,
+        "mom_threshold": -0.008,
+        "etf_accel_override": 0.55,
+    },
+    "etf_scoring": {
+        "trend_weight": 0.35,
+        "momentum_weight": 0.30,
+        "participation_weight": 0.20,
+        "risk_weight": 0.15,
+    },
 }
 
-##################################
+
+##############################################
 """ refactor/common/market_config_v2.py"""
 from __future__ import annotations
 
@@ -319,7 +341,9 @@ def get_market_config_v2(market: str) -> dict:
     cfg["tradable_universe"] = list(cfg["tradable_universe_fn"]())
     return cfg
 
-##########################
+
+#######################################
+
 """ refactor/common/universe_loader_v2.py """
 from __future__ import annotations
 
@@ -328,4 +352,5 @@ def get_universe_for_market(market: str):
     from common.universe import get_universe_for_market as gufm
     return gufm(market)
 
-######################
+
+######################################
