@@ -389,7 +389,10 @@ def get_full_universe() -> list[str]:
 
 def get_universe_for_market(market: str) -> list[str]:
     if market == 'US':
-        return list(ETF_UNIVERSE)
+        # Full universe: ETFs + US single names (matches MARKET_CONFIG)
+        us_singles = [s for s in get_all_single_names()
+                      if not s.endswith(".HK") and not s.endswith(".NS") and not s.endswith(".BO")]
+        return sorted(set(list(ETF_UNIVERSE) + us_singles))
     elif market == 'HK':
         return list(HK_UNIVERSE)
     elif market == 'IN':
