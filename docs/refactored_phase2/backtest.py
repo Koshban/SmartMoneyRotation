@@ -1,338 +1,769 @@
 """
-backtest/phase2/tracker.py
-Virtual portfolio tracker with minimum hold period,
-trailing stop, max hold duration, and score-ranked buys.
+backtest/phase2/compare.py
+Run two configs side-by-side and print a comparison table,
+including benchmark performance.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+import pandas as pd
+from typing import Any, Dict, Tuple
+
+from rich.console import Console
+from rich.table import Table
+
+from backtest.phase2.engine import BacktestEngine
+from backtest.phase2.data_source import BacktestDataSource
+from backtest.phase2.metrics import compute_metrics
+
+
+# ------------------------------------------------------------------
+def build_config_dict(
+    vol_regime_params: dict,
+    scoring_weights: dict,
+    scoring_params: dict,
+    signal_params: dict,
+    convergence_params: dict,
+    action_params: dict | None = None,
+    breadth_params: dict | None = None,
+    rotation_params: dict | None = None,
+) -> Dict[str, Any]:
+    """Bundle config blocks into one dict for the engine."""
+    cfg = {
+        "vol_regime_params": vol_regime_params,
+        "scoring_weights": scoring_weights,
+        "scoring_params": scoring_params,
+        "signal_params": signal_params,
+        "convergence_params": convergence_params,
+    }
+    if action_params is not None:
+        cfg["action_params"] = action_params
+    if breadth_params is not None:
+        cfg["breadth_params"] = breadth_params
+    if rotation_params is not None:
+        cfg["rotation_params"] = rotation_params
+    return cfg
+
+
+# ------------------------------------------------------------------
+def run_comparison(
+    data_source: BacktestDataSource,
+    market: str,
+    config_a: Dict[str, Any],
+    config_b: Dict[str, Any],
+    start_date: str,
+    end_date: str,
+    name_a: str = "Config A",
+    name_b: str = "Config B",
+    initial_capital: float = 1_000_000.0,
+    max_positions: int = 12,
+    commission_rate: float = 0.0010,
+    slippage_rate: float = 0.0010,
+) -> Tuple[Dict, Dict, pd.DataFrame]:
+    """
+    Returns (results_a, results_b, comparison_dataframe).
+    """
+    common = dict(
+        data_source=data_source,
+        market=market,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=initial_capital,
+        max_positions=max_positions,
+        commission_rate=commission_rate,
+        slippage_rate=slippage_rate,
+    )
+
+    ra = BacktestEngine(config=config_a, config_name=name_a, **common).run()
+    rb = BacktestEngine(config=config_b, config_name=name_b, **common).run()
+
+    ma = compute_metrics(ra)
+    mb = compute_metrics(rb)
+    ra["metrics"], rb["metrics"] = ma, mb
+
+    comp = _comparison_df(ma, mb, name_a, name_b)
+    return ra, rb, comp
+
+
+# ------------------------------------------------------------------
+_ROWS = [
+    # (label,                  key,                    fmt,   lower_is_better)
+    ("Total Return",           "total_return",         ".1%",  False),
+    ("Annualized Return",      "annualized_return",    ".1%",  False),
+    ("Final Value",            "final_value",          ",.0f", False),
+    ("SEP", None, None, None),
+    ("Annualized Vol",         "annualized_vol",       ".1%",  True),
+    ("Sharpe Ratio",           "sharpe_ratio",         ".2f",  False),
+    ("Sortino Ratio",          "sortino_ratio",        ".2f",  False),
+    ("Max Drawdown",           "max_drawdown",         ".1%",  True),
+    ("Max DD Duration (days)", "max_dd_duration_days", "d",    True),
+    ("Calmar Ratio",           "calmar_ratio",         ".2f",  False),
+    ("SEP", None, None, None),
+    ("Total Trades",           "total_trades",         "d",    None),
+    ("Win Rate",               "win_rate",             ".1%",  False),
+    ("Avg Win",                "avg_win_pct",          ".1%",  False),
+    ("Avg Loss",               "avg_loss_pct",         ".1%",  True),
+    ("Profit Factor",          "profit_factor",        ".2f",  False),
+    ("Avg PnL %",              "avg_pnl_pct",          ".2%",  False),
+    ("Expectancy ($)",         "expectancy_dollar",    ",.0f", False),
+    ("Avg Holding Days",       "avg_holding_days",     ".1f",  None),
+    ("SEP", None, None, None),
+    ("Best Trade",             "best_trade_pct",       ".1%",  False),
+    ("Worst Trade",            "worst_trade_pct",      ".1%",  True),
+    ("Avg Positions",          "avg_positions",        ".1f",  None),
+    ("Buy Signals",            "total_buy_signals",    "d",    None),
+    ("Sell Signals",           "total_sell_signals",   "d",    None),
+    ("SEP", None, None, None),
+    # ── Benchmark & relative metrics ──────────────────────────────
+    ("Benchmark Return",       "benchmark_total_return", ".1%", None),
+    ("Benchmark Ann. Return",  "benchmark_ann_return", ".1%",  None),
+    ("Benchmark Sharpe",       "benchmark_sharpe",     ".2f",  None),
+    ("Benchmark Max DD",       "benchmark_max_dd",     ".1%",  None),
+    ("SEP", None, None, None),
+    ("Alpha (Jensen)",         "alpha",                ".2%",  False),
+    ("Beta",                   "beta",                 ".2f",  None),
+    ("Tracking Error",         "tracking_error",       ".1%",  True),
+    ("Information Ratio",      "information_ratio",    ".2f",  False),
+]
+
+
+def _comparison_df(
+    ma: Dict, mb: Dict, name_a: str, name_b: str
+) -> pd.DataFrame:
+    rows = []
+    for label, key, fmt, lower_better in _ROWS:
+        if key is None:
+            rows.append({"Metric": "─" * 28, name_a: "", name_b: "", "Better": ""})
+            continue
+
+        va, vb = ma.get(key, 0), mb.get(key, 0)
+
+        # who wins?
+        if lower_better is None:
+            better = ""
+        elif lower_better:
+            better = name_a if va < vb else name_b if vb < va else "Tie"
+        else:
+            better = name_a if va > vb else name_b if vb > va else "Tie"
+
+        try:
+            sa = f"{va:{fmt}}"
+            sb = f"{vb:{fmt}}"
+        except (ValueError, TypeError):
+            sa, sb = str(va), str(vb)
+
+        rows.append({"Metric": label, name_a: sa, name_b: sb, "Better": better})
+
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------
+def print_comparison(
+    comp: pd.DataFrame,
+    name_a: str = "Config A",
+    name_b: str = "Config B",
+    console: Console | None = None,
+) -> None:
+    """Pretty-print with Rich."""
+    if console is None:
+        console = Console()
+
+    table = Table(title="⚔️  Backtest Comparison", show_lines=False, padding=(0, 1))
+    for col in comp.columns:
+        table.add_column(col, justify="left" if col == "Metric" else "right")
+
+    for _, row in comp.iterrows():
+        cells = []
+        for col in comp.columns:
+            v = str(row[col])
+            if col == "Better":
+                if v == name_a:
+                    v = f"[cyan]◄ {v}[/]"
+                elif v == name_b:
+                    v = f"[green]{v} ►[/]"
+            cells.append(v)
+        table.add_row(*cells)
+
+    console.print(table)
+
+##########################################
+"""
+backtest/phase2/data_source.py
+Date-aware data source wrapper for backtesting.
+
+Loads from a single parquet file per market (data/{market}_cash.parquet),
+filters to a given ticker universe, and presents a sliding window up to
+the current backtest date.
+
+Expected parquet schema (long format):
+    date | ticker | open | high | low | close | volume
+
+The 'date' column should be parseable as datetime.  Column names are
+normalised to lowercase on load.  If the parquet uses 'symbol' instead
+of 'ticker', that works too.
+"""
+from __future__ import annotations
+
 import logging
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
 
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class Position:
-    ticker: str
-    entry_date: object
-    entry_price: float
-    shares: int
-    cost_basis: float
-    peak_price: float = 0.0          # ← NEW: trailing-stop tracking
-    latest_score: float = 0.0        # ← NEW: for upgrade comparisons
-
-    def __post_init__(self):
-        if self.peak_price == 0.0:
-            self.peak_price = self.entry_price
-
-
-class PortfolioTracker:
+class BacktestDataSource:
 
     def __init__(
         self,
-        initial_capital: float = 1_000_000.0,
-        max_positions: int = 12,
-        commission_rate: float = 0.0010,
-        slippage_rate: float = 0.0010,
-        min_hold_days: int = 5,
-        min_profit_early_exit_pct: float = 0.05,
-        # ── NEW parameters ────────────────────────────────────
-        trailing_stop_pct: float = 0.18,
-        max_hold_days: int = 120,
-        upgrade_min_score_gap: float = 999,
+        ticker_data: Dict[str, pd.DataFrame],
+        benchmark_data: Optional[pd.DataFrame] = None,
+        lookback_bars: int = 300,
     ):
-        self.initial_capital = initial_capital
-        self.cash = initial_capital
-        self.max_positions = max_positions
-        self.commission_rate = commission_rate
-        self.slippage_rate = slippage_rate
-        self.min_hold_days = min_hold_days
-        self.min_profit_early_exit_pct = min_profit_early_exit_pct
+        self.ticker_data = ticker_data
+        self.benchmark_data = benchmark_data
+        self.lookback_bars = lookback_bars
+        self._cutoff: Optional[pd.Timestamp] = None
 
-        # NEW
-        self.trailing_stop_pct = trailing_stop_pct
-        self.max_hold_days = max_hold_days
-        self.upgrade_min_score_gap = upgrade_min_score_gap
+    # ==================================================================
+    #  Factory — build from parquet + universe list
+    # ==================================================================
+    @classmethod
+    def from_parquet(
+        cls,
+        parquet_path: str | Path,
+        tickers: List[str],
+        benchmark_ticker: Optional[str] = None,
+        lookback_bars: int = 300,
+    ) -> "BacktestDataSource":
+        """
+        Load ``data/{market}_cash.parquet`` and split into per-ticker
+        DataFrames keyed by ticker with a DatetimeIndex.
 
-        self.positions: Dict[str, Position] = {}
-        self.closed_trades: List[Dict] = []
+        Args:
+            parquet_path:     Path to the parquet file.
+            tickers:          Universe tickers to keep.
+            benchmark_ticker: e.g. "2800.HK".  Looked up in the same
+                              parquet; ignored if not found.
+            lookback_bars:    Max bars per fetch() call.
+        """
+        path = Path(parquet_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Parquet file not found: {path}")
 
-    # ──────────────────────────────────────────────────────────
-    #  Min-hold check (unchanged)
-    # ──────────────────────────────────────────────────────────
-    def _can_sell(self, pos: Position, date, current_price: float) -> bool:
-        held_days = (date - pos.entry_date).days
-        if held_days >= self.min_hold_days:
-            return True
-        unrealised_pct = (current_price / pos.entry_price) - 1.0
-        if unrealised_pct >= self.min_profit_early_exit_pct:
-            log.debug(
-                "  early exit allowed %s: +%.1f%% after %dd",
-                pos.ticker, unrealised_pct * 100, held_days,
+        raw = pd.read_parquet(path)
+        raw.columns = raw.columns.str.strip().str.lower()
+
+        # ── normalise ticker column ──────────────────────────────
+        ticker_col = _find_column(raw, ("ticker", "symbol", "code", "stock"))
+        if ticker_col is None:
+            raise KeyError(
+                f"Cannot find a ticker/symbol column in {path}.  "
+                f"Columns present: {list(raw.columns)}"
             )
-            return True
-        return False
 
-    # ──────────────────────────────────────────────────────────
-    #  NEW: Force exits for trailing stop + max hold
-    # ──────────────────────────────────────────────────────────
-    def force_exits(
+        # ── normalise date column / index ────────────────────────
+        date_col = _find_column(raw, ("date", "datetime", "timestamp", "time"))
+        if date_col is not None:
+            raw[date_col] = pd.to_datetime(raw[date_col])
+        elif isinstance(raw.index, pd.DatetimeIndex):
+            raw = raw.reset_index()
+            date_col = raw.columns[0]  # the old index name
+        else:
+            raise KeyError(
+                f"Cannot find a date column in {path}.  "
+                f"Columns present: {list(raw.columns)}"
+            )
+
+        # ── normalise OHLCV column names ─────────────────────────
+        rename_map = {}
+        for target, candidates in [
+            ("open",   ("open", "o")),
+            ("high",   ("high", "h")),
+            ("low",    ("low", "l")),
+            ("close",  ("close", "c", "adj close", "adj_close", "adjclose")),
+            ("volume", ("volume", "vol", "v")),
+        ]:
+            found = _find_column(raw, candidates)
+            if found and found != target:
+                rename_map[found] = target
+        if rename_map:
+            raw = raw.rename(columns=rename_map)
+
+        needed = {"open", "high", "low", "close", "volume"}
+        missing = needed - set(raw.columns)
+        if missing:
+            raise KeyError(f"Missing OHLCV columns after rename: {missing}")
+
+        # ── filter to universe tickers ───────────────────────────
+        all_tickers_in_file = set(raw[ticker_col].unique())
+        want = set(tickers)
+        if benchmark_ticker:
+            want.add(benchmark_ticker)
+
+        found_tickers = want & all_tickers_in_file
+        not_found = want - all_tickers_in_file
+        if not_found:
+            log.warning(
+                "%d tickers not in parquet and will be skipped: %s",
+                len(not_found),
+                sorted(not_found)[:20],
+            )
+
+        raw = raw[raw[ticker_col].isin(found_tickers)].copy()
+        raw = raw.sort_values([ticker_col, date_col])
+
+        # ── split into {ticker: DataFrame} ───────────────────────
+        ticker_data: Dict[str, pd.DataFrame] = {}
+        benchmark_data: Optional[pd.DataFrame] = None
+
+        for tkr, group in raw.groupby(ticker_col):
+            df = (
+                group.set_index(date_col)[["open", "high", "low", "close", "volume"]]
+                .sort_index()
+                .copy()
+            )
+            df.index.name = "date"
+            # drop exact duplicate indices if any
+            df = df[~df.index.duplicated(keep="last")]
+            ticker_data[tkr] = df
+
+            if tkr == benchmark_ticker:
+                benchmark_data = df.copy()
+
+        log.info(
+            "Loaded %d tickers from %s  (date range %s → %s)",
+            len(ticker_data),
+            path.name,
+            raw[date_col].min().strftime("%Y-%m-%d"),
+            raw[date_col].max().strftime("%Y-%m-%d"),
+        )
+
+        return cls(
+            ticker_data=ticker_data,
+            benchmark_data=benchmark_data,
+            lookback_bars=lookback_bars,
+        )
+
+    # ==================================================================
+    #  Cutoff management
+    # ==================================================================
+    def set_cutoff(self, dt) -> None:
+        self._cutoff = pd.Timestamp(dt)
+
+    # ==================================================================
+    #  Data access
+    # ==================================================================
+    def fetch(self, ticker: str) -> pd.DataFrame:
+        if ticker not in self.ticker_data:
+            return pd.DataFrame()
+        df = self.ticker_data[ticker]
+        if self._cutoff is not None:
+            df = df.loc[df.index <= self._cutoff]
+        if len(df) > self.lookback_bars:
+            df = df.iloc[-self.lookback_bars:]
+        return df.copy()
+
+    def fetch_benchmark(self) -> pd.DataFrame:
+        if self.benchmark_data is None:
+            return pd.DataFrame()
+        df = self.benchmark_data
+        if self._cutoff is not None:
+            df = df.loc[df.index <= self._cutoff]
+        if len(df) > self.lookback_bars:
+            df = df.iloc[-self.lookback_bars:]
+        return df.copy()
+
+    def get_tickers(self) -> List[str]:
+        return list(self.ticker_data.keys())
+
+    def get_trading_days(self, start: str, end: str) -> List[pd.Timestamp]:
+        all_dates: set = set()
+        for df in self.ticker_data.values():
+            all_dates.update(df.index.tolist())
+        s, e = pd.Timestamp(start), pd.Timestamp(end)
+        return sorted(d for d in all_dates if s <= d <= e)
+
+    def get_date_range(self) -> tuple:
+        """Min and max dates across all loaded tickers."""
+        lo, hi = pd.Timestamp.max, pd.Timestamp.min
+        for df in self.ticker_data.values():
+            if not df.empty:
+                lo = min(lo, df.index.min())
+                hi = max(hi, df.index.max())
+        return lo, hi
+
+
+# ------------------------------------------------------------------
+#  helpers
+# ------------------------------------------------------------------
+
+def _find_column(df: pd.DataFrame, candidates: tuple) -> Optional[str]:
+    """Return the first column name from *candidates* present in df."""
+    cols_lower = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c in cols_lower:
+            return cols_lower[c]
+    return None
+
+#################
+"""backtest/phase2/diagnostics.py
+
+Drop-in signal diagnostics. Wire into your engine's day loop
+and signal generator to capture *why* BUY/SELL/HOLD decisions
+are made.
+
+Usage:
+    from backtest.phase2.diagnostics import SignalDiagnostics
+    diag = SignalDiagnostics("Loose", enabled=True)
+    # ... wire calls at each decision point (see integration notes below)
+    diag.print_summary()
+"""
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from typing import Any
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+# ── reason tags (use these as constants so summaries group cleanly) ─────
+R_SCORE_BELOW_EXIT    = "score<exit"
+R_SCORE_ABOVE_ENTRY   = "score>=entry"
+R_RANK_BELOW_FLOOR    = "rank<exit_floor"
+R_RANK_ABOVE_MIN      = "rank>=min_rank"
+R_RANK_BELOW_MIN      = "rank<min_rank"
+R_RS_BLOCKED          = "rs_regime_blocked"
+R_RS_FAIL_PENALTY     = "rs_fail_penalty_applied"
+R_SECTOR_BLOCKED      = "sector_regime_blocked"
+R_BREADTH_HARD_BLOCK  = "breadth_hard_block"
+R_VOL_HARD_BLOCK      = "vol_hard_block"
+R_COOLDOWN            = "cooldown_active"
+R_MAX_POSITIONS       = "max_positions_reached"
+R_CONTINUATION        = "continuation_pass"
+R_CONTINUATION_FAIL   = "continuation_fail"
+R_PULLBACK            = "pullback_pass"
+R_PULLBACK_FAIL       = "pullback_fail"
+R_CHAOTIC_EXIT_BUMP   = "chaotic_exit_bump"
+R_NOT_HELD            = "not_held"
+R_HELD_OK             = "held_score_ok"
+
+
+class SignalDiagnostics:
+    """Captures per-day, per-ticker decision data and emits summaries."""
+
+    def __init__(self, name: str = "", enabled: bool = True,
+                 verbose_top_n: int = 5, verbose_sells: int = 3):
+        self.name = name
+        self.enabled = enabled
+        self.verbose_top_n = verbose_top_n
+        self.verbose_sells = verbose_sells
+
+        # accumulation across entire backtest
+        self.daily_records: list[dict] = []
+        self._rec: dict | None = None
+
+    # ── per-day lifecycle ───────────────────────────────────────────────
+
+    def begin_day(
         self,
         date,
-        prices: Dict[str, float],
-    ) -> List[str]:
+        vol_regime: str,
+        breadth_regime: str,
+        base_entry: float,
+        base_exit: float,
+        regime_entry_adj: float,
+        breadth_entry_adj: float,
+        adjusted_entry: float,
+        adjusted_exit: float,
+        size_multiplier: float = 1.0,
+        n_held: int = 0,
+        max_positions: int = 0,
+    ):
+        """Call once at the start of each trading day, after computing
+        regime adjustments but before iterating over tickers."""
+        if not self.enabled:
+            return
+        self._rec = {
+            "date": date,
+            "vol_regime": vol_regime,
+            "breadth_regime": breadth_regime,
+            "base_entry": base_entry,
+            "base_exit": base_exit,
+            "regime_entry_adj": regime_entry_adj,
+            "breadth_entry_adj": breadth_entry_adj,
+            "adjusted_entry": adjusted_entry,
+            "adjusted_exit": adjusted_exit,
+            "size_multiplier": size_multiplier,
+            "n_held": n_held,
+            "max_positions": max_positions,
+            # populated by log_score / log_decision
+            "composites": {},          # ticker -> float
+            "sub_scores": {},          # ticker -> dict
+            "ranks": {},               # ticker -> float
+            "rs_regimes": {},          # ticker -> str
+            "sector_regimes": {},      # ticker -> str
+            "decisions": {},           # ticker -> (action, [reasons])
+            "sell_triggers": defaultdict(list),
+        }
+
+    def log_score(
+        self,
+        ticker: str,
+        composite: float,
+        rank_pct: float | None = None,
+        sub_scores: dict | None = None,
+        rs_regime: str | None = None,
+        sector_regime: str | None = None,
+    ):
+        """Call for every ticker after the scoring pipeline runs."""
+        if not self.enabled or self._rec is None:
+            return
+        self._rec["composites"][ticker] = composite
+        if rank_pct is not None:
+            self._rec["ranks"][ticker] = rank_pct
+        if sub_scores:
+            self._rec["sub_scores"][ticker] = sub_scores
+        if rs_regime:
+            self._rec["rs_regimes"][ticker] = rs_regime
+        if sector_regime:
+            self._rec["sector_regimes"][ticker] = sector_regime
+
+    def log_decision(self, ticker: str, action: str, reasons: list[str]):
+        """Call when a final BUY / SELL / HOLD / BLOCKED decision is made.
+
+        action: one of 'BUY', 'SELL', 'HOLD', 'BLOCKED'
+        reasons: list of R_* tags (or free-form strings)
         """
-        Mechanically sell positions that hit the trailing stop
-        or exceed max holding period.  Called BEFORE normal signal
-        processing so freed slots are available for new buys.
+        if not self.enabled or self._rec is None:
+            return
+        self._rec["decisions"][ticker] = (action, reasons)
+        if action == "SELL":
+            for r in reasons:
+                self._rec["sell_triggers"][r].append(ticker)
 
-        Returns list of tickers that were force-sold.
-        """
-        force_sold = []
-        for ticker in list(self.positions):
-            pos = self.positions[ticker]
-            price = prices.get(ticker)
-            if price is None:
-                continue
+    def end_day(self):
+        """Call at end of day. Logs summary lines and archives the record."""
+        if not self.enabled or self._rec is None:
+            return
+        rec = self._rec
+        scores = np.array(list(rec["composites"].values())) if rec["composites"] else np.array([])
+        ranks = np.array(list(rec["ranks"].values())) if rec["ranks"] else np.array([])
 
-            held_days = (date - pos.entry_date).days
-            drawdown_from_peak = (price - pos.peak_price) / pos.peak_price
+        # ── 1. score distribution vs thresholds ────────────────────────
+        if len(scores) > 0:
+            p = np.percentile(scores, [5, 10, 25, 50, 75, 90, 95])
+            above_entry = int(np.sum(scores >= rec["adjusted_entry"]))
+            in_band = int(np.sum(
+                (scores >= rec["adjusted_exit"]) & (scores < rec["adjusted_entry"])
+            ))
+            below_exit = int(np.sum(scores < rec["adjusted_exit"]))
 
-            reason = None
-            if held_days >= self.max_hold_days:
-                reason = f"max_hold ({held_days}d >= {self.max_hold_days}d)"
-            elif drawdown_from_peak <= -self.trailing_stop_pct:
-                reason = (
-                    f"trailing_stop ({drawdown_from_peak:+.1%} from "
-                    f"peak ${pos.peak_price:.2f})"
+            logger.info(
+                f"[{self.name}] {rec['date']}  DIAG-SCORES  "
+                f"n={len(scores)}  "
+                f"p5={p[0]:.3f} p10={p[1]:.3f} p25={p[2]:.3f} "
+                f"p50={p[3]:.3f} p75={p[4]:.3f} p90={p[5]:.3f} p95={p[6]:.3f}  "
+                f"above_entry={above_entry}  in_band={in_band}  below_exit={below_exit}"
+            )
+
+        # ── 2. threshold computation trace ─────────────────────────────
+        logger.info(
+            f"[{self.name}] {rec['date']}  DIAG-THRESH  "
+            f"vol={rec['vol_regime']}  breadth={rec['breadth_regime']}  "
+            f"base_entry={rec['base_entry']:.3f}  "
+            f"+regime_adj={rec['regime_entry_adj']:+.3f}  "
+            f"+breadth_adj={rec['breadth_entry_adj']:+.3f}  "
+            f"= adjusted_entry={rec['adjusted_entry']:.3f}  "
+            f"adjusted_exit={rec['adjusted_exit']:.3f}  "
+            f"size_mult={rec['size_multiplier']:.2f}  "
+            f"held={rec['n_held']}/{rec['max_positions']}"
+        )
+
+        # ── 3. rank distribution (if populated) ────────────────────────
+        if len(ranks) > 0:
+            rp = np.percentile(ranks, [10, 50, 90])
+            logger.info(
+                f"[{self.name}] {rec['date']}  DIAG-RANKS   "
+                f"n={len(ranks)}  p10={rp[0]:.3f}  p50={rp[1]:.3f}  p90={rp[2]:.3f}"
+            )
+        else:
+            logger.info(
+                f"[{self.name}] {rec['date']}  DIAG-RANKS   "
+                f"** NO RANK DATA — rank keys may not be wired **"
+            )
+
+        # ── 4. top N scores with full breakdown ────────────────────────
+        if rec["composites"]:
+            top = sorted(rec["composites"].items(), key=lambda x: x[1], reverse=True)
+            for ticker, comp in top[: self.verbose_top_n]:
+                sub = rec["sub_scores"].get(ticker, {})
+                rank = rec["ranks"].get(ticker)
+                rs = rec["rs_regimes"].get(ticker, "?")
+                sec = rec["sector_regimes"].get(ticker, "?")
+                dec_action, dec_reasons = rec["decisions"].get(ticker, ("?", []))
+
+                sub_str = "  ".join(f"{k}={v:.3f}" for k, v in sub.items())
+                rank_str = f"rank={rank:.3f}" if rank is not None else "rank=N/A"
+
+                logger.info(
+                    f"[{self.name}] {rec['date']}  DIAG-TOP     "
+                    f"{ticker:20s}  comp={comp:.4f}  {rank_str}  "
+                    f"rs={rs}  sec={sec}  {sub_str}  "
+                    f"→ {dec_action}  {dec_reasons}"
                 )
 
-            if reason and self._can_sell(pos, date, price):
-                log.info("  ✖ FORCE-EXIT %-10s  %s", ticker, reason)
-                self._sell(date, ticker, price)
-                force_sold.append(ticker)
-
-        return force_sold
-
-    # ──────────────────────────────────────────────────────────
-    #  NEW: Upgrade — swap weak held position for strong candidate
-    # ──────────────────────────────────────────────────────────
-    def try_upgrades(
-        self,
-        date,
-        candidate_scores: Dict[str, float],
-        prices: Dict[str, float],
-        max_upgrades: int = 2,
-    ) -> List[tuple]:
-        """
-        Compare the weakest held positions against the strongest
-        un-held candidates.  If the score gap exceeds the threshold,
-        sell the held position and buy the candidate.
-
-        Returns list of (sold_ticker, bought_ticker) pairs.
-        """
-        if not self.positions or not candidate_scores:
-            return []
-
-        # Rank held positions by their latest score (ascending = weakest first)
-        held_scored = [
-            (t, pos.latest_score)
-            for t, pos in self.positions.items()
-            if self._can_sell(pos, date, prices.get(t, pos.entry_price))
-        ]
-        held_scored.sort(key=lambda x: x[1])
-
-        # Rank candidates by score (descending = strongest first)
-        candidates = [
-            (t, s)
-            for t, s in candidate_scores.items()
-            if t not in self.positions and t in prices
-        ]
-        candidates.sort(key=lambda x: x[1], reverse=True)
-
-        swaps = []
-        used_held = set()
-        used_cand = set()
-
-        for cand_ticker, cand_score in candidates:
-            if len(swaps) >= max_upgrades:
-                break
-            if cand_ticker in used_cand:
-                continue
-
-            for held_ticker, held_score in held_scored:
-                if held_ticker in used_held:
-                    continue
-                gap = cand_score - held_score
-                if gap >= self.upgrade_min_score_gap:
-                    log.info(
-                        "  ⇄ UPGRADE  sell %-10s (score %.3f) → "
-                        "buy %-10s (score %.3f, gap +%.3f)",
-                        held_ticker, held_score,
-                        cand_ticker, cand_score, gap,
-                    )
-                    self._sell(date, held_ticker, prices[held_ticker])
-                    self._buy(date, cand_ticker, prices[cand_ticker])
-                    used_held.add(held_ticker)
-                    used_cand.add(cand_ticker)
-                    swaps.append((held_ticker, cand_ticker))
-                    break
-
-        return swaps
-
-    # ──────────────────────────────────────────────────────────
-    #  Process signals — NOW accepts scores for buy ranking
-    # ──────────────────────────────────────────────────────────
-    
-    def process_signals(
-        self,
-        date,
-        actions: Dict[str, str],
-        prices: Dict[str, float],
-        scores: Optional[Dict[str, float]] = None,
-    ) -> None:
-        scores = scores or {}
-
-        # ── sells first (respect min hold) ────────────────────
-        blocked_sells = []
-        for ticker, action in actions.items():
-            if action == "SELL" and ticker in self.positions:
-                if ticker not in prices:
-                    continue
-                pos = self.positions[ticker]
-                if self._can_sell(pos, date, prices[ticker]):
-                    self._sell(date, ticker, prices[ticker])
-                else:
-                    held = (date - pos.entry_date).days
-                    blocked_sells.append((ticker, held))
-
-        if blocked_sells:
-            log.debug(
-                "  min-hold blocked %d sells: %s",
-                len(blocked_sells),
-                [(t, f"{d}d") for t, d in blocked_sells[:5]],
+        # ── 5. sell trigger breakdown ──────────────────────────────────
+        if rec["sell_triggers"]:
+            counts = {k: len(v) for k, v in rec["sell_triggers"].items()}
+            logger.info(
+                f"[{self.name}] {rec['date']}  DIAG-SELLS   {counts}"
             )
+            # show a few examples of score-below-exit sells
+            score_sells = rec["sell_triggers"].get(R_SCORE_BELOW_EXIT, [])
+            for ticker in score_sells[: self.verbose_sells]:
+                comp = rec["composites"].get(ticker, 0)
+                sub = rec["sub_scores"].get(ticker, {})
+                sub_str = "  ".join(f"{k}={v:.3f}" for k, v in sub.items())
+                logger.info(
+                    f"[{self.name}] {rec['date']}  DIAG-SELL-EX "
+                    f"{ticker:20s}  comp={comp:.4f}  {sub_str}"
+                )
 
-        # ── then buys — SORTED BY SCORE (highest first) ──────
-        buy_tickers = [
-            t
-            for t, a in actions.items()
-            if a in ("BUY", "STRONG_BUY")
-            and t not in self.positions
-            and t in prices
+        # ── 6. blocked buys (score above entry but blocked by filter) ──
+        blocked = [
+            (t, d) for t, d in rec["decisions"].items() if d[0] == "BLOCKED"
         ]
-        # ← NEW: sort by composite score descending
-        buy_tickers.sort(key=lambda t: scores.get(t, 0.0), reverse=True)
+        if blocked:
+            logger.info(
+                f"[{self.name}] {rec['date']}  DIAG-BLOCKED "
+                f"{len(blocked)} tickers passed score threshold but were blocked"
+            )
+            for ticker, (_, reasons) in blocked[: self.verbose_top_n]:
+                comp = rec["composites"].get(ticker, 0)
+                logger.info(
+                    f"[{self.name}] {rec['date']}  DIAG-BLOCKED "
+                    f"{ticker:20s}  comp={comp:.4f}  {reasons}"
+                )
 
-        slots = self.max_positions - len(self.positions)
-        if slots <= 0 or not buy_tickers:
+        self.daily_records.append(rec)
+        self._rec = None
+
+    # ── end-of-backtest summary ─────────────────────────────────────────
+
+    def print_summary(self):
+        """Call once after the backtest loop finishes."""
+        if not self.daily_records:
+            logger.info(f"[{self.name}] DIAG-SUMMARY  no data recorded")
             return
 
-        for ticker in buy_tickers[:slots]:
-            self._buy(date, ticker, prices[ticker])
+        n_days = len(self.daily_records)
+        all_scores = []
+        all_entries = []
+        all_exits = []
+        action_counts = defaultdict(int)
+        trigger_counts = defaultdict(int)
+        regime_day_counts = defaultdict(int)
+        breadth_day_counts = defaultdict(int)
+        days_with_rank = 0
 
-    # ──────────────────────────────────────────────────────────
-    #  Update held positions' scores (call each day)
-    # ──────────────────────────────────────────────────────────
-    def update_scores(self, scores: Dict[str, float]) -> None:
-        """Refresh latest_score on each held position for upgrade logic."""
-        for ticker, pos in self.positions.items():
-            if ticker in scores:
-                pos.latest_score = scores[ticker]
+        for rec in self.daily_records:
+            all_scores.extend(rec["composites"].values())
+            all_entries.append(rec["adjusted_entry"])
+            all_exits.append(rec["adjusted_exit"])
+            regime_day_counts[rec["vol_regime"]] += 1
+            breadth_day_counts[rec["breadth_regime"]] += 1
+            if rec["ranks"]:
+                days_with_rank += 1
+            for _, (action, reasons) in rec["decisions"].items():
+                action_counts[action] += 1
+                if action == "SELL":
+                    for r in reasons:
+                        trigger_counts[r] += 1
 
-    # ──────────────────────────────────────────────────────────
-    #  Buy / Sell / Mark-to-market
-    # ──────────────────────────────────────────────────────────
-    def _buy(self, date, ticker: str, raw_price: float) -> None:
-        exec_price = raw_price * (1 + self.slippage_rate)
-        target_value = min(
-            self.initial_capital / self.max_positions,
-            self.cash * 0.95,
+        scores_arr = np.array(all_scores) if all_scores else np.array([0])
+        entries_arr = np.array(all_entries)
+        exits_arr = np.array(all_exits)
+
+        logger.info(f"[{self.name}] {'=' * 60}")
+        logger.info(f"[{self.name}] DIAGNOSTIC SUMMARY  ({n_days} trading days)")
+        logger.info(f"[{self.name}] {'=' * 60}")
+
+        logger.info(
+            f"[{self.name}]   Score distribution (all ticker-days):  "
+            f"mean={scores_arr.mean():.4f}  std={scores_arr.std():.4f}  "
+            f"min={scores_arr.min():.4f}  max={scores_arr.max():.4f}"
         )
-        if target_value < 1_000:
-            return
-
-        shares = int(target_value / exec_price)
-        if shares <= 0:
-            return
-
-        cost = shares * exec_price
-        commission = cost * self.commission_rate
-        total = cost + commission
-        if total > self.cash:
-            return
-
-        self.cash -= total
-        self.positions[ticker] = Position(
-            ticker=ticker,
-            entry_date=date,
-            entry_price=exec_price,
-            shares=shares,
-            cost_basis=total,
-            peak_price=exec_price,
-        )
-        log.info(
-            "  ▲ BUY  %-10s  %d shares @ %.2f  cost $%s",
-            ticker, shares, exec_price, f"{total:,.0f}",
-        )
-
-    def _sell(self, date, ticker: str, raw_price: float) -> None:
-        pos = self.positions.get(ticker)
-        if pos is None:
-            return
-
-        exec_price = raw_price * (1 - self.slippage_rate)
-        proceeds = pos.shares * exec_price
-        commission = proceeds * self.commission_rate
-        net = proceeds - commission
-
-        pnl = net - pos.cost_basis
-        pnl_pct = pnl / pos.cost_basis
-        held = (date - pos.entry_date).days
-
-        self.cash += net
-        del self.positions[ticker]
-
-        self.closed_trades.append({
-            "ticker": ticker,
-            "entry_date": pos.entry_date,
-            "exit_date": date,
-            "entry_price": pos.entry_price,
-            "exit_price": exec_price,
-            "shares": pos.shares,
-            "cost_basis": pos.cost_basis,
-            "net_proceeds": net,
-            "pnl": pnl,
-            "pnl_pct": pnl_pct,
-            "holding_days": held,
-        })
-        log.info(
-            "  ▼ SELL %-10s  %d shares @ %.2f  PnL $%s (%+.1f%%)  held %dd",
-            ticker, pos.shares, exec_price, f"{pnl:,.0f}", pnl_pct * 100, held,
+        p = np.percentile(scores_arr, [5, 25, 50, 75, 90, 95, 99])
+        logger.info(
+            f"[{self.name}]   Score percentiles:  "
+            f"p5={p[0]:.4f}  p25={p[1]:.4f}  p50={p[2]:.4f}  "
+            f"p75={p[3]:.4f}  p90={p[4]:.4f}  p95={p[5]:.4f}  p99={p[6]:.4f}"
         )
 
-    def mark_to_market(self, date, close_prices: Dict[str, float]) -> float:
-        pos_val = 0.0
-        for t, p in self.positions.items():
-            price = close_prices.get(t, p.entry_price)
-            pos_val += price * p.shares
-            # ← NEW: update peak for trailing stop
-            if price > p.peak_price:
-                p.peak_price = price
-        return self.cash + pos_val
-    
-##############################
+        pct_above_entry = 100.0 * np.mean(scores_arr >= entries_arr.mean())
+        pct_below_exit = 100.0 * np.mean(scores_arr < exits_arr.mean())
+        logger.info(
+            f"[{self.name}]   Avg entry threshold: {entries_arr.mean():.4f}  "
+            f"Avg exit threshold: {exits_arr.mean():.4f}"
+        )
+        logger.info(
+            f"[{self.name}]   %% ticker-days above avg entry: {pct_above_entry:.1f}%%  "
+            f"below avg exit: {pct_below_exit:.1f}%%"
+        )
+
+        logger.info(f"[{self.name}]   Vol regime days:     {dict(regime_day_counts)}")
+        logger.info(f"[{self.name}]   Breadth regime days:  {dict(breadth_day_counts)}")
+        logger.info(f"[{self.name}]   Days with rank data:  {days_with_rank}/{n_days}")
+
+        logger.info(f"[{self.name}]   Decision totals:      {dict(action_counts)}")
+        if trigger_counts:
+            logger.info(f"[{self.name}]   Sell trigger totals:  {dict(trigger_counts)}")
+
+        # gap analysis: how far is p90 score from entry threshold?
+        daily_gaps = []
+        for rec in self.daily_records:
+            s = list(rec["composites"].values())
+            if s:
+                daily_gaps.append(np.percentile(s, 90) - rec["adjusted_entry"])
+        if daily_gaps:
+            gaps = np.array(daily_gaps)
+            logger.info(
+                f"[{self.name}]   Daily (p90_score - entry_thresh):  "
+                f"mean={gaps.mean():+.4f}  min={gaps.min():+.4f}  max={gaps.max():+.4f}"
+            )
+            if gaps.mean() < 0:
+                logger.warning(
+                    f"[{self.name}]   ⚠ p90 score is BELOW entry threshold on average. "
+                    f"Scoring pipeline may be systematically too low, or thresholds too high."
+                )
+
+        logger.info(f"[{self.name}] {'=' * 60}")
+
+##################################
 """
 backtest/phase2/engine.py
 Core backtesting engine with pre-computed indicators for speed.
+
+Fixes applied:
+  - EXIT DOUBLE-GATE REMOVED: sigexit_v2=1 on held tickers → SELL regardless
+    of action_v2 column. The signal layer's exit flag is authoritative.
+  - force_exits() runs unconditionally every day (not gated by prev_actions)
+  - process_signals() receives prev_scores
+  - try_upgrades() called exactly once per day
+  - Position sizing uses current NAV (not frozen initial_capital)
+  - Exit metadata captured on closed trades for post-hoc analysis
+  - Daily debug spam moved to DEBUG level, only on first occurrence
 """
 from __future__ import annotations
 
 import logging
 import time
 import pandas as pd
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from backtest.phase2.data_source import BacktestDataSource
 from backtest.phase2.tracker import PortfolioTracker
@@ -374,7 +805,15 @@ class BacktestEngine:
         self._precomputed_frames: Dict[str, pd.DataFrame] = {}
         self._precomputed_regime_df: pd.DataFrame | None = None
 
-    
+        # Diagnostic tracking
+        self._columns_logged: bool = False
+        self._exit_source_counts: Dict[str, int] = {
+            "signal_exit": 0,
+            "force_exit_trailing": 0,
+            "force_exit_max_hold": 0,
+            "force_exit_other": 0,
+        }
+
     def _extract_scores(self, output: Dict) -> Dict[str, float]:
         """Pull composite scores from the pipeline output table."""
         scores: Dict[str, float] = {}
@@ -386,7 +825,7 @@ class BacktestEngine:
                 continue
             score_col = next(
                 (c for c in (
-                    "composite_v2", "composite", "score",
+                    "composite_v2", "scorecomposite_v2", "composite", "score",
                     "total_score", "weighted_score",
                 ) if c in df.columns),
                 None,
@@ -403,6 +842,184 @@ class BacktestEngine:
                         scores[str(ticker)] = float(row[score_col])
             break
         return scores
+
+    # ==================================================================
+    #  EXIT METADATA EXTRACTION — for trade-level audit trail
+    # ==================================================================
+    def _extract_exit_metadata(self, output: Dict) -> Dict[str, Dict[str, Any]]:
+        """
+        Extract per-ticker exit diagnostic fields from the pipeline output.
+        Returns {ticker: {exit_reason, exit_momentum, ..., indicator values}}.
+        """
+        metadata: Dict[str, Dict[str, Any]] = {}
+        for key in ("action_table", "snapshot"):
+            df = output.get(key)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            if "exit_reason" not in df.columns:
+                break
+
+            ticker_in_col = "ticker" in df.columns
+            for idx, row in df.iterrows():
+                ticker = str(row["ticker"]) if ticker_in_col else str(idx)
+                metadata[ticker] = {
+                    "exit_reason": str(row.get("exit_reason", "") or ""),
+                    "exit_momentum": bool(row.get("exit_momentum", False)),
+                    "exit_trend": bool(row.get("exit_trend", False)),
+                    "exit_rs": bool(row.get("exit_rs", False)),
+                    "exit_no_trend": bool(row.get("exit_no_trend", False)),
+                    "exit_score_floor": bool(row.get("exit_score_floor", False)),
+                    "rsi_at_exit": float(row.get("rsi14", 0) or 0),
+                    "adx_at_exit": float(row.get("adx14", 0) or 0),
+                    "macdhist_at_exit": float(row.get("macdhist", 0) or 0),
+                    "closevsema30_at_exit": float(row.get("closevsema30pct", 0) or 0),
+                    "rszscore_at_exit": float(row.get("rszscore", 0) or 0),
+                    "composite_at_exit": float(row.get("scorecomposite_v2", 0) or 0),
+                }
+            break
+        return metadata
+
+    # ==================================================================
+    #  EXTRACT sigexit_v2 DIRECTLY for held tickers
+    # ==================================================================
+    def _extract_exit_flags(
+        self, output: Dict, held_tickers: Set[str]
+    ) -> Set[str]:
+        """
+        Scan pipeline output for held tickers with sigexit_v2 >= 1.
+        This is INDEPENDENT of the action_v2 column — the signal layer's
+        exit flag is authoritative for held positions.
+
+        Returns set of tickers that should be sold.
+        """
+        if not held_tickers:
+            return set()
+
+        exit_tickers: Set[str] = set()
+        for key in ("action_table", "snapshot"):
+            df = output.get(key)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            exit_col = next(
+                (c for c in ("sigexit_v2", "sig_exit_v2", "exit_signal")
+                 if c in df.columns),
+                None,
+            )
+            if exit_col is None:
+                break
+
+            ticker_in_col = "ticker" in df.columns
+            for idx, row in df.iterrows():
+                ticker = str(row["ticker"]) if ticker_in_col else str(idx)
+                if ticker not in held_tickers:
+                    continue
+                try:
+                    if float(row[exit_col]) >= 1.0:
+                        exit_tickers.add(ticker)
+                except (TypeError, ValueError):
+                    pass
+            break
+
+        if exit_tickers:
+            log.info(
+                "[%s] EXIT FLAGS (direct): %d of %d held tickers flagged: %s",
+                self.config_name,
+                len(exit_tickers),
+                len(held_tickers),
+                sorted(exit_tickers),
+            )
+
+        return exit_tickers
+
+    # ==================================================================
+    #  EXIT CHURN DIAGNOSTIC — log distribution when churn is extreme
+    # ==================================================================
+    def _log_exit_churn_diagnostic(self, output: Dict, day) -> None:
+        """
+        When >60% of the universe is flagged for exit, log the underlying
+        indicator distributions to diagnose threshold calibration.
+        """
+        for key in ("action_table", "snapshot"):
+            df = output.get(key)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            if "sigexit_v2" not in df.columns:
+                break
+
+            exit_pct = 100.0 * df["sigexit_v2"].mean()
+            if exit_pct <= 60:
+                break
+
+            if "closevsema30pct" in df.columns:
+                col = df["closevsema30pct"].dropna()
+                if not col.empty:
+                    exit_trend_count = (
+                        int(df["exit_trend"].sum())
+                        if "exit_trend" in df.columns else -1
+                    )
+                    log.warning(
+                        "[%s] %s EXIT DEEP DIVE — closevsema30pct: "
+                        "min=%.4f p10=%.4f p25=%.4f med=%.4f p75=%.4f max=%.4f | "
+                        "exit_trend=%d/%d tickers",
+                        self.config_name,
+                        day.strftime("%Y-%m-%d"),
+                        float(col.min()),
+                        float(col.quantile(0.10)),
+                        float(col.quantile(0.25)),
+                        float(col.median()),
+                        float(col.quantile(0.75)),
+                        float(col.max()),
+                        exit_trend_count,
+                        len(df),
+                    )
+
+            if "rsi14" in df.columns:
+                rsi = df["rsi14"].dropna()
+                if not rsi.empty:
+                    exit_mom_count = (
+                        int(df["exit_momentum"].sum())
+                        if "exit_momentum" in df.columns else -1
+                    )
+                    log.warning(
+                        "[%s] %s EXIT DEEP DIVE — rsi14: "
+                        "min=%.1f p10=%.1f p25=%.1f med=%.1f p75=%.1f max=%.1f | "
+                        "exit_momentum=%d/%d tickers",
+                        self.config_name,
+                        day.strftime("%Y-%m-%d"),
+                        float(rsi.min()),
+                        float(rsi.quantile(0.10)),
+                        float(rsi.quantile(0.25)),
+                        float(rsi.median()),
+                        float(rsi.quantile(0.75)),
+                        float(rsi.max()),
+                        exit_mom_count,
+                        len(df),
+                    )
+
+            if "rszscore" in df.columns:
+                rs = df["rszscore"].dropna()
+                if not rs.empty:
+                    exit_rs_count = (
+                        int(df["exit_rs"].sum())
+                        if "exit_rs" in df.columns else -1
+                    )
+                    log.warning(
+                        "[%s] %s EXIT DEEP DIVE — rszscore: "
+                        "min=%.3f p10=%.3f p25=%.3f med=%.3f p75=%.3f max=%.3f | "
+                        "exit_rs=%d/%d tickers",
+                        self.config_name,
+                        day.strftime("%Y-%m-%d"),
+                        float(rs.min()),
+                        float(rs.quantile(0.10)),
+                        float(rs.quantile(0.25)),
+                        float(rs.median()),
+                        float(rs.quantile(0.75)),
+                        float(rs.max()),
+                        exit_rs_count,
+                        len(df),
+                    )
+            break
 
     # ==================================================================
     #  PRE-COMPUTATION — run all expensive rolling ops ONCE
@@ -466,6 +1083,25 @@ class BacktestEngine:
         )
 
     # ==================================================================
+    #  CURRENT NAV CALCULATION — for dynamic position sizing
+    # ==================================================================
+    # def _compute_current_nav(self, tracker: PortfolioTracker) -> float:
+    #     """
+    #     Estimate NAV for position sizing.
+        
+    #     Uses entry_price as a conservative proxy since the original tracker
+    #     doesn't store current market price on Position objects.
+    #     The real MTM happens in mark_to_market() at end of day.
+    #     """
+    #     nav = tracker.cash
+    #     for ticker, pos in tracker.positions.items():
+    #         nav += pos.shares * pos.entry_price
+    #     return nav
+
+    def _compute_current_nav(self, tracker: PortfolioTracker) -> float:
+        return tracker.nav
+
+    # ==================================================================
     #  MAIN LOOP
     # ==================================================================
     def run(self) -> Dict[str, Any]:
@@ -500,79 +1136,211 @@ class BacktestEngine:
 
         log.info(
             "[%s] backtest %s → %s  (%d days, %d tickers)  "
-            "min_hold=%dd  min_profit=%.0f%%",
+            "min_hold=%dd  min_profit=%.0f%%  trailing_stop=%.0f%%  "
+            "max_hold=%dd",
             self.config_name, self.start_date, self.end_date,
             len(trading_days), len(tickers), min_hold, min_profit * 100,
+            sig_params.get("trailing_stop_pct", 0.18) * 100,
+            sig_params.get("max_hold_days", 120),
         )
 
         prev_actions: Dict[str, str] = {}
-        prev_scores: Dict[str, float] = {}          # ← FIX 3: correct type
+        prev_scores: Dict[str, float] = {}
+        prev_exit_metadata: Dict[str, Dict[str, Any]] = {}
+        prev_exit_tickers: Set[str] = set()
         bench_start_close: float | None = None
+
+        # Cash utilization tracking
+        cash_utilization_pcts: List[float] = []
 
         for i, day in enumerate(trading_days):
 
-            # 1 — run pipeline (fast path)
+            # ── 1. run pipeline (fast path) ───────────────────
             try:
                 output = self._run_pipeline_fast(day, tickers)
-                actions = self._extract_actions(output)
+
+                # Debug: log columns only once (not every day)
+                if not self._columns_logged:
+                    for key in ("action_table", "snapshot"):
+                        df = output.get(key)
+                        if isinstance(df, pd.DataFrame):
+                            log.info(
+                                "[%s] Pipeline output '%s' columns: %s",
+                                self.config_name, key, list(df.columns),
+                            )
+                            if "sigexit_v2" in df.columns:
+                                log.info(
+                                    "[%s] sigexit_v2 present — exit signal "
+                                    "path is active",
+                                    self.config_name,
+                                )
+                            else:
+                                log.warning(
+                                    "[%s] sigexit_v2 NOT in output — exits "
+                                    "will only fire via force_exits!",
+                                    self.config_name,
+                                )
+                            self._columns_logged = True
+                            break
+
+                # Log exit churn diagnostic when extreme
+                self._log_exit_churn_diagnostic(output, day)
+
+                held = set(tracker.positions.keys())
+                actions = self._extract_actions(output, held_tickers=held)
                 scores = self._extract_scores(output)
+
+                # ── CRITICAL FIX: Extract exit flags DIRECTLY ──────
+                # This is independent of the action_v2 column.
+                # sigexit_v2=1 on a HELD ticker → SELL, period.
+                exit_tickers = self._extract_exit_flags(output, held)
+
+                # Merge direct exit flags into actions
+                # (these override any HOLD from the action layer)
+                for ticker in exit_tickers:
+                    if ticker not in actions or actions[ticker] != "SELL":
+                        if ticker in actions and actions[ticker] in ("BUY", "STRONG_BUY"):
+                            # Edge case: pipeline says BUY but we hold it
+                            # and exit flag is set. Exit takes priority.
+                            log.warning(
+                                "[%s] %s CONFLICT: %s has BUY action but "
+                                "sigexit_v2=1 (held). Forcing SELL.",
+                                self.config_name,
+                                day.strftime("%Y-%m-%d"),
+                                ticker,
+                            )
+                        actions[ticker] = "SELL"
+
+                # Extract exit metadata for trade-level audit trail
+                exit_metadata = self._extract_exit_metadata(output)
+
             except Exception as exc:
                 log.warning(
                     "[%s] pipeline error %s: %s",
                     self.config_name, day.strftime("%Y-%m-%d"), exc,
                 )
                 actions, scores = {}, {}
+                exit_metadata = {}
+                exit_tickers = set()
 
-            # 2 — log signals
+            # ── 2. log signals ────────────────────────────────
             buy_sigs = [t for t, a in actions.items() if a in ("BUY", "STRONG_BUY")]
             sell_sigs = [t for t, a in actions.items() if a == "SELL"]
             if buy_sigs or sell_sigs:
                 log.info(
-                    "[%s] %s  BUY %s | SELL %d names",
+                    "[%s] %s  BUY %s | SELL %s",
                     self.config_name,
                     day.strftime("%Y-%m-%d"),
                     buy_sigs if buy_sigs else "—",
-                    len(sell_sigs),
+                    sell_sigs if sell_sigs else "—",
                 )
 
-            # 3 — execute PREVIOUS day's signals at TODAY's open
+            # ── 3. execute PREVIOUS day's signals at TODAY's open ─
             prices_open = self._prices_fast(day, tickers, field="open")
-            if i > 0 and prev_actions:
-                # force-exit stale / stopped-out positions
+
+            if i > 0:
+                # snapshot closed trade count before execution
+                n_closed_before = len(tracker.closed_trades)
+
+                # 3a — force-exit stale / stopped-out positions
+                #       runs UNCONDITIONALLY — not gated by prev_actions
                 tracker.force_exits(day, prices_open)
 
-                # normal signal-driven sells + buys (score-ranked)
-                tracker.process_signals(
-                    day, prev_actions, prices_open,
-                    scores={},
-                )
+                # Count force exits
+                n_force_closed = len(tracker.closed_trades) - n_closed_before
 
-                # upgrade weak held positions
-                tracker.try_upgrades(
-                    day,
-                    candidate_scores=prev_scores,
-                    prices=prices_open,
-                    max_upgrades=2,
-                )
+                # 3b — signal-driven sells + score-ranked buys
+                #       CRITICAL: prev_exit_tickers ensures sigexit_v2
+                #       tickers get SELL action even if action layer said HOLD
+                if prev_actions:
+                    # ─── DYNAMIC POSITION SIZING ──────────────────
+                    # Pass current NAV so tracker can size new positions
+                    # based on current equity, not frozen initial_capital.
+                    current_nav = self._compute_current_nav(tracker)
 
-                # Inside the loop, after try_upgrades:
-                n_upgrades = tracker.try_upgrades(
-                    day,
-                    candidate_scores=prev_scores,
-                    prices=prices_open,
-                    max_upgrades=2,
-                )
-                if n_upgrades:
-                    log.info("[%s] %s  upgrades=%d", self.config_name, day.strftime("%Y-%m-%d"), n_upgrades)
+                    tracker.process_signals(
+                        day, prev_actions, prices_open,
+                        scores=prev_scores,
+                        current_nav=current_nav,  # ← NEW: enables dynamic sizing
+                    )
 
-            # 4 — mark-to-market at close                      ← FIX 1: single call
+                # 3c — upgrade weak held positions (single call)
+                if prev_scores:
+                    swaps = tracker.try_upgrades(
+                        day,
+                        candidate_scores=prev_scores,
+                        prices=prices_open,
+                        max_upgrades=2,
+                    )
+                    if swaps:
+                        log.info(
+                            "[%s] %s  upgrades=%d: %s",
+                            self.config_name,
+                            day.strftime("%Y-%m-%d"),
+                            len(swaps),
+                            swaps,
+                        )
+
+                # Attach exit metadata to newly closed trades
+                n_closed_after = len(tracker.closed_trades)
+                if n_closed_after > n_closed_before:
+                    for j, trade in enumerate(
+                        tracker.closed_trades[n_closed_before:n_closed_after]
+                    ):
+                        ticker = trade.get("ticker", "")
+
+                        # Determine exit source
+                        if j < n_force_closed:
+                            # These were closed by force_exits
+                            source = trade.get("exit_type", "force_exit_other")
+                            trade.setdefault("exit_source", source)
+                            self._exit_source_counts[
+                                source if source in self._exit_source_counts
+                                else "force_exit_other"
+                            ] += 1
+                        else:
+                            # These were closed by process_signals (sigexit_v2)
+                            trade.setdefault("exit_source", "signal_exit")
+                            self._exit_source_counts["signal_exit"] += 1
+
+                        # Attach indicator metadata from the exit signal
+                        if ticker in prev_exit_metadata:
+                            trade.update(prev_exit_metadata[ticker])
+                        elif "exit_reason" not in trade:
+                            trade["exit_reason"] = trade.get(
+                                "exit_source", "unknown"
+                            )
+
+            # ── 4. mark-to-market at close ────────────────────
             prices_close = self._prices_fast(day, tickers, field="close")
             port_value = tracker.mark_to_market(day, prices_close)
 
             # refresh held-position scores for tomorrow's upgrades
             tracker.update_scores(scores)
 
-            # 5 — benchmark value
+            # ── 5. cash utilization tracking ──────────────────
+            if port_value > 0:
+                cash_pct = 100.0 * tracker.cash / port_value
+                cash_utilization_pcts.append(cash_pct)
+                # Warn if cash consistently too high
+                if i > 20 and i % 20 == 0:
+                    recent_cash = cash_utilization_pcts[-20:]
+                    avg_cash = sum(recent_cash) / len(recent_cash)
+                    if avg_cash > 40:
+                        log.warning(
+                            "[%s] %s CASH DRAG: avg cash=%.1f%% over last "
+                            "20 days. NAV=$%s but only %d/%d slots filled. "
+                            "Consider: (1) lower entry threshold, "
+                            "(2) lower min_rank_pct, (3) dynamic sizing.",
+                            self.config_name,
+                            day.strftime("%Y-%m-%d"),
+                            avg_cash,
+                            f"{port_value:,.0f}",
+                            len(tracker.positions),
+                            self.max_positions,
+                        )
+
+            # ── 6. benchmark value ────────────────────────────
             bench_value = self._benchmark_value(day, bench_start_close)
             if bench_value is not None and bench_start_close is None:
                 bench_df = self.data_source.benchmark_data
@@ -580,34 +1348,56 @@ class BacktestEngine:
                     bench_start_close = float(bench_df.loc[day, "close"])
                     bench_value = self.initial_capital
 
-            # 6 — record
+            # ── 7. record ─────────────────────────────────────
             self.equity_curve.append((day, port_value, bench_value))
             self.daily_log.append({
                 "date": day,
                 "portfolio_value": port_value,
                 "benchmark_value": bench_value,
                 "cash": tracker.cash,
+                "cash_pct": 100.0 * tracker.cash / max(port_value, 1),
                 "n_positions": len(tracker.positions),
                 "positions": list(tracker.positions.keys()),
                 "n_buys": sum(1 for a in actions.values()
                               if a in ("BUY", "STRONG_BUY")),
                 "n_sells": sum(1 for a in actions.values()
                                if a == "SELL"),
+                "n_exit_flags": len(exit_tickers),
             })
 
             prev_actions = actions
-            prev_scores = scores                    # ← FIX 2: was missing entirely
+            prev_scores = scores
+            prev_exit_metadata = exit_metadata
+            prev_exit_tickers = exit_tickers
             self.action_history[day] = actions
 
             if (i + 1) % 50 == 0 or i == len(trading_days) - 1:
                 log.info(
-                    "[%s] %d/%d  %s  portfolio=$%s  pos=%d  cash=$%s",
+                    "[%s] %d/%d  %s  portfolio=$%s  pos=%d/%d  "
+                    "cash=$%s (%.1f%%)",
                     self.config_name, i + 1, len(trading_days),
                     day.strftime("%Y-%m-%d"),
                     f"{port_value:,.0f}",
                     len(tracker.positions),
+                    self.max_positions,
                     f"{tracker.cash:,.0f}",
+                    100.0 * tracker.cash / max(port_value, 1),
                 )
+
+        # ── End-of-backtest summary ───────────────────────────────────
+        log.info(
+            "[%s] EXIT SOURCE SUMMARY: %s",
+            self.config_name, self._exit_source_counts,
+        )
+        if cash_utilization_pcts:
+            avg_cash_all = sum(cash_utilization_pcts) / len(cash_utilization_pcts)
+            log.info(
+                "[%s] CASH UTILIZATION: avg=%.1f%% min=%.1f%% max=%.1f%%",
+                self.config_name,
+                avg_cash_all,
+                min(cash_utilization_pcts),
+                max(cash_utilization_pcts),
+            )
 
         return {
             "config_name": self.config_name,
@@ -628,6 +1418,11 @@ class BacktestEngine:
             ),
             "initial_capital": self.initial_capital,
             "open_positions": dict(tracker.positions),
+            "exit_source_counts": dict(self._exit_source_counts),
+            "avg_cash_pct": (
+                sum(cash_utilization_pcts) / len(cash_utilization_pcts)
+                if cash_utilization_pcts else 0
+            ),
         }
 
     # ==================================================================
@@ -708,32 +1503,30 @@ class BacktestEngine:
             return None
         if bench_start_close is None:
             return self.initial_capital
-        return self.initial_capital * (float(bench_df.loc[day, "close"]) / bench_start_close)
+        return self.initial_capital * (
+            float(bench_df.loc[day, "close"]) / bench_start_close
+        )
 
     # ==================================================================
     #  Extract actions from pipeline output
     # ==================================================================
-    def _extract_actions(self, output: Dict) -> Dict[str, str]:
+    def _extract_actions(
+        self, output: Dict, held_tickers: Set[str] = None
+    ) -> Dict[str, str]:
         """
         Extract ticker → action mapping from pipeline output.
 
-        Implements 3-state exit gating via sigexit_v2:
+        BUY/STRONG_BUY  → BUY  (cross-sectional entry — unheld tickers only)
+        SELL/EXIT       → SELL (held tickers only)
 
-          BUY/STRONG_BUY                → BUY   (entry criteria met)
-          SELL + sigexit_v2 == 1        → SELL   (genuine exit signal)
-          SELL + sigexit_v2 != 1        → omitted from dict (HOLD)
-          HOLD / other                  → omitted from dict (HOLD)
-
-        Tickers absent from the returned dict are treated as HOLD by
-        the portfolio tracker — existing positions are kept, no new
-        entries are made.
-
-        Without this gating, the pipeline labels ~77% of the universe
-        as SELL every day (anything not meeting top-15% BUY criteria).
-        Positions entered at rank 0.85+ drop to rank 0.70 the next day,
-        get queued for exit, and are dumped at min-hold expiry with
-        -3% to -8% losses — even though sigexit_v2 == 0.
+        NOTE: This method extracts actions from the action_v2 column.
+        The DIRECT exit flag check (_extract_exit_flags) runs separately
+        and merges its results into the final action dict. This means
+        sigexit_v2=1 triggers a SELL even if action_v2 says "HOLD".
         """
+        if held_tickers is None:
+            held_tickers = set()
+
         actions: Dict[str, str] = {}
         for key in ("action_table", "snapshot", "actions"):
             if key not in output:
@@ -749,69 +1542,309 @@ class BacktestEngine:
             if act_col is None:
                 continue
 
-            # ── detect exit-signal column for 3-state gating ──
-            exit_col = next(
-                (c for c in ("sigexit_v2", "sig_exit_v2", "exit_signal")
-                 if c in df.columns),
-                None,
-            )
-            use_3state = exit_col is not None
-
-            if not use_3state:
-                log.warning(
-                    "[%s] sigexit_v2 not found in pipeline output '%s' "
-                    "— SELL gating disabled, expect high exit churn",
-                    self.config_name, key,
-                )
-
             ticker_in_col = "ticker" in df.columns
-            n_gated = 0
 
             for idx, row in df.iterrows():
-                ticker = (
-                    str(row["ticker"]) if ticker_in_col else str(idx)
-                )
+                ticker = str(row["ticker"]) if ticker_in_col else str(idx)
                 raw_action = str(row[act_col]).upper()
 
                 if raw_action in ("BUY", "STRONG_BUY"):
-                    actions[ticker] = raw_action
+                    # Only emit BUY for tickers NOT already held
+                    if ticker not in held_tickers:
+                        actions[ticker] = raw_action
 
                 elif raw_action in ("SELL", "EXIT", "STRONG_SELL"):
-                    if use_3state:
-                        try:
-                            is_genuine_exit = (
-                                float(row[exit_col]) >= 1.0
-                            )
-                        except (TypeError, ValueError):
-                            # NaN or unparseable → safe default: allow
-                            is_genuine_exit = True
-
-                        if is_genuine_exit:
-                            actions[ticker] = "SELL"
-                        else:
-                            n_gated += 1
-                            # omit → tracker treats as HOLD
-                    else:
-                        # no exit column → preserve old behavior
+                    # Only emit SELL for tickers we actually hold
+                    if ticker in held_tickers:
                         actions[ticker] = "SELL"
-
-                # else: HOLD / unknown → omit from actions dict
-
-            if use_3state:
-                n_sells = sum(
-                    1 for a in actions.values() if a == "SELL"
-                )
-                log.debug(
-                    "[%s] exit gating: %d genuine SELLs, "
-                    "%d SELL→HOLD (gated)",
-                    self.config_name, n_sells, n_gated,
-                )
+                    # NOTE: No longer double-gating with sigexit_v2 here.
+                    # The action layer says SELL → we trust it.
+                    # sigexit_v2 is checked independently in _extract_exit_flags.
 
             break
 
         return actions
 
-#################################################
+#######################################
+"""
+backtest/phase2/metrics.py
+Performance metrics from backtest results, including benchmark comparison.
+
+FIX (2026-04-28): annualization now uses calendar dates, not trading-day
+count.  The old formula ``252 / n_days`` broke when data had gaps —
+e.g. 310 trading days over a 28-month span was treated as 1.23 years
+instead of 2.32 years, inflating CAGR from ~11% to ~21%.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from typing import Any, Dict
+
+
+def compute_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
+    equity = results["equity_curve"].copy()
+    trades = results.get("trade_log", pd.DataFrame())
+    initial = results["initial_capital"]
+    final = results["final_value"]
+
+    # ── returns ───────────────────────────────────────────────────
+    total_ret = (final - initial) / initial
+    equity["daily_ret"] = equity["value"].pct_change()
+    daily = equity["daily_ret"].dropna()
+
+    n_days = len(equity)
+
+    # ── calendar-based annualization (robust to data gaps) ────────
+    actual_start = actual_end = None
+    if "date" in equity.columns and n_days >= 2:
+        actual_start = pd.Timestamp(equity["date"].iloc[0])
+        actual_end = pd.Timestamp(equity["date"].iloc[-1])
+        calendar_days = (actual_end - actual_start).days
+        years = calendar_days / 365.25
+    else:
+        years = n_days / 252.0
+
+    years = max(years, 1.0 / 365.25)       # floor at 1 calendar day
+    ann_factor = 1.0 / years                # exponent for CAGR
+
+    ann_ret = (1 + total_ret) ** ann_factor - 1
+
+    # expected trading days (for data-coverage check)
+    expected_trading_days = int(round(years * 252))
+
+    # ── volatility ────────────────────────────────────────────────
+    ann_vol = daily.std() * np.sqrt(252) if len(daily) > 1 else 0.0
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+
+    down = daily[daily < 0]
+    down_vol = down.std() * np.sqrt(252) if len(down) > 1 else 0.001
+    sortino = ann_ret / down_vol
+
+    # ── drawdown ──────────────────────────────────────────────────
+    equity["peak"] = equity["value"].cummax()
+    equity["dd"] = (equity["value"] - equity["peak"]) / equity["peak"]
+    max_dd = equity["dd"].min()
+
+    in_dd = equity["dd"] < 0
+    if in_dd.any():
+        groups = (~in_dd).cumsum()
+        max_dd_dur = int(in_dd.groupby(groups).sum().max())
+    else:
+        max_dd_dur = 0
+
+    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0.0
+
+    # ── portfolio utilisation ─────────────────────────────────────
+    dl = results.get("daily_log", pd.DataFrame())
+    avg_pos = dl["n_positions"].mean() if not dl.empty else 0
+    max_pos = int(dl["n_positions"].max()) if not dl.empty else 0
+    total_buys = int(dl["n_buys"].sum()) if not dl.empty else 0
+    total_sells = int(dl["n_sells"].sum()) if not dl.empty else 0
+
+    # ── trade stats ───────────────────────────────────────────────
+    tm = _trade_metrics(trades)
+
+    # ── benchmark comparison (uses same ann_factor) ───────────────
+    bm = _benchmark_metrics(equity, ann_ret, ann_factor, years)
+
+    return {
+        # ── core ──
+        "total_return": total_ret,
+        "annualized_return": ann_ret,
+        "final_value": final,
+        "initial_capital": initial,
+        # ── period ──
+        "years": years,
+        "actual_start": str(actual_start.date()) if actual_start is not None else "",
+        "actual_end": str(actual_end.date()) if actual_end is not None else "",
+        "trading_days": n_days,
+        "expected_trading_days": expected_trading_days,
+        # ── risk ──
+        "annualized_vol": ann_vol,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown": max_dd,
+        "max_dd_duration_days": max_dd_dur,
+        "calmar_ratio": calmar,
+        # ── utilisation ──
+        "avg_positions": avg_pos,
+        "max_positions_held": max_pos,
+        "total_buy_signals": total_buys,
+        "total_sell_signals": total_sells,
+        # ── trades + benchmark (spread in) ──
+        **tm,
+        **bm,
+    }
+
+
+# ------------------------------------------------------------------
+def _benchmark_metrics(
+    equity: pd.DataFrame,
+    strategy_ann_ret: float,
+    ann_factor: float,
+    years: float,
+) -> Dict[str, Any]:
+    """
+    Benchmark return, risk, and relative metrics.
+
+    Uses the same *ann_factor* (1 / calendar_years) as the portfolio
+    so that CAGR values are directly comparable.
+    """
+    defaults = {
+        "benchmark_total_return": 0.0,
+        "benchmark_ann_return": 0.0,
+        "benchmark_ann_vol": 0.0,
+        "benchmark_sharpe": 0.0,
+        "benchmark_sortino": 0.0,
+        "benchmark_max_dd": 0.0,
+        "benchmark_calmar": 0.0,
+        "alpha": 0.0,
+        "beta": 0.0,
+        "tracking_error": 0.0,
+        "information_ratio": 0.0,
+    }
+
+    if "benchmark" not in equity.columns:
+        return defaults
+
+    bench = equity["benchmark"]
+    if bench.isna().all():
+        return defaults
+
+    # Forward-fill any gaps, then drop remaining NaNs
+    bench = bench.ffill()
+    valid = equity[["value", "benchmark"]].dropna()
+    if len(valid) < 10:
+        return defaults
+
+    bench_initial = valid["benchmark"].iloc[0]
+    bench_final = valid["benchmark"].iloc[-1]
+    bench_total_ret = (
+        (bench_final - bench_initial) / bench_initial
+        if bench_initial > 0
+        else 0.0
+    )
+    bench_ann_ret = (1 + bench_total_ret) ** ann_factor - 1
+
+    # Daily returns for both
+    combined = pd.DataFrame({
+        "port_ret": valid["value"].pct_change(),
+        "bench_ret": valid["benchmark"].pct_change(),
+    }).dropna()
+
+    if len(combined) < 5:
+        return {
+            **defaults,
+            "benchmark_total_return": bench_total_ret,
+            "benchmark_ann_return": bench_ann_ret,
+        }
+
+    # ── benchmark vol ─────────────────────────────────────────────
+    bench_ann_vol = combined["bench_ret"].std() * np.sqrt(252)
+    bench_sharpe = bench_ann_ret / bench_ann_vol if bench_ann_vol > 0 else 0.0
+
+    # ── benchmark sortino ─────────────────────────────────────────
+    bench_down = combined["bench_ret"][combined["bench_ret"] < 0]
+    bench_down_vol = (
+        bench_down.std() * np.sqrt(252) if len(bench_down) > 1 else 0.001
+    )
+    bench_sortino = bench_ann_ret / bench_down_vol
+
+    # ── benchmark drawdown ────────────────────────────────────────
+    bench_peak = valid["benchmark"].cummax()
+    bench_dd = (valid["benchmark"] - bench_peak) / bench_peak
+    bench_max_dd = bench_dd.min()
+
+    # ── benchmark calmar ──────────────────────────────────────────
+    bench_calmar = (
+        bench_ann_ret / abs(bench_max_dd) if bench_max_dd != 0 else 0.0
+    )
+
+    # ── excess returns / tracking error ───────────────────────────
+    excess = combined["port_ret"] - combined["bench_ret"]
+    tracking_error = (
+        excess.std() * np.sqrt(252) if len(excess) > 1 else 0.0
+    )
+
+    # ── beta ──────────────────────────────────────────────────────
+    bench_var = combined["bench_ret"].var()
+    if bench_var > 0:
+        beta = (
+            combined[["port_ret", "bench_ret"]].cov().iloc[0, 1] / bench_var
+        )
+    else:
+        beta = 0.0
+
+    # ── Jensen's alpha ────────────────────────────────────────────
+    alpha = strategy_ann_ret - beta * bench_ann_ret
+
+    # ── information ratio ─────────────────────────────────────────
+    info_ratio = (
+        (strategy_ann_ret - bench_ann_ret) / tracking_error
+        if tracking_error > 0
+        else 0.0
+    )
+
+    return {
+        "benchmark_total_return": bench_total_ret,
+        "benchmark_ann_return": bench_ann_ret,
+        "benchmark_ann_vol": bench_ann_vol,
+        "benchmark_sharpe": bench_sharpe,
+        "benchmark_sortino": bench_sortino,
+        "benchmark_max_dd": bench_max_dd,
+        "benchmark_calmar": bench_calmar,
+        "alpha": alpha,
+        "beta": beta,
+        "tracking_error": tracking_error,
+        "information_ratio": info_ratio,
+    }
+
+
+# ------------------------------------------------------------------
+def _trade_metrics(trades: pd.DataFrame) -> Dict[str, Any]:
+    empty = {
+        "total_trades": 0,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "win_rate": 0.0,
+        "avg_win_pct": 0.0,
+        "avg_loss_pct": 0.0,
+        "profit_factor": 0.0,
+        "avg_pnl_pct": 0.0,
+        "median_pnl_pct": 0.0,
+        "avg_holding_days": 0.0,
+        "best_trade_pct": 0.0,
+        "worst_trade_pct": 0.0,
+        "expectancy_dollar": 0.0,
+    }
+    if trades.empty:
+        return empty
+
+    w = trades[trades["pnl"] > 0]
+    l = trades[trades["pnl"] <= 0]
+    n = len(trades)
+
+    gross_win = w["pnl"].sum() if not w.empty else 0.0
+    gross_loss = abs(l["pnl"].sum()) if not l.empty else 0.001
+
+    return {
+        "total_trades": n,
+        "winning_trades": len(w),
+        "losing_trades": len(l),
+        "win_rate": len(w) / n,
+        "avg_win_pct": w["pnl_pct"].mean() if not w.empty else 0.0,
+        "avg_loss_pct": l["pnl_pct"].mean() if not l.empty else 0.0,
+        "profit_factor": gross_win / gross_loss,
+        "avg_pnl_pct": trades["pnl_pct"].mean(),
+        "median_pnl_pct": trades["pnl_pct"].median(),
+        "avg_holding_days": trades["holding_days"].mean(),
+        "best_trade_pct": trades["pnl_pct"].max(),
+        "worst_trade_pct": trades["pnl_pct"].min(),
+        "expectancy_dollar": trades["pnl"].mean(),
+    }
+
+################################################
 """
 backtest/phase2/run_backtest.py
 CLI entry point — single-config backtest.
@@ -1310,1366 +2343,442 @@ def main():
 if __name__ == "__main__":
     main()
 
-#######################################
+###################################################
 """
-backtest/phase2/metrics.py
-Performance metrics from backtest results, including benchmark comparison.
+backtest/phase2/tracker.py
+Virtual portfolio tracker with minimum hold period,
+trailing stop, max hold duration, and score-ranked buys.
 
-FIX (2026-04-28): annualization now uses calendar dates, not trading-day
-count.  The old formula ``252 / n_days`` broke when data had gaps —
-e.g. 310 trading days over a 28-month span was treated as 1.23 years
-instead of 2.32 years, inflating CAGR from ~11% to ~21%.
-"""
-from __future__ import annotations
-
-import numpy as np
-import pandas as pd
-from typing import Any, Dict
-
-
-def compute_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
-    equity = results["equity_curve"].copy()
-    trades = results.get("trade_log", pd.DataFrame())
-    initial = results["initial_capital"]
-    final = results["final_value"]
-
-    # ── returns ───────────────────────────────────────────────────
-    total_ret = (final - initial) / initial
-    equity["daily_ret"] = equity["value"].pct_change()
-    daily = equity["daily_ret"].dropna()
-
-    n_days = len(equity)
-
-    # ── calendar-based annualization (robust to data gaps) ────────
-    actual_start = actual_end = None
-    if "date" in equity.columns and n_days >= 2:
-        actual_start = pd.Timestamp(equity["date"].iloc[0])
-        actual_end = pd.Timestamp(equity["date"].iloc[-1])
-        calendar_days = (actual_end - actual_start).days
-        years = calendar_days / 365.25
-    else:
-        years = n_days / 252.0
-
-    years = max(years, 1.0 / 365.25)       # floor at 1 calendar day
-    ann_factor = 1.0 / years                # exponent for CAGR
-
-    ann_ret = (1 + total_ret) ** ann_factor - 1
-
-    # expected trading days (for data-coverage check)
-    expected_trading_days = int(round(years * 252))
-
-    # ── volatility ────────────────────────────────────────────────
-    ann_vol = daily.std() * np.sqrt(252) if len(daily) > 1 else 0.0
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
-
-    down = daily[daily < 0]
-    down_vol = down.std() * np.sqrt(252) if len(down) > 1 else 0.001
-    sortino = ann_ret / down_vol
-
-    # ── drawdown ──────────────────────────────────────────────────
-    equity["peak"] = equity["value"].cummax()
-    equity["dd"] = (equity["value"] - equity["peak"]) / equity["peak"]
-    max_dd = equity["dd"].min()
-
-    in_dd = equity["dd"] < 0
-    if in_dd.any():
-        groups = (~in_dd).cumsum()
-        max_dd_dur = int(in_dd.groupby(groups).sum().max())
-    else:
-        max_dd_dur = 0
-
-    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0.0
-
-    # ── portfolio utilisation ─────────────────────────────────────
-    dl = results.get("daily_log", pd.DataFrame())
-    avg_pos = dl["n_positions"].mean() if not dl.empty else 0
-    max_pos = int(dl["n_positions"].max()) if not dl.empty else 0
-    total_buys = int(dl["n_buys"].sum()) if not dl.empty else 0
-    total_sells = int(dl["n_sells"].sum()) if not dl.empty else 0
-
-    # ── trade stats ───────────────────────────────────────────────
-    tm = _trade_metrics(trades)
-
-    # ── benchmark comparison (uses same ann_factor) ───────────────
-    bm = _benchmark_metrics(equity, ann_ret, ann_factor, years)
-
-    return {
-        # ── core ──
-        "total_return": total_ret,
-        "annualized_return": ann_ret,
-        "final_value": final,
-        "initial_capital": initial,
-        # ── period ──
-        "years": years,
-        "actual_start": str(actual_start.date()) if actual_start is not None else "",
-        "actual_end": str(actual_end.date()) if actual_end is not None else "",
-        "trading_days": n_days,
-        "expected_trading_days": expected_trading_days,
-        # ── risk ──
-        "annualized_vol": ann_vol,
-        "sharpe_ratio": sharpe,
-        "sortino_ratio": sortino,
-        "max_drawdown": max_dd,
-        "max_dd_duration_days": max_dd_dur,
-        "calmar_ratio": calmar,
-        # ── utilisation ──
-        "avg_positions": avg_pos,
-        "max_positions_held": max_pos,
-        "total_buy_signals": total_buys,
-        "total_sell_signals": total_sells,
-        # ── trades + benchmark (spread in) ──
-        **tm,
-        **bm,
-    }
-
-
-# ------------------------------------------------------------------
-def _benchmark_metrics(
-    equity: pd.DataFrame,
-    strategy_ann_ret: float,
-    ann_factor: float,
-    years: float,
-) -> Dict[str, Any]:
-    """
-    Benchmark return, risk, and relative metrics.
-
-    Uses the same *ann_factor* (1 / calendar_years) as the portfolio
-    so that CAGR values are directly comparable.
-    """
-    defaults = {
-        "benchmark_total_return": 0.0,
-        "benchmark_ann_return": 0.0,
-        "benchmark_ann_vol": 0.0,
-        "benchmark_sharpe": 0.0,
-        "benchmark_sortino": 0.0,
-        "benchmark_max_dd": 0.0,
-        "benchmark_calmar": 0.0,
-        "alpha": 0.0,
-        "beta": 0.0,
-        "tracking_error": 0.0,
-        "information_ratio": 0.0,
-    }
-
-    if "benchmark" not in equity.columns:
-        return defaults
-
-    bench = equity["benchmark"]
-    if bench.isna().all():
-        return defaults
-
-    # Forward-fill any gaps, then drop remaining NaNs
-    bench = bench.ffill()
-    valid = equity[["value", "benchmark"]].dropna()
-    if len(valid) < 10:
-        return defaults
-
-    bench_initial = valid["benchmark"].iloc[0]
-    bench_final = valid["benchmark"].iloc[-1]
-    bench_total_ret = (
-        (bench_final - bench_initial) / bench_initial
-        if bench_initial > 0
-        else 0.0
-    )
-    bench_ann_ret = (1 + bench_total_ret) ** ann_factor - 1
-
-    # Daily returns for both
-    combined = pd.DataFrame({
-        "port_ret": valid["value"].pct_change(),
-        "bench_ret": valid["benchmark"].pct_change(),
-    }).dropna()
-
-    if len(combined) < 5:
-        return {
-            **defaults,
-            "benchmark_total_return": bench_total_ret,
-            "benchmark_ann_return": bench_ann_ret,
-        }
-
-    # ── benchmark vol ─────────────────────────────────────────────
-    bench_ann_vol = combined["bench_ret"].std() * np.sqrt(252)
-    bench_sharpe = bench_ann_ret / bench_ann_vol if bench_ann_vol > 0 else 0.0
-
-    # ── benchmark sortino ─────────────────────────────────────────
-    bench_down = combined["bench_ret"][combined["bench_ret"] < 0]
-    bench_down_vol = (
-        bench_down.std() * np.sqrt(252) if len(bench_down) > 1 else 0.001
-    )
-    bench_sortino = bench_ann_ret / bench_down_vol
-
-    # ── benchmark drawdown ────────────────────────────────────────
-    bench_peak = valid["benchmark"].cummax()
-    bench_dd = (valid["benchmark"] - bench_peak) / bench_peak
-    bench_max_dd = bench_dd.min()
-
-    # ── benchmark calmar ──────────────────────────────────────────
-    bench_calmar = (
-        bench_ann_ret / abs(bench_max_dd) if bench_max_dd != 0 else 0.0
-    )
-
-    # ── excess returns / tracking error ───────────────────────────
-    excess = combined["port_ret"] - combined["bench_ret"]
-    tracking_error = (
-        excess.std() * np.sqrt(252) if len(excess) > 1 else 0.0
-    )
-
-    # ── beta ──────────────────────────────────────────────────────
-    bench_var = combined["bench_ret"].var()
-    if bench_var > 0:
-        beta = (
-            combined[["port_ret", "bench_ret"]].cov().iloc[0, 1] / bench_var
-        )
-    else:
-        beta = 0.0
-
-    # ── Jensen's alpha ────────────────────────────────────────────
-    alpha = strategy_ann_ret - beta * bench_ann_ret
-
-    # ── information ratio ─────────────────────────────────────────
-    info_ratio = (
-        (strategy_ann_ret - bench_ann_ret) / tracking_error
-        if tracking_error > 0
-        else 0.0
-    )
-
-    return {
-        "benchmark_total_return": bench_total_ret,
-        "benchmark_ann_return": bench_ann_ret,
-        "benchmark_ann_vol": bench_ann_vol,
-        "benchmark_sharpe": bench_sharpe,
-        "benchmark_sortino": bench_sortino,
-        "benchmark_max_dd": bench_max_dd,
-        "benchmark_calmar": bench_calmar,
-        "alpha": alpha,
-        "beta": beta,
-        "tracking_error": tracking_error,
-        "information_ratio": info_ratio,
-    }
-
-
-# ------------------------------------------------------------------
-def _trade_metrics(trades: pd.DataFrame) -> Dict[str, Any]:
-    empty = {
-        "total_trades": 0,
-        "winning_trades": 0,
-        "losing_trades": 0,
-        "win_rate": 0.0,
-        "avg_win_pct": 0.0,
-        "avg_loss_pct": 0.0,
-        "profit_factor": 0.0,
-        "avg_pnl_pct": 0.0,
-        "median_pnl_pct": 0.0,
-        "avg_holding_days": 0.0,
-        "best_trade_pct": 0.0,
-        "worst_trade_pct": 0.0,
-        "expectancy_dollar": 0.0,
-    }
-    if trades.empty:
-        return empty
-
-    w = trades[trades["pnl"] > 0]
-    l = trades[trades["pnl"] <= 0]
-    n = len(trades)
-
-    gross_win = w["pnl"].sum() if not w.empty else 0.0
-    gross_loss = abs(l["pnl"].sum()) if not l.empty else 0.001
-
-    return {
-        "total_trades": n,
-        "winning_trades": len(w),
-        "losing_trades": len(l),
-        "win_rate": len(w) / n,
-        "avg_win_pct": w["pnl_pct"].mean() if not w.empty else 0.0,
-        "avg_loss_pct": l["pnl_pct"].mean() if not l.empty else 0.0,
-        "profit_factor": gross_win / gross_loss,
-        "avg_pnl_pct": trades["pnl_pct"].mean(),
-        "median_pnl_pct": trades["pnl_pct"].median(),
-        "avg_holding_days": trades["holding_days"].mean(),
-        "best_trade_pct": trades["pnl_pct"].max(),
-        "worst_trade_pct": trades["pnl_pct"].min(),
-        "expectancy_dollar": trades["pnl"].mean(),
-    }
-
-####################################
-
-"""backtest/phase2/diagnostics.py
-
-Drop-in signal diagnostics. Wire into your engine's day loop
-and signal generator to capture *why* BUY/SELL/HOLD decisions
-are made.
-
-Usage:
-    from backtest.phase2.diagnostics import SignalDiagnostics
-    diag = SignalDiagnostics("Loose", enabled=True)
-    # ... wire calls at each decision point (see integration notes below)
-    diag.print_summary()
+Features:
+  - Dynamic position sizing: _buy() uses current_nav (passed per-call)
+    instead of frozen initial_capital. Slot size grows with equity.
+  - force_exits() tags exit_type on closed trade records for attribution.
+  - _can_sell() uses calendar-day semantics for min hold period.
+  - market_value property on Position for clean NAV calculation.
+  - nav property on PortfolioTracker for engine integration.
+  - Trailing stop fires at open price (gap-down protection).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 import logging
-from collections import defaultdict
-from typing import Any
-
-import numpy as np
-
-logger = logging.getLogger(__name__)
-
-
-# ── reason tags (use these as constants so summaries group cleanly) ─────
-R_SCORE_BELOW_EXIT    = "score<exit"
-R_SCORE_ABOVE_ENTRY   = "score>=entry"
-R_RANK_BELOW_FLOOR    = "rank<exit_floor"
-R_RANK_ABOVE_MIN      = "rank>=min_rank"
-R_RANK_BELOW_MIN      = "rank<min_rank"
-R_RS_BLOCKED          = "rs_regime_blocked"
-R_RS_FAIL_PENALTY     = "rs_fail_penalty_applied"
-R_SECTOR_BLOCKED      = "sector_regime_blocked"
-R_BREADTH_HARD_BLOCK  = "breadth_hard_block"
-R_VOL_HARD_BLOCK      = "vol_hard_block"
-R_COOLDOWN            = "cooldown_active"
-R_MAX_POSITIONS       = "max_positions_reached"
-R_CONTINUATION        = "continuation_pass"
-R_CONTINUATION_FAIL   = "continuation_fail"
-R_PULLBACK            = "pullback_pass"
-R_PULLBACK_FAIL       = "pullback_fail"
-R_CHAOTIC_EXIT_BUMP   = "chaotic_exit_bump"
-R_NOT_HELD            = "not_held"
-R_HELD_OK             = "held_score_ok"
-
-
-class SignalDiagnostics:
-    """Captures per-day, per-ticker decision data and emits summaries."""
-
-    def __init__(self, name: str = "", enabled: bool = True,
-                 verbose_top_n: int = 5, verbose_sells: int = 3):
-        self.name = name
-        self.enabled = enabled
-        self.verbose_top_n = verbose_top_n
-        self.verbose_sells = verbose_sells
-
-        # accumulation across entire backtest
-        self.daily_records: list[dict] = []
-        self._rec: dict | None = None
-
-    # ── per-day lifecycle ───────────────────────────────────────────────
-
-    def begin_day(
-        self,
-        date,
-        vol_regime: str,
-        breadth_regime: str,
-        base_entry: float,
-        base_exit: float,
-        regime_entry_adj: float,
-        breadth_entry_adj: float,
-        adjusted_entry: float,
-        adjusted_exit: float,
-        size_multiplier: float = 1.0,
-        n_held: int = 0,
-        max_positions: int = 0,
-    ):
-        """Call once at the start of each trading day, after computing
-        regime adjustments but before iterating over tickers."""
-        if not self.enabled:
-            return
-        self._rec = {
-            "date": date,
-            "vol_regime": vol_regime,
-            "breadth_regime": breadth_regime,
-            "base_entry": base_entry,
-            "base_exit": base_exit,
-            "regime_entry_adj": regime_entry_adj,
-            "breadth_entry_adj": breadth_entry_adj,
-            "adjusted_entry": adjusted_entry,
-            "adjusted_exit": adjusted_exit,
-            "size_multiplier": size_multiplier,
-            "n_held": n_held,
-            "max_positions": max_positions,
-            # populated by log_score / log_decision
-            "composites": {},          # ticker -> float
-            "sub_scores": {},          # ticker -> dict
-            "ranks": {},               # ticker -> float
-            "rs_regimes": {},          # ticker -> str
-            "sector_regimes": {},      # ticker -> str
-            "decisions": {},           # ticker -> (action, [reasons])
-            "sell_triggers": defaultdict(list),
-        }
-
-    def log_score(
-        self,
-        ticker: str,
-        composite: float,
-        rank_pct: float | None = None,
-        sub_scores: dict | None = None,
-        rs_regime: str | None = None,
-        sector_regime: str | None = None,
-    ):
-        """Call for every ticker after the scoring pipeline runs."""
-        if not self.enabled or self._rec is None:
-            return
-        self._rec["composites"][ticker] = composite
-        if rank_pct is not None:
-            self._rec["ranks"][ticker] = rank_pct
-        if sub_scores:
-            self._rec["sub_scores"][ticker] = sub_scores
-        if rs_regime:
-            self._rec["rs_regimes"][ticker] = rs_regime
-        if sector_regime:
-            self._rec["sector_regimes"][ticker] = sector_regime
-
-    def log_decision(self, ticker: str, action: str, reasons: list[str]):
-        """Call when a final BUY / SELL / HOLD / BLOCKED decision is made.
-
-        action: one of 'BUY', 'SELL', 'HOLD', 'BLOCKED'
-        reasons: list of R_* tags (or free-form strings)
-        """
-        if not self.enabled or self._rec is None:
-            return
-        self._rec["decisions"][ticker] = (action, reasons)
-        if action == "SELL":
-            for r in reasons:
-                self._rec["sell_triggers"][r].append(ticker)
-
-    def end_day(self):
-        """Call at end of day. Logs summary lines and archives the record."""
-        if not self.enabled or self._rec is None:
-            return
-        rec = self._rec
-        scores = np.array(list(rec["composites"].values())) if rec["composites"] else np.array([])
-        ranks = np.array(list(rec["ranks"].values())) if rec["ranks"] else np.array([])
-
-        # ── 1. score distribution vs thresholds ────────────────────────
-        if len(scores) > 0:
-            p = np.percentile(scores, [5, 10, 25, 50, 75, 90, 95])
-            above_entry = int(np.sum(scores >= rec["adjusted_entry"]))
-            in_band = int(np.sum(
-                (scores >= rec["adjusted_exit"]) & (scores < rec["adjusted_entry"])
-            ))
-            below_exit = int(np.sum(scores < rec["adjusted_exit"]))
-
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-SCORES  "
-                f"n={len(scores)}  "
-                f"p5={p[0]:.3f} p10={p[1]:.3f} p25={p[2]:.3f} "
-                f"p50={p[3]:.3f} p75={p[4]:.3f} p90={p[5]:.3f} p95={p[6]:.3f}  "
-                f"above_entry={above_entry}  in_band={in_band}  below_exit={below_exit}"
-            )
-
-        # ── 2. threshold computation trace ─────────────────────────────
-        logger.info(
-            f"[{self.name}] {rec['date']}  DIAG-THRESH  "
-            f"vol={rec['vol_regime']}  breadth={rec['breadth_regime']}  "
-            f"base_entry={rec['base_entry']:.3f}  "
-            f"+regime_adj={rec['regime_entry_adj']:+.3f}  "
-            f"+breadth_adj={rec['breadth_entry_adj']:+.3f}  "
-            f"= adjusted_entry={rec['adjusted_entry']:.3f}  "
-            f"adjusted_exit={rec['adjusted_exit']:.3f}  "
-            f"size_mult={rec['size_multiplier']:.2f}  "
-            f"held={rec['n_held']}/{rec['max_positions']}"
-        )
-
-        # ── 3. rank distribution (if populated) ────────────────────────
-        if len(ranks) > 0:
-            rp = np.percentile(ranks, [10, 50, 90])
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-RANKS   "
-                f"n={len(ranks)}  p10={rp[0]:.3f}  p50={rp[1]:.3f}  p90={rp[2]:.3f}"
-            )
-        else:
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-RANKS   "
-                f"** NO RANK DATA — rank keys may not be wired **"
-            )
-
-        # ── 4. top N scores with full breakdown ────────────────────────
-        if rec["composites"]:
-            top = sorted(rec["composites"].items(), key=lambda x: x[1], reverse=True)
-            for ticker, comp in top[: self.verbose_top_n]:
-                sub = rec["sub_scores"].get(ticker, {})
-                rank = rec["ranks"].get(ticker)
-                rs = rec["rs_regimes"].get(ticker, "?")
-                sec = rec["sector_regimes"].get(ticker, "?")
-                dec_action, dec_reasons = rec["decisions"].get(ticker, ("?", []))
-
-                sub_str = "  ".join(f"{k}={v:.3f}" for k, v in sub.items())
-                rank_str = f"rank={rank:.3f}" if rank is not None else "rank=N/A"
-
-                logger.info(
-                    f"[{self.name}] {rec['date']}  DIAG-TOP     "
-                    f"{ticker:20s}  comp={comp:.4f}  {rank_str}  "
-                    f"rs={rs}  sec={sec}  {sub_str}  "
-                    f"→ {dec_action}  {dec_reasons}"
-                )
-
-        # ── 5. sell trigger breakdown ──────────────────────────────────
-        if rec["sell_triggers"]:
-            counts = {k: len(v) for k, v in rec["sell_triggers"].items()}
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-SELLS   {counts}"
-            )
-            # show a few examples of score-below-exit sells
-            score_sells = rec["sell_triggers"].get(R_SCORE_BELOW_EXIT, [])
-            for ticker in score_sells[: self.verbose_sells]:
-                comp = rec["composites"].get(ticker, 0)
-                sub = rec["sub_scores"].get(ticker, {})
-                sub_str = "  ".join(f"{k}={v:.3f}" for k, v in sub.items())
-                logger.info(
-                    f"[{self.name}] {rec['date']}  DIAG-SELL-EX "
-                    f"{ticker:20s}  comp={comp:.4f}  {sub_str}"
-                )
-
-        # ── 6. blocked buys (score above entry but blocked by filter) ──
-        blocked = [
-            (t, d) for t, d in rec["decisions"].items() if d[0] == "BLOCKED"
-        ]
-        if blocked:
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-BLOCKED "
-                f"{len(blocked)} tickers passed score threshold but were blocked"
-            )
-            for ticker, (_, reasons) in blocked[: self.verbose_top_n]:
-                comp = rec["composites"].get(ticker, 0)
-                logger.info(
-                    f"[{self.name}] {rec['date']}  DIAG-BLOCKED "
-                    f"{ticker:20s}  comp={comp:.4f}  {reasons}"
-                )
-
-        self.daily_records.append(rec)
-        self._rec = None
-
-    # ── end-of-backtest summary ─────────────────────────────────────────
-
-    def print_summary(self):
-        """Call once after the backtest loop finishes."""
-        if not self.daily_records:
-            logger.info(f"[{self.name}] DIAG-SUMMARY  no data recorded")
-            return
-
-        n_days = len(self.daily_records)
-        all_scores = []
-        all_entries = []
-        all_exits = []
-        action_counts = defaultdict(int)
-        trigger_counts = defaultdict(int)
-        regime_day_counts = defaultdict(int)
-        breadth_day_counts = defaultdict(int)
-        days_with_rank = 0
-
-        for rec in self.daily_records:
-            all_scores.extend(rec["composites"].values())
-            all_entries.append(rec["adjusted_entry"])
-            all_exits.append(rec["adjusted_exit"])
-            regime_day_counts[rec["vol_regime"]] += 1
-            breadth_day_counts[rec["breadth_regime"]] += 1
-            if rec["ranks"]:
-                days_with_rank += 1
-            for _, (action, reasons) in rec["decisions"].items():
-                action_counts[action] += 1
-                if action == "SELL":
-                    for r in reasons:
-                        trigger_counts[r] += 1
-
-        scores_arr = np.array(all_scores) if all_scores else np.array([0])
-        entries_arr = np.array(all_entries)
-        exits_arr = np.array(all_exits)
-
-        logger.info(f"[{self.name}] {'=' * 60}")
-        logger.info(f"[{self.name}] DIAGNOSTIC SUMMARY  ({n_days} trading days)")
-        logger.info(f"[{self.name}] {'=' * 60}")
-
-        logger.info(
-            f"[{self.name}]   Score distribution (all ticker-days):  "
-            f"mean={scores_arr.mean():.4f}  std={scores_arr.std():.4f}  "
-            f"min={scores_arr.min():.4f}  max={scores_arr.max():.4f}"
-        )
-        p = np.percentile(scores_arr, [5, 25, 50, 75, 90, 95, 99])
-        logger.info(
-            f"[{self.name}]   Score percentiles:  "
-            f"p5={p[0]:.4f}  p25={p[1]:.4f}  p50={p[2]:.4f}  "
-            f"p75={p[3]:.4f}  p90={p[4]:.4f}  p95={p[5]:.4f}  p99={p[6]:.4f}"
-        )
-
-        pct_above_entry = 100.0 * np.mean(scores_arr >= entries_arr.mean())
-        pct_below_exit = 100.0 * np.mean(scores_arr < exits_arr.mean())
-        logger.info(
-            f"[{self.name}]   Avg entry threshold: {entries_arr.mean():.4f}  "
-            f"Avg exit threshold: {exits_arr.mean():.4f}"
-        )
-        logger.info(
-            f"[{self.name}]   %% ticker-days above avg entry: {pct_above_entry:.1f}%%  "
-            f"below avg exit: {pct_below_exit:.1f}%%"
-        )
-
-        logger.info(f"[{self.name}]   Vol regime days:     {dict(regime_day_counts)}")
-        logger.info(f"[{self.name}]   Breadth regime days:  {dict(breadth_day_counts)}")
-        logger.info(f"[{self.name}]   Days with rank data:  {days_with_rank}/{n_days}")
-
-        logger.info(f"[{self.name}]   Decision totals:      {dict(action_counts)}")
-        if trigger_counts:
-            logger.info(f"[{self.name}]   Sell trigger totals:  {dict(trigger_counts)}")
-
-        # gap analysis: how far is p90 score from entry threshold?
-        daily_gaps = []
-        for rec in self.daily_records:
-            s = list(rec["composites"].values())
-            if s:
-                daily_gaps.append(np.percentile(s, 90) - rec["adjusted_entry"])
-        if daily_gaps:
-            gaps = np.array(daily_gaps)
-            logger.info(
-                f"[{self.name}]   Daily (p90_score - entry_thresh):  "
-                f"mean={gaps.mean():+.4f}  min={gaps.min():+.4f}  max={gaps.max():+.4f}"
-            )
-            if gaps.mean() < 0:
-                logger.warning(
-                    f"[{self.name}]   ⚠ p90 score is BELOW entry threshold on average. "
-                    f"Scoring pipeline may be systematically too low, or thresholds too high."
-                )
-
-        logger.info(f"[{self.name}] {'=' * 60}")
-
-
-############################
-"""backtest/phase2/diagnostics.py
-
-Drop-in signal diagnostics. Wire into your engine's day loop
-and signal generator to capture *why* BUY/SELL/HOLD decisions
-are made.
-
-Usage:
-    from backtest.phase2.diagnostics import SignalDiagnostics
-    diag = SignalDiagnostics("Loose", enabled=True)
-    # ... wire calls at each decision point (see integration notes below)
-    diag.print_summary()
-"""
-from __future__ import annotations
-
-import logging
-from collections import defaultdict
-from typing import Any
-
-import numpy as np
-
-logger = logging.getLogger(__name__)
-
-
-# ── reason tags (use these as constants so summaries group cleanly) ─────
-R_SCORE_BELOW_EXIT    = "score<exit"
-R_SCORE_ABOVE_ENTRY   = "score>=entry"
-R_RANK_BELOW_FLOOR    = "rank<exit_floor"
-R_RANK_ABOVE_MIN      = "rank>=min_rank"
-R_RANK_BELOW_MIN      = "rank<min_rank"
-R_RS_BLOCKED          = "rs_regime_blocked"
-R_RS_FAIL_PENALTY     = "rs_fail_penalty_applied"
-R_SECTOR_BLOCKED      = "sector_regime_blocked"
-R_BREADTH_HARD_BLOCK  = "breadth_hard_block"
-R_VOL_HARD_BLOCK      = "vol_hard_block"
-R_COOLDOWN            = "cooldown_active"
-R_MAX_POSITIONS       = "max_positions_reached"
-R_CONTINUATION        = "continuation_pass"
-R_CONTINUATION_FAIL   = "continuation_fail"
-R_PULLBACK            = "pullback_pass"
-R_PULLBACK_FAIL       = "pullback_fail"
-R_CHAOTIC_EXIT_BUMP   = "chaotic_exit_bump"
-R_NOT_HELD            = "not_held"
-R_HELD_OK             = "held_score_ok"
-
-
-class SignalDiagnostics:
-    """Captures per-day, per-ticker decision data and emits summaries."""
-
-    def __init__(self, name: str = "", enabled: bool = True,
-                 verbose_top_n: int = 5, verbose_sells: int = 3):
-        self.name = name
-        self.enabled = enabled
-        self.verbose_top_n = verbose_top_n
-        self.verbose_sells = verbose_sells
-
-        # accumulation across entire backtest
-        self.daily_records: list[dict] = []
-        self._rec: dict | None = None
-
-    # ── per-day lifecycle ───────────────────────────────────────────────
-
-    def begin_day(
-        self,
-        date,
-        vol_regime: str,
-        breadth_regime: str,
-        base_entry: float,
-        base_exit: float,
-        regime_entry_adj: float,
-        breadth_entry_adj: float,
-        adjusted_entry: float,
-        adjusted_exit: float,
-        size_multiplier: float = 1.0,
-        n_held: int = 0,
-        max_positions: int = 0,
-    ):
-        """Call once at the start of each trading day, after computing
-        regime adjustments but before iterating over tickers."""
-        if not self.enabled:
-            return
-        self._rec = {
-            "date": date,
-            "vol_regime": vol_regime,
-            "breadth_regime": breadth_regime,
-            "base_entry": base_entry,
-            "base_exit": base_exit,
-            "regime_entry_adj": regime_entry_adj,
-            "breadth_entry_adj": breadth_entry_adj,
-            "adjusted_entry": adjusted_entry,
-            "adjusted_exit": adjusted_exit,
-            "size_multiplier": size_multiplier,
-            "n_held": n_held,
-            "max_positions": max_positions,
-            # populated by log_score / log_decision
-            "composites": {},          # ticker -> float
-            "sub_scores": {},          # ticker -> dict
-            "ranks": {},               # ticker -> float
-            "rs_regimes": {},          # ticker -> str
-            "sector_regimes": {},      # ticker -> str
-            "decisions": {},           # ticker -> (action, [reasons])
-            "sell_triggers": defaultdict(list),
-        }
-
-    def log_score(
-        self,
-        ticker: str,
-        composite: float,
-        rank_pct: float | None = None,
-        sub_scores: dict | None = None,
-        rs_regime: str | None = None,
-        sector_regime: str | None = None,
-    ):
-        """Call for every ticker after the scoring pipeline runs."""
-        if not self.enabled or self._rec is None:
-            return
-        self._rec["composites"][ticker] = composite
-        if rank_pct is not None:
-            self._rec["ranks"][ticker] = rank_pct
-        if sub_scores:
-            self._rec["sub_scores"][ticker] = sub_scores
-        if rs_regime:
-            self._rec["rs_regimes"][ticker] = rs_regime
-        if sector_regime:
-            self._rec["sector_regimes"][ticker] = sector_regime
-
-    def log_decision(self, ticker: str, action: str, reasons: list[str]):
-        """Call when a final BUY / SELL / HOLD / BLOCKED decision is made.
-
-        action: one of 'BUY', 'SELL', 'HOLD', 'BLOCKED'
-        reasons: list of R_* tags (or free-form strings)
-        """
-        if not self.enabled or self._rec is None:
-            return
-        self._rec["decisions"][ticker] = (action, reasons)
-        if action == "SELL":
-            for r in reasons:
-                self._rec["sell_triggers"][r].append(ticker)
-
-    def end_day(self):
-        """Call at end of day. Logs summary lines and archives the record."""
-        if not self.enabled or self._rec is None:
-            return
-        rec = self._rec
-        scores = np.array(list(rec["composites"].values())) if rec["composites"] else np.array([])
-        ranks = np.array(list(rec["ranks"].values())) if rec["ranks"] else np.array([])
-
-        # ── 1. score distribution vs thresholds ────────────────────────
-        if len(scores) > 0:
-            p = np.percentile(scores, [5, 10, 25, 50, 75, 90, 95])
-            above_entry = int(np.sum(scores >= rec["adjusted_entry"]))
-            in_band = int(np.sum(
-                (scores >= rec["adjusted_exit"]) & (scores < rec["adjusted_entry"])
-            ))
-            below_exit = int(np.sum(scores < rec["adjusted_exit"]))
-
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-SCORES  "
-                f"n={len(scores)}  "
-                f"p5={p[0]:.3f} p10={p[1]:.3f} p25={p[2]:.3f} "
-                f"p50={p[3]:.3f} p75={p[4]:.3f} p90={p[5]:.3f} p95={p[6]:.3f}  "
-                f"above_entry={above_entry}  in_band={in_band}  below_exit={below_exit}"
-            )
-
-        # ── 2. threshold computation trace ─────────────────────────────
-        logger.info(
-            f"[{self.name}] {rec['date']}  DIAG-THRESH  "
-            f"vol={rec['vol_regime']}  breadth={rec['breadth_regime']}  "
-            f"base_entry={rec['base_entry']:.3f}  "
-            f"+regime_adj={rec['regime_entry_adj']:+.3f}  "
-            f"+breadth_adj={rec['breadth_entry_adj']:+.3f}  "
-            f"= adjusted_entry={rec['adjusted_entry']:.3f}  "
-            f"adjusted_exit={rec['adjusted_exit']:.3f}  "
-            f"size_mult={rec['size_multiplier']:.2f}  "
-            f"held={rec['n_held']}/{rec['max_positions']}"
-        )
-
-        # ── 3. rank distribution (if populated) ────────────────────────
-        if len(ranks) > 0:
-            rp = np.percentile(ranks, [10, 50, 90])
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-RANKS   "
-                f"n={len(ranks)}  p10={rp[0]:.3f}  p50={rp[1]:.3f}  p90={rp[2]:.3f}"
-            )
-        else:
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-RANKS   "
-                f"** NO RANK DATA — rank keys may not be wired **"
-            )
-
-        # ── 4. top N scores with full breakdown ────────────────────────
-        if rec["composites"]:
-            top = sorted(rec["composites"].items(), key=lambda x: x[1], reverse=True)
-            for ticker, comp in top[: self.verbose_top_n]:
-                sub = rec["sub_scores"].get(ticker, {})
-                rank = rec["ranks"].get(ticker)
-                rs = rec["rs_regimes"].get(ticker, "?")
-                sec = rec["sector_regimes"].get(ticker, "?")
-                dec_action, dec_reasons = rec["decisions"].get(ticker, ("?", []))
-
-                sub_str = "  ".join(f"{k}={v:.3f}" for k, v in sub.items())
-                rank_str = f"rank={rank:.3f}" if rank is not None else "rank=N/A"
-
-                logger.info(
-                    f"[{self.name}] {rec['date']}  DIAG-TOP     "
-                    f"{ticker:20s}  comp={comp:.4f}  {rank_str}  "
-                    f"rs={rs}  sec={sec}  {sub_str}  "
-                    f"→ {dec_action}  {dec_reasons}"
-                )
-
-        # ── 5. sell trigger breakdown ──────────────────────────────────
-        if rec["sell_triggers"]:
-            counts = {k: len(v) for k, v in rec["sell_triggers"].items()}
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-SELLS   {counts}"
-            )
-            # show a few examples of score-below-exit sells
-            score_sells = rec["sell_triggers"].get(R_SCORE_BELOW_EXIT, [])
-            for ticker in score_sells[: self.verbose_sells]:
-                comp = rec["composites"].get(ticker, 0)
-                sub = rec["sub_scores"].get(ticker, {})
-                sub_str = "  ".join(f"{k}={v:.3f}" for k, v in sub.items())
-                logger.info(
-                    f"[{self.name}] {rec['date']}  DIAG-SELL-EX "
-                    f"{ticker:20s}  comp={comp:.4f}  {sub_str}"
-                )
-
-        # ── 6. blocked buys (score above entry but blocked by filter) ──
-        blocked = [
-            (t, d) for t, d in rec["decisions"].items() if d[0] == "BLOCKED"
-        ]
-        if blocked:
-            logger.info(
-                f"[{self.name}] {rec['date']}  DIAG-BLOCKED "
-                f"{len(blocked)} tickers passed score threshold but were blocked"
-            )
-            for ticker, (_, reasons) in blocked[: self.verbose_top_n]:
-                comp = rec["composites"].get(ticker, 0)
-                logger.info(
-                    f"[{self.name}] {rec['date']}  DIAG-BLOCKED "
-                    f"{ticker:20s}  comp={comp:.4f}  {reasons}"
-                )
-
-        self.daily_records.append(rec)
-        self._rec = None
-
-    # ── end-of-backtest summary ─────────────────────────────────────────
-
-    def print_summary(self):
-        """Call once after the backtest loop finishes."""
-        if not self.daily_records:
-            logger.info(f"[{self.name}] DIAG-SUMMARY  no data recorded")
-            return
-
-        n_days = len(self.daily_records)
-        all_scores = []
-        all_entries = []
-        all_exits = []
-        action_counts = defaultdict(int)
-        trigger_counts = defaultdict(int)
-        regime_day_counts = defaultdict(int)
-        breadth_day_counts = defaultdict(int)
-        days_with_rank = 0
-
-        for rec in self.daily_records:
-            all_scores.extend(rec["composites"].values())
-            all_entries.append(rec["adjusted_entry"])
-            all_exits.append(rec["adjusted_exit"])
-            regime_day_counts[rec["vol_regime"]] += 1
-            breadth_day_counts[rec["breadth_regime"]] += 1
-            if rec["ranks"]:
-                days_with_rank += 1
-            for _, (action, reasons) in rec["decisions"].items():
-                action_counts[action] += 1
-                if action == "SELL":
-                    for r in reasons:
-                        trigger_counts[r] += 1
-
-        scores_arr = np.array(all_scores) if all_scores else np.array([0])
-        entries_arr = np.array(all_entries)
-        exits_arr = np.array(all_exits)
-
-        logger.info(f"[{self.name}] {'=' * 60}")
-        logger.info(f"[{self.name}] DIAGNOSTIC SUMMARY  ({n_days} trading days)")
-        logger.info(f"[{self.name}] {'=' * 60}")
-
-        logger.info(
-            f"[{self.name}]   Score distribution (all ticker-days):  "
-            f"mean={scores_arr.mean():.4f}  std={scores_arr.std():.4f}  "
-            f"min={scores_arr.min():.4f}  max={scores_arr.max():.4f}"
-        )
-        p = np.percentile(scores_arr, [5, 25, 50, 75, 90, 95, 99])
-        logger.info(
-            f"[{self.name}]   Score percentiles:  "
-            f"p5={p[0]:.4f}  p25={p[1]:.4f}  p50={p[2]:.4f}  "
-            f"p75={p[3]:.4f}  p90={p[4]:.4f}  p95={p[5]:.4f}  p99={p[6]:.4f}"
-        )
-
-        pct_above_entry = 100.0 * np.mean(scores_arr >= entries_arr.mean())
-        pct_below_exit = 100.0 * np.mean(scores_arr < exits_arr.mean())
-        logger.info(
-            f"[{self.name}]   Avg entry threshold: {entries_arr.mean():.4f}  "
-            f"Avg exit threshold: {exits_arr.mean():.4f}"
-        )
-        logger.info(
-            f"[{self.name}]   %% ticker-days above avg entry: {pct_above_entry:.1f}%%  "
-            f"below avg exit: {pct_below_exit:.1f}%%"
-        )
-
-        logger.info(f"[{self.name}]   Vol regime days:     {dict(regime_day_counts)}")
-        logger.info(f"[{self.name}]   Breadth regime days:  {dict(breadth_day_counts)}")
-        logger.info(f"[{self.name}]   Days with rank data:  {days_with_rank}/{n_days}")
-
-        logger.info(f"[{self.name}]   Decision totals:      {dict(action_counts)}")
-        if trigger_counts:
-            logger.info(f"[{self.name}]   Sell trigger totals:  {dict(trigger_counts)}")
-
-        # gap analysis: how far is p90 score from entry threshold?
-        daily_gaps = []
-        for rec in self.daily_records:
-            s = list(rec["composites"].values())
-            if s:
-                daily_gaps.append(np.percentile(s, 90) - rec["adjusted_entry"])
-        if daily_gaps:
-            gaps = np.array(daily_gaps)
-            logger.info(
-                f"[{self.name}]   Daily (p90_score - entry_thresh):  "
-                f"mean={gaps.mean():+.4f}  min={gaps.min():+.4f}  max={gaps.max():+.4f}"
-            )
-            if gaps.mean() < 0:
-                logger.warning(
-                    f"[{self.name}]   ⚠ p90 score is BELOW entry threshold on average. "
-                    f"Scoring pipeline may be systematically too low, or thresholds too high."
-                )
-
-        logger.info(f"[{self.name}] {'=' * 60}")
-
-###################
-"""
-backtest/phase2/compare.py
-Run two configs side-by-side and print a comparison table,
-including benchmark performance.
-"""
-from __future__ import annotations
-
-import pandas as pd
-from typing import Any, Dict, Tuple
-
-from rich.console import Console
-from rich.table import Table
-
-from backtest.phase2.engine import BacktestEngine
-from backtest.phase2.data_source import BacktestDataSource
-from backtest.phase2.metrics import compute_metrics
-
-
-# ------------------------------------------------------------------
-def build_config_dict(
-    vol_regime_params: dict,
-    scoring_weights: dict,
-    scoring_params: dict,
-    signal_params: dict,
-    convergence_params: dict,
-    action_params: dict | None = None,
-    breadth_params: dict | None = None,
-    rotation_params: dict | None = None,
-) -> Dict[str, Any]:
-    """Bundle config blocks into one dict for the engine."""
-    cfg = {
-        "vol_regime_params": vol_regime_params,
-        "scoring_weights": scoring_weights,
-        "scoring_params": scoring_params,
-        "signal_params": signal_params,
-        "convergence_params": convergence_params,
-    }
-    if action_params is not None:
-        cfg["action_params"] = action_params
-    if breadth_params is not None:
-        cfg["breadth_params"] = breadth_params
-    if rotation_params is not None:
-        cfg["rotation_params"] = rotation_params
-    return cfg
-
-
-# ------------------------------------------------------------------
-def run_comparison(
-    data_source: BacktestDataSource,
-    market: str,
-    config_a: Dict[str, Any],
-    config_b: Dict[str, Any],
-    start_date: str,
-    end_date: str,
-    name_a: str = "Config A",
-    name_b: str = "Config B",
-    initial_capital: float = 1_000_000.0,
-    max_positions: int = 12,
-    commission_rate: float = 0.0010,
-    slippage_rate: float = 0.0010,
-) -> Tuple[Dict, Dict, pd.DataFrame]:
-    """
-    Returns (results_a, results_b, comparison_dataframe).
-    """
-    common = dict(
-        data_source=data_source,
-        market=market,
-        start_date=start_date,
-        end_date=end_date,
-        initial_capital=initial_capital,
-        max_positions=max_positions,
-        commission_rate=commission_rate,
-        slippage_rate=slippage_rate,
-    )
-
-    ra = BacktestEngine(config=config_a, config_name=name_a, **common).run()
-    rb = BacktestEngine(config=config_b, config_name=name_b, **common).run()
-
-    ma = compute_metrics(ra)
-    mb = compute_metrics(rb)
-    ra["metrics"], rb["metrics"] = ma, mb
-
-    comp = _comparison_df(ma, mb, name_a, name_b)
-    return ra, rb, comp
-
-
-# ------------------------------------------------------------------
-_ROWS = [
-    # (label,                  key,                    fmt,   lower_is_better)
-    ("Total Return",           "total_return",         ".1%",  False),
-    ("Annualized Return",      "annualized_return",    ".1%",  False),
-    ("Final Value",            "final_value",          ",.0f", False),
-    ("SEP", None, None, None),
-    ("Annualized Vol",         "annualized_vol",       ".1%",  True),
-    ("Sharpe Ratio",           "sharpe_ratio",         ".2f",  False),
-    ("Sortino Ratio",          "sortino_ratio",        ".2f",  False),
-    ("Max Drawdown",           "max_drawdown",         ".1%",  True),
-    ("Max DD Duration (days)", "max_dd_duration_days", "d",    True),
-    ("Calmar Ratio",           "calmar_ratio",         ".2f",  False),
-    ("SEP", None, None, None),
-    ("Total Trades",           "total_trades",         "d",    None),
-    ("Win Rate",               "win_rate",             ".1%",  False),
-    ("Avg Win",                "avg_win_pct",          ".1%",  False),
-    ("Avg Loss",               "avg_loss_pct",         ".1%",  True),
-    ("Profit Factor",          "profit_factor",        ".2f",  False),
-    ("Avg PnL %",              "avg_pnl_pct",          ".2%",  False),
-    ("Expectancy ($)",         "expectancy_dollar",    ",.0f", False),
-    ("Avg Holding Days",       "avg_holding_days",     ".1f",  None),
-    ("SEP", None, None, None),
-    ("Best Trade",             "best_trade_pct",       ".1%",  False),
-    ("Worst Trade",            "worst_trade_pct",      ".1%",  True),
-    ("Avg Positions",          "avg_positions",        ".1f",  None),
-    ("Buy Signals",            "total_buy_signals",    "d",    None),
-    ("Sell Signals",           "total_sell_signals",   "d",    None),
-    ("SEP", None, None, None),
-    # ── Benchmark & relative metrics ──────────────────────────────
-    ("Benchmark Return",       "benchmark_total_return", ".1%", None),
-    ("Benchmark Ann. Return",  "benchmark_ann_return", ".1%",  None),
-    ("Benchmark Sharpe",       "benchmark_sharpe",     ".2f",  None),
-    ("Benchmark Max DD",       "benchmark_max_dd",     ".1%",  None),
-    ("SEP", None, None, None),
-    ("Alpha (Jensen)",         "alpha",                ".2%",  False),
-    ("Beta",                   "beta",                 ".2f",  None),
-    ("Tracking Error",         "tracking_error",       ".1%",  True),
-    ("Information Ratio",      "information_ratio",    ".2f",  False),
-]
-
-
-def _comparison_df(
-    ma: Dict, mb: Dict, name_a: str, name_b: str
-) -> pd.DataFrame:
-    rows = []
-    for label, key, fmt, lower_better in _ROWS:
-        if key is None:
-            rows.append({"Metric": "─" * 28, name_a: "", name_b: "", "Better": ""})
-            continue
-
-        va, vb = ma.get(key, 0), mb.get(key, 0)
-
-        # who wins?
-        if lower_better is None:
-            better = ""
-        elif lower_better:
-            better = name_a if va < vb else name_b if vb < va else "Tie"
-        else:
-            better = name_a if va > vb else name_b if vb > va else "Tie"
-
-        try:
-            sa = f"{va:{fmt}}"
-            sb = f"{vb:{fmt}}"
-        except (ValueError, TypeError):
-            sa, sb = str(va), str(vb)
-
-        rows.append({"Metric": label, name_a: sa, name_b: sb, "Better": better})
-
-    return pd.DataFrame(rows)
-
-
-# ------------------------------------------------------------------
-def print_comparison(
-    comp: pd.DataFrame,
-    name_a: str = "Config A",
-    name_b: str = "Config B",
-    console: Console | None = None,
-) -> None:
-    """Pretty-print with Rich."""
-    if console is None:
-        console = Console()
-
-    table = Table(title="⚔️  Backtest Comparison", show_lines=False, padding=(0, 1))
-    for col in comp.columns:
-        table.add_column(col, justify="left" if col == "Metric" else "right")
-
-    for _, row in comp.iterrows():
-        cells = []
-        for col in comp.columns:
-            v = str(row[col])
-            if col == "Better":
-                if v == name_a:
-                    v = f"[cyan]◄ {v}[/]"
-                elif v == name_b:
-                    v = f"[green]{v} ►[/]"
-            cells.append(v)
-        table.add_row(*cells)
-
-    console.print(table)
-
-#############################
-"""
-backtest/phase2/data_source.py
-Date-aware data source wrapper for backtesting.
-
-Loads from a single parquet file per market (data/{market}_cash.parquet),
-filters to a given ticker universe, and presents a sliding window up to
-the current backtest date.
-
-Expected parquet schema (long format):
-    date | ticker | open | high | low | close | volume
-
-The 'date' column should be parseable as datetime.  Column names are
-normalised to lowercase on load.  If the parquet uses 'symbol' instead
-of 'ticker', that works too.
-"""
-from __future__ import annotations
-
-import logging
-from pathlib import Path
-from typing import Dict, List, Optional
-
-import pandas as pd
 
 log = logging.getLogger(__name__)
 
 
-class BacktestDataSource:
+@dataclass
+class Position:
+    ticker: str
+    entry_date: object
+    entry_price: float
+    shares: int
+    cost_basis: float
+    peak_price: float = 0.0
+    latest_score: float = 0.0
+    current_price: float = 0.0
+
+    def __post_init__(self):
+        if self.peak_price == 0.0:
+            self.peak_price = self.entry_price
+        if self.current_price == 0.0:
+            self.current_price = self.entry_price
+
+    @property
+    def market_value(self) -> float:
+        return self.shares * self.current_price
+
+
+class PortfolioTracker:
 
     def __init__(
         self,
-        ticker_data: Dict[str, pd.DataFrame],
-        benchmark_data: Optional[pd.DataFrame] = None,
-        lookback_bars: int = 300,
+        initial_capital: float = 1_000_000.0,
+        max_positions: int = 12,
+        commission_rate: float = 0.0010,
+        slippage_rate: float = 0.0010,
+        min_hold_days: int = 5,
+        min_profit_early_exit_pct: float = 0.05,
+        trailing_stop_pct: float = 0.18,
+        max_hold_days: int = 120,
+        upgrade_min_score_gap: float = 999,
     ):
-        self.ticker_data = ticker_data
-        self.benchmark_data = benchmark_data
-        self.lookback_bars = lookback_bars
-        self._cutoff: Optional[pd.Timestamp] = None
+        self.initial_capital = initial_capital
+        self.cash = initial_capital
+        self.max_positions = max_positions
+        self.commission_rate = commission_rate
+        self.slippage_rate = slippage_rate
+        self.min_hold_days = min_hold_days
+        self.min_profit_early_exit_pct = min_profit_early_exit_pct
 
-    # ==================================================================
-    #  Factory — build from parquet + universe list
-    # ==================================================================
-    @classmethod
-    def from_parquet(
-        cls,
-        parquet_path: str | Path,
-        tickers: List[str],
-        benchmark_ticker: Optional[str] = None,
-        lookback_bars: int = 300,
-    ) -> "BacktestDataSource":
+        self.trailing_stop_pct = trailing_stop_pct
+        self.max_hold_days = max_hold_days
+        self.upgrade_min_score_gap = upgrade_min_score_gap
+
+        self.positions: Dict[str, Position] = {}
+        self.closed_trades: List[Dict] = []
+
+        # Diagnostic counters
+        self._total_buys: int = 0
+        self._total_sells: int = 0
+        self._blocked_sells: int = 0
+
+    # ──────────────────────────────────────────────────────────
+    #  NAV calculation (used by engine for dynamic sizing)
+    # ──────────────────────────────────────────────────────────
+    @property
+    def nav(self) -> float:
+        """Current net asset value = cash + sum of position market values."""
+        return self.cash + sum(
+            pos.market_value for pos in self.positions.values()
+        )
+
+    # ──────────────────────────────────────────────────────────
+    #  Min-hold check
+    #
+    #  NOTE: Uses calendar days, not trading days.
+    #  min_hold_days=5 means 5 calendar days (≈3 trading days).
+    #  If you want 5 trading days, set min_hold_days=7.
+    # ──────────────────────────────────────────────────────────
+    def _can_sell(self, pos: Position, date, current_price: float) -> bool:
+        held_days = (date - pos.entry_date).days
+        if held_days >= self.min_hold_days:
+            return True
+        unrealised_pct = (current_price / pos.entry_price) - 1.0
+        if unrealised_pct >= self.min_profit_early_exit_pct:
+            log.debug(
+                "  early exit allowed %s: +%.1f%% after %dd",
+                pos.ticker, unrealised_pct * 100, held_days,
+            )
+            return True
+        return False
+
+    # ──────────────────────────────────────────────────────────
+    #  Force exits: trailing stop + max hold
+    #
+    #  Returns list of tickers force-sold.
+    #  Tags each closed trade with 'exit_type' for attribution.
+    # ──────────────────────────────────────────────────────────
+    def force_exits(self, date, prices, **kw) -> List[str]:
+        force_sold = []
+        for ticker in list(self.positions):
+            pos = self.positions[ticker]
+            price = prices.get(ticker)
+
+            if price is None:
+                held = (date - pos.entry_date).days
+                if held > 5:
+                    log.warning(
+                        "  ⚠ NO PRICE for %-10s  held %dd  "
+                        "entry=$%.2f  peak=$%.2f  — STOP CANNOT FIRE",
+                        ticker, held, pos.entry_price, pos.peak_price,
+                    )
+                continue
+
+            held_days = (date - pos.entry_date).days
+            drawdown_from_peak = (price - pos.peak_price) / pos.peak_price
+            drawdown_from_entry = (price - pos.entry_price) / pos.entry_price
+
+            # Diagnostic: catch positions with large losses
+            if drawdown_from_entry < -0.25:
+                log.warning(
+                    "  ⚠ BIG LOSS %-10s  from_entry=%.1f%%  from_peak=%.1f%%  "
+                    "price=$%.2f  peak=$%.2f  entry=$%.2f  held=%dd",
+                    ticker,
+                    drawdown_from_entry * 100,
+                    drawdown_from_peak * 100,
+                    price, pos.peak_price, pos.entry_price, held_days,
+                )
+
+            reason = None
+            exit_type = None
+
+            if held_days >= self.max_hold_days:
+                reason = f"max_hold ({held_days}d >= {self.max_hold_days}d)"
+                exit_type = "force_exit_max_hold"
+            elif drawdown_from_peak <= -self.trailing_stop_pct:
+                reason = (
+                    f"trailing_stop ({drawdown_from_peak:+.1%} from "
+                    f"peak ${pos.peak_price:.2f})"
+                )
+                exit_type = "force_exit_trailing"
+
+            if reason:
+                log.info("  ✖ FORCE-EXIT %-10s  %s", ticker, reason)
+                self._sell(date, ticker, price, exit_type=exit_type)
+                force_sold.append(ticker)
+
+        return force_sold
+
+    # ──────────────────────────────────────────────────────────
+    #  Upgrade — swap weak held position for strong candidate
+    # ──────────────────────────────────────────────────────────
+    def try_upgrades(
+        self,
+        date,
+        candidate_scores: Dict[str, float],
+        prices: Dict[str, float],
+        max_upgrades: int = 2,
+    ) -> List[Tuple[str, str]]:
         """
-        Load ``data/{market}_cash.parquet`` and split into per-ticker
-        DataFrames keyed by ticker with a DatetimeIndex.
+        Compare the weakest held positions against the strongest
+        un-held candidates.  If the score gap exceeds the threshold,
+        sell the held position and buy the candidate.
 
-        Args:
-            parquet_path:     Path to the parquet file.
-            tickers:          Universe tickers to keep.
-            benchmark_ticker: e.g. "2800.HK".  Looked up in the same
-                              parquet; ignored if not found.
-            lookback_bars:    Max bars per fetch() call.
+        Returns list of (sold_ticker, bought_ticker) pairs.
         """
-        path = Path(parquet_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Parquet file not found: {path}")
+        if not self.positions or not candidate_scores:
+            return []
 
-        raw = pd.read_parquet(path)
-        raw.columns = raw.columns.str.strip().str.lower()
+        # Rank held positions by latest score (ascending = weakest first)
+        held_scored = [
+            (t, pos.latest_score)
+            for t, pos in self.positions.items()
+            if self._can_sell(pos, date, prices.get(t, pos.entry_price))
+        ]
+        held_scored.sort(key=lambda x: x[1])
 
-        # ── normalise ticker column ──────────────────────────────
-        ticker_col = _find_column(raw, ("ticker", "symbol", "code", "stock"))
-        if ticker_col is None:
-            raise KeyError(
-                f"Cannot find a ticker/symbol column in {path}.  "
-                f"Columns present: {list(raw.columns)}"
+        # Rank candidates by score (descending = strongest first)
+        candidates = [
+            (t, s)
+            for t, s in candidate_scores.items()
+            if t not in self.positions and t in prices
+        ]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        swaps = []
+        used_held = set()
+        used_cand = set()
+
+        for cand_ticker, cand_score in candidates:
+            if len(swaps) >= max_upgrades:
+                break
+            if cand_ticker in used_cand:
+                continue
+
+            for held_ticker, held_score in held_scored:
+                if held_ticker in used_held:
+                    continue
+                gap = cand_score - held_score
+                if gap >= self.upgrade_min_score_gap:
+                    log.info(
+                        "  ⇄ UPGRADE  sell %-10s (score %.3f) → "
+                        "buy %-10s (score %.3f, gap +%.3f)",
+                        held_ticker, held_score,
+                        cand_ticker, cand_score, gap,
+                    )
+                    self._sell(
+                        date, held_ticker, prices[held_ticker],
+                        exit_type="upgrade_out",
+                    )
+                    self._buy(
+                        date, cand_ticker, prices[cand_ticker],
+                        current_nav=self.nav,
+                    )
+                    used_held.add(held_ticker)
+                    used_cand.add(cand_ticker)
+                    swaps.append((held_ticker, cand_ticker))
+                    break
+
+        return swaps
+
+    # ──────────────────────────────────────────────────────────
+    #  Process signals — accepts current_nav for dynamic sizing
+    # ──────────────────────────────────────────────────────────
+    def process_signals(
+        self,
+        date,
+        actions: Dict[str, str],
+        prices: Dict[str, float],
+        scores: Optional[Dict[str, float]] = None,
+        current_nav: Optional[float] = None,
+    ) -> None:
+        scores = scores or {}
+
+        # ── sells first (respect min hold) ────────────────────
+        blocked_sells = []
+        for ticker, action in actions.items():
+            if action == "SELL" and ticker in self.positions:
+                if ticker not in prices:
+                    continue
+                pos = self.positions[ticker]
+                if self._can_sell(pos, date, prices[ticker]):
+                    self._sell(date, ticker, prices[ticker], exit_type="signal_exit")
+                else:
+                    held = (date - pos.entry_date).days
+                    blocked_sells.append((ticker, held))
+
+        if blocked_sells:
+            self._blocked_sells += len(blocked_sells)
+            log.debug(
+                "  min-hold blocked %d sells: %s",
+                len(blocked_sells),
+                [(t, f"{d}d") for t, d in blocked_sells[:5]],
             )
 
-        # ── normalise date column / index ────────────────────────
-        date_col = _find_column(raw, ("date", "datetime", "timestamp", "time"))
-        if date_col is not None:
-            raw[date_col] = pd.to_datetime(raw[date_col])
-        elif isinstance(raw.index, pd.DatetimeIndex):
-            raw = raw.reset_index()
-            date_col = raw.columns[0]  # the old index name
-        else:
-            raise KeyError(
-                f"Cannot find a date column in {path}.  "
-                f"Columns present: {list(raw.columns)}"
+        # ── then buys — SORTED BY SCORE (highest first) ──────
+        buy_tickers = [
+            t
+            for t, a in actions.items()
+            if a in ("BUY", "STRONG_BUY")
+            and t not in self.positions
+            and t in prices
+        ]
+        buy_tickers.sort(key=lambda t: scores.get(t, 0.0), reverse=True)
+
+        slots = self.max_positions - len(self.positions)
+        if slots <= 0 or not buy_tickers:
+            return
+
+        for ticker in buy_tickers[:slots]:
+            self._buy(date, ticker, prices[ticker], current_nav=current_nav)
+
+    # ──────────────────────────────────────────────────────────
+    #  Update held positions' scores (call each day)
+    # ──────────────────────────────────────────────────────────
+    def update_scores(self, scores: Dict[str, float]) -> None:
+        """Refresh latest_score on each held position for upgrade logic."""
+        for ticker, pos in self.positions.items():
+            if ticker in scores:
+                pos.latest_score = scores[ticker]
+
+    # ──────────────────────────────────────────────────────────
+    #  Buy — DYNAMIC SIZING based on current NAV
+    # ──────────────────────────────────────────────────────────
+    def _buy(
+        self,
+        date,
+        ticker: str,
+        raw_price: float,
+        current_nav: Optional[float] = None,
+    ) -> None:
+        exec_price = raw_price * (1 + self.slippage_rate)
+
+        # Use current NAV (if provided) instead of frozen initial_capital.
+        # Slot size = NAV / max_positions (equal-weight target).
+        # Capped at 95% of available cash to prevent over-commitment.
+        sizing_nav = current_nav if current_nav else self.nav
+        slot_target = sizing_nav / self.max_positions
+
+        target_value = min(slot_target, self.cash * 0.95)
+
+        if target_value < 1_000:
+            log.debug(
+                "  SKIP BUY %-10s: target_value=$%.0f too small "
+                "(nav=$%s, cash=$%s, slots=%d)",
+                ticker, target_value,
+                f"{sizing_nav:,.0f}", f"{self.cash:,.0f}",
+                self.max_positions,
             )
+            return
 
-        # ── normalise OHLCV column names ─────────────────────────
-        rename_map = {}
-        for target, candidates in [
-            ("open",   ("open", "o")),
-            ("high",   ("high", "h")),
-            ("low",    ("low", "l")),
-            ("close",  ("close", "c", "adj close", "adj_close", "adjclose")),
-            ("volume", ("volume", "vol", "v")),
-        ]:
-            found = _find_column(raw, candidates)
-            if found and found != target:
-                rename_map[found] = target
-        if rename_map:
-            raw = raw.rename(columns=rename_map)
+        shares = int(target_value / exec_price)
+        if shares <= 0:
+            return
 
-        needed = {"open", "high", "low", "close", "volume"}
-        missing = needed - set(raw.columns)
-        if missing:
-            raise KeyError(f"Missing OHLCV columns after rename: {missing}")
+        cost = shares * exec_price
+        commission = cost * self.commission_rate
+        total = cost + commission
+        if total > self.cash:
+            # Try smaller allocation (use all remaining cash minus commission buffer)
+            max_cost = self.cash / (1 + self.commission_rate)
+            shares = int(max_cost / exec_price)
+            if shares <= 0:
+                return
+            cost = shares * exec_price
+            commission = cost * self.commission_rate
+            total = cost + commission
+            if total > self.cash:
+                return
 
-        # ── filter to universe tickers ───────────────────────────
-        all_tickers_in_file = set(raw[ticker_col].unique())
-        want = set(tickers)
-        if benchmark_ticker:
-            want.add(benchmark_ticker)
-
-        found_tickers = want & all_tickers_in_file
-        not_found = want - all_tickers_in_file
-        if not_found:
-            log.warning(
-                "%d tickers not in parquet and will be skipped: %s",
-                len(not_found),
-                sorted(not_found)[:20],
-            )
-
-        raw = raw[raw[ticker_col].isin(found_tickers)].copy()
-        raw = raw.sort_values([ticker_col, date_col])
-
-        # ── split into {ticker: DataFrame} ───────────────────────
-        ticker_data: Dict[str, pd.DataFrame] = {}
-        benchmark_data: Optional[pd.DataFrame] = None
-
-        for tkr, group in raw.groupby(ticker_col):
-            df = (
-                group.set_index(date_col)[["open", "high", "low", "close", "volume"]]
-                .sort_index()
-                .copy()
-            )
-            df.index.name = "date"
-            # drop exact duplicate indices if any
-            df = df[~df.index.duplicated(keep="last")]
-            ticker_data[tkr] = df
-
-            if tkr == benchmark_ticker:
-                benchmark_data = df.copy()
+        self.cash -= total
+        self.positions[ticker] = Position(
+            ticker=ticker,
+            entry_date=date,
+            entry_price=exec_price,
+            shares=shares,
+            cost_basis=total,
+            peak_price=exec_price,
+            current_price=exec_price,
+        )
+        self._total_buys += 1
 
         log.info(
-            "Loaded %d tickers from %s  (date range %s → %s)",
-            len(ticker_data),
-            path.name,
-            raw[date_col].min().strftime("%Y-%m-%d"),
-            raw[date_col].max().strftime("%Y-%m-%d"),
+            "  ▲ BUY  %-10s  %d shares @ %.2f  cost $%s  "
+            "(slot=$%s, nav=$%s)",
+            ticker, shares, exec_price,
+            f"{total:,.0f}",
+            f"{slot_target:,.0f}",
+            f"{sizing_nav:,.0f}",
         )
 
-        return cls(
-            ticker_data=ticker_data,
-            benchmark_data=benchmark_data,
-            lookback_bars=lookback_bars,
+    # ──────────────────────────────────────────────────────────
+    #  Sell — tags exit_type for attribution
+    # ──────────────────────────────────────────────────────────
+    def _sell(
+        self,
+        date,
+        ticker: str,
+        raw_price: float,
+        exit_type: Optional[str] = None,
+    ) -> None:
+        pos = self.positions.get(ticker)
+        if pos is None:
+            return
+
+        exec_price = raw_price * (1 - self.slippage_rate)
+        proceeds = pos.shares * exec_price
+        commission = proceeds * self.commission_rate
+        net = proceeds - commission
+
+        pnl = net - pos.cost_basis
+        pnl_pct = pnl / pos.cost_basis
+        held = (date - pos.entry_date).days
+
+        self.cash += net
+        del self.positions[ticker]
+        self._total_sells += 1
+
+        trade_record = {
+            "ticker": ticker,
+            "entry_date": pos.entry_date,
+            "exit_date": date,
+            "entry_price": pos.entry_price,
+            "exit_price": exec_price,
+            "shares": pos.shares,
+            "cost_basis": pos.cost_basis,
+            "net_proceeds": net,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "holding_days": held,
+            "peak_price": pos.peak_price,
+            "max_favorable": (pos.peak_price / pos.entry_price) - 1.0,
+            "latest_score": pos.latest_score,
+        }
+        if exit_type:
+            trade_record["exit_type"] = exit_type
+
+        self.closed_trades.append(trade_record)
+
+        log.info(
+            "  ▼ SELL %-10s  %d shares @ %.2f  PnL $%s (%+.1f%%)  "
+            "held %dd  [%s]",
+            ticker, pos.shares, exec_price,
+            f"{pnl:,.0f}", pnl_pct * 100, held,
+            exit_type or "unknown",
         )
 
-    # ==================================================================
-    #  Cutoff management
-    # ==================================================================
-    def set_cutoff(self, dt) -> None:
-        self._cutoff = pd.Timestamp(dt)
+    # ──────────────────────────────────────────────────────────
+    #  Mark-to-market — updates peak + current_price
+    # ──────────────────────────────────────────────────────────
+    def mark_to_market(self, date, close_prices: Dict[str, float]) -> float:
+        pos_val = 0.0
+        for t, p in self.positions.items():
+            price = close_prices.get(t, p.current_price)
+            p.current_price = price
+            pos_val += price * p.shares
+            if price > p.peak_price:
+                p.peak_price = price
+        return self.cash + pos_val
 
-    # ==================================================================
-    #  Data access
-    # ==================================================================
-    def fetch(self, ticker: str) -> pd.DataFrame:
-        if ticker not in self.ticker_data:
-            return pd.DataFrame()
-        df = self.ticker_data[ticker]
-        if self._cutoff is not None:
-            df = df.loc[df.index <= self._cutoff]
-        if len(df) > self.lookback_bars:
-            df = df.iloc[-self.lookback_bars:]
-        return df.copy()
-
-    def fetch_benchmark(self) -> pd.DataFrame:
-        if self.benchmark_data is None:
-            return pd.DataFrame()
-        df = self.benchmark_data
-        if self._cutoff is not None:
-            df = df.loc[df.index <= self._cutoff]
-        if len(df) > self.lookback_bars:
-            df = df.iloc[-self.lookback_bars:]
-        return df.copy()
-
-    def get_tickers(self) -> List[str]:
-        return list(self.ticker_data.keys())
-
-    def get_trading_days(self, start: str, end: str) -> List[pd.Timestamp]:
-        all_dates: set = set()
-        for df in self.ticker_data.values():
-            all_dates.update(df.index.tolist())
-        s, e = pd.Timestamp(start), pd.Timestamp(end)
-        return sorted(d for d in all_dates if s <= d <= e)
-
-    def get_date_range(self) -> tuple:
-        """Min and max dates across all loaded tickers."""
-        lo, hi = pd.Timestamp.max, pd.Timestamp.min
-        for df in self.ticker_data.values():
-            if not df.empty:
-                lo = min(lo, df.index.min())
-                hi = max(hi, df.index.max())
-        return lo, hi
-
-
-# ------------------------------------------------------------------
-#  helpers
-# ------------------------------------------------------------------
-
-def _find_column(df: pd.DataFrame, candidates: tuple) -> Optional[str]:
-    """Return the first column name from *candidates* present in df."""
-    cols_lower = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c in cols_lower:
-            return cols_lower[c]
-    return None
+##########################################
