@@ -1,23 +1,21 @@
 """
 backtest/phase2/tracker.py
 Virtual portfolio tracker with minimum hold period,
-trailing stop, max hold duration, and score-ranked buys.
+trailing stop, max hold duration, and momentum-tilted buy ranking.
 
-Features:
-  - VARIABLE POSITION SIZING: _buy() accepts per-ticker weight from pipeline.
-    Falls back to equal-weight (1/max_positions) if no weight provided.
-  - Dynamic position sizing: uses current NAV (not frozen initial_capital).
-  - force_exits() tags exit_type on closed trade records for attribution.
-  - _can_sell() uses calendar-day semantics for min hold period.
-  - market_value property on Position for clean NAV calculation.
-  - nav property on PortfolioTracker for engine integration.
-  - Trailing stop fires at open price (gap-down protection).
+Key features:
+  - MOMENTUM/BETA-TILTED BUY RANKING
+  - VARIABLE POSITION SIZING from pipeline (sigpositionpct_v2)
+  - Dynamic sizing uses current NAV
+  - force_exits() tags exit_type for attribution
+  - Trailing stop at open price (gap-down protection)
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import logging
+import numpy as np
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +30,8 @@ class Position:
     peak_price: float = 0.0
     latest_score: float = 0.0
     current_price: float = 0.0
-    target_weight: float = 0.0  # the weight used at entry (for diagnostics)
+    target_weight: float = 0.0
+    entry_momentum_rank: float = 0.0
 
     def __post_init__(self):
         if self.peak_price == 0.0:
@@ -78,20 +77,15 @@ class PortfolioTracker:
         self._total_buys: int = 0
         self._total_sells: int = 0
         self._blocked_sells: int = 0
+        self._filtered_low_vol: int = 0
+        self._ranking_logged: bool = False
 
-    # ──────────────────────────────────────────────────────────
-    #  NAV calculation (used by engine for dynamic sizing)
-    # ──────────────────────────────────────────────────────────
     @property
     def nav(self) -> float:
-        """Current net asset value = cash + sum of position market values."""
         return self.cash + sum(
             pos.market_value for pos in self.positions.values()
         )
 
-    # ──────────────────────────────────────────────────────────
-    #  Min-hold check
-    # ──────────────────────────────────────────────────────────
     def _can_sell(self, pos: Position, date, current_price: float) -> bool:
         held_days = (date - pos.entry_date).days
         if held_days >= self.min_hold_days:
@@ -105,9 +99,6 @@ class PortfolioTracker:
             return True
         return False
 
-    # ──────────────────────────────────────────────────────────
-    #  Force exits: trailing stop + max hold
-    # ──────────────────────────────────────────────────────────
     def force_exits(self, date, prices, **kw) -> List[str]:
         force_sold = []
         for ticker in list(self.positions):
@@ -128,11 +119,11 @@ class PortfolioTracker:
             drawdown_from_peak = (price - pos.peak_price) / pos.peak_price
             drawdown_from_entry = (price - pos.entry_price) / pos.entry_price
 
-            # Diagnostic: catch positions with large losses
             if drawdown_from_entry < -0.25:
                 log.warning(
-                    "  ⚠ BIG LOSS %-10s  from_entry=%.1f%%  from_peak=%.1f%%  "
-                    "price=$%.2f  peak=$%.2f  entry=$%.2f  held=%dd",
+                    "  ⚠ BIG LOSS %-10s  from_entry=%.1f%%  "
+                    "from_peak=%.1f%%  price=$%.2f  peak=$%.2f  "
+                    "entry=$%.2f  held=%dd",
                     ticker,
                     drawdown_from_entry * 100,
                     drawdown_from_peak * 100,
@@ -143,7 +134,9 @@ class PortfolioTracker:
             exit_type = None
 
             if held_days >= self.max_hold_days:
-                reason = f"max_hold ({held_days}d >= {self.max_hold_days}d)"
+                reason = (
+                    f"max_hold ({held_days}d >= {self.max_hold_days}d)"
+                )
                 exit_type = "force_exit_max_hold"
             elif drawdown_from_peak <= -self.trailing_stop_pct:
                 reason = (
@@ -159,9 +152,6 @@ class PortfolioTracker:
 
         return force_sold
 
-    # ──────────────────────────────────────────────────────────
-    #  Upgrade — swap weak held position for strong candidate
-    # ──────────────────────────────────────────────────────────
     def try_upgrades(
         self,
         date,
@@ -223,7 +213,112 @@ class PortfolioTracker:
         return swaps
 
     # ──────────────────────────────────────────────────────────
-    #  Process signals — accepts per-ticker position sizes
+    #  BLENDED BUY RANKING — momentum/beta tilt
+    # ──────────────────────────────────────────────────────────
+    def _rank_buy_candidates(
+        self,
+        buy_tickers: List[str],
+        scores: Dict[str, float],
+        momentum_metrics: Dict[str, Dict[str, float]],
+        trailing_vols: Dict[str, float],
+        params: Dict,
+    ) -> List[str]:
+        """
+        Re-rank buy candidates: blended composite + momentum/vol preference.
+        """
+        if not buy_tickers:
+            return []
+
+        tilt = params.get("momentum_tilt", 0.4)
+        vol_weight = params.get("vol_preference", 0.3)
+
+        n = len(buy_tickers)
+        if n == 1:
+            return buy_tickers
+
+        # ── Compute composite rank (percentile) ──────────────
+        score_sorted = sorted(
+            buy_tickers, key=lambda t: scores.get(t, 0.0)
+        )
+        composite_rank = {
+            t: i / max(n - 1, 1) for i, t in enumerate(score_sorted)
+        }
+
+        # ── Compute momentum rank ────────────────────────────
+        momentum_raw = {}
+        for t in buy_tickers:
+            mm = momentum_metrics.get(t, {})
+            rs = mm.get("rszscore", mm.get("rs_zscore", 0.0))
+            rsi = mm.get("rsi14", mm.get("rsi_14", 50.0))
+            vol = trailing_vols.get(t, 0.30)
+            # Also try realizedvol20d from pipeline
+            if vol == 0.30 and "realizedvol20d" in mm:
+                vol = mm["realizedvol20d"]
+
+            # Normalize RSI to 0-1 scale (30-70 → 0-1)
+            rsi_norm = max(0.0, min(1.0, (rsi - 30) / 40.0))
+
+            # Normalize RS z-score (-3 to +3 → 0-1)
+            rs_norm = max(0.0, min(1.0, (rs + 2.0) / 4.0))
+
+            # Normalize vol (0.15 to 0.80 → 0-1)
+            vol_norm = max(0.0, min(1.0, (vol - 0.15) / 0.65))
+
+            # Blend: RS primary, vol as configured, RSI secondary
+            rs_weight = max(0.3, 1.0 - vol_weight - 0.2)
+            momentum_raw[t] = (
+                rs_norm * rs_weight
+                + vol_norm * vol_weight
+                + rsi_norm * 0.2
+            )
+
+        # Rank momentum (percentile)
+        mom_sorted = sorted(
+            buy_tickers, key=lambda t: momentum_raw.get(t, 0.0)
+        )
+        momentum_rank = {
+            t: i / max(n - 1, 1) for i, t in enumerate(mom_sorted)
+        }
+
+        # ── Blend ────────────────────────────────────────────
+        blended = {}
+        for t in buy_tickers:
+            blended[t] = (
+                composite_rank[t] * (1.0 - tilt)
+                + momentum_rank[t] * tilt
+            )
+
+        result = sorted(
+            buy_tickers, key=lambda t: blended[t], reverse=True
+        )
+
+        # ── Log ranking (first time + every 50th) ────────────
+        if not self._ranking_logged and len(result) >= 2:
+            log.info(
+                "  RANKING (tilt=%.2f, vol_pref=%.2f):",
+                tilt, vol_weight,
+            )
+            for t in result[:6]:
+                mm = momentum_metrics.get(t, {})
+                log.info(
+                    "    %-12s  comp_rank=%.2f  mom_rank=%.2f  "
+                    "blended=%.3f  score=%.3f  rs=%.2f  vol=%.3f  "
+                    "rsi=%.1f",
+                    t,
+                    composite_rank.get(t, 0),
+                    momentum_rank.get(t, 0),
+                    blended.get(t, 0),
+                    scores.get(t, 0),
+                    mm.get("rszscore", mm.get("rs_zscore", 0)),
+                    trailing_vols.get(t, 0),
+                    mm.get("rsi14", mm.get("rsi_14", 0)),
+                )
+            self._ranking_logged = True
+
+        return result
+
+    # ──────────────────────────────────────────────────────────
+    #  Process signals — with momentum-tilted ranking
     # ──────────────────────────────────────────────────────────
     def process_signals(
         self,
@@ -233,9 +328,15 @@ class PortfolioTracker:
         scores: Optional[Dict[str, float]] = None,
         current_nav: Optional[float] = None,
         position_sizes: Optional[Dict[str, float]] = None,
+        momentum_metrics: Optional[Dict[str, Dict[str, float]]] = None,
+        trailing_vols: Optional[Dict[str, float]] = None,
+        buy_ranking_params: Optional[Dict] = None,
     ) -> None:
         scores = scores or {}
         position_sizes = position_sizes or {}
+        momentum_metrics = momentum_metrics or {}
+        trailing_vols = trailing_vols or {}
+        buy_ranking_params = buy_ranking_params or {}
 
         # ── sells first (respect min hold) ────────────────────
         blocked_sells = []
@@ -245,7 +346,10 @@ class PortfolioTracker:
                     continue
                 pos = self.positions[ticker]
                 if self._can_sell(pos, date, prices[ticker]):
-                    self._sell(date, ticker, prices[ticker], exit_type="signal_exit")
+                    self._sell(
+                        date, ticker, prices[ticker],
+                        exit_type="signal_exit",
+                    )
                 else:
                     held = (date - pos.entry_date).days
                     blocked_sells.append((ticker, held))
@@ -258,7 +362,7 @@ class PortfolioTracker:
                 [(t, f"{d}d") for t, d in blocked_sells[:5]],
             )
 
-        # ── then buys — SORTED BY SCORE (highest first) ──────
+        # ── then buys — MOMENTUM-TILTED RANKING ──────────────
         buy_tickers = [
             t
             for t, a in actions.items()
@@ -266,14 +370,27 @@ class PortfolioTracker:
             and t not in self.positions
             and t in prices
         ]
-        buy_tickers.sort(key=lambda t: scores.get(t, 0.0), reverse=True)
+
+        # Apply blended ranking (composite + momentum/beta tilt)
+        if buy_tickers and (momentum_metrics or trailing_vols):
+            buy_tickers = self._rank_buy_candidates(
+                buy_tickers,
+                scores=scores,
+                momentum_metrics=momentum_metrics,
+                trailing_vols=trailing_vols,
+                params=buy_ranking_params,
+            )
+        else:
+            # Fallback: pure composite score ranking
+            buy_tickers.sort(
+                key=lambda t: scores.get(t, 0.0), reverse=True
+            )
 
         slots = self.max_positions - len(self.positions)
         if slots <= 0 or not buy_tickers:
             return
 
         for ticker in buy_tickers[:slots]:
-            # Pass per-ticker weight if available
             ticker_weight = position_sizes.get(ticker)
             self._buy(
                 date, ticker, prices[ticker],
@@ -281,28 +398,13 @@ class PortfolioTracker:
                 target_weight=ticker_weight,
             )
 
-    # ──────────────────────────────────────────────────────────
-    #  Update held positions' scores (call each day)
-    # ──────────────────────────────────────────────────────────
     def update_scores(self, scores: Dict[str, float]) -> None:
         for ticker, pos in self.positions.items():
             if ticker in scores:
                 pos.latest_score = scores[ticker]
 
     # ──────────────────────────────────────────────────────────
-    #  Buy — VARIABLE SIZING: uses per-ticker weight if provided
-    #
-    #  Priority:
-    #    1. target_weight (from pipeline's position_pct column)
-    #    2. Equal-weight fallback: 1 / max_positions
-    #
-    #  The weight is interpreted as a fraction of NAV.
-    #  E.g. 0.12 means "allocate 12% of NAV to this position".
-    #
-    #  Constraints:
-    #    - Never exceed 95% of available cash
-    #    - Never exceed 25% of NAV (hard cap per position)
-    #    - Minimum $1,000 target value to avoid dust trades
+    #  Buy — VARIABLE SIZING
     # ──────────────────────────────────────────────────────────
     def _buy(
         self,
@@ -316,19 +418,15 @@ class PortfolioTracker:
 
         sizing_nav = current_nav if current_nav else self.nav
 
-        # Determine position weight
         if target_weight is not None and target_weight > 0:
-            # Use pipeline-provided weight, capped at 25% of NAV
             weight = min(target_weight, 0.25)
             slot_target = sizing_nav * weight
             sizing_source = f"pipeline_weight={target_weight:.3f}"
         else:
-            # Equal-weight fallback
             weight = 1.0 / self.max_positions
             slot_target = sizing_nav * weight
             sizing_source = f"equal_weight=1/{self.max_positions}"
 
-        # Cap at 95% of available cash
         target_value = min(slot_target, self.cash * 0.95)
 
         if target_value < 1_000:
@@ -384,7 +482,7 @@ class PortfolioTracker:
         )
 
     # ──────────────────────────────────────────────────────────
-    #  Sell — tags exit_type for attribution
+    #  Sell
     # ──────────────────────────────────────────────────────────
     def _sell(
         self,
@@ -440,10 +538,9 @@ class PortfolioTracker:
             exit_type or "unknown",
         )
 
-    # ──────────────────────────────────────────────────────────
-    #  Mark-to-market — updates peak + current_price
-    # ──────────────────────────────────────────────────────────
-    def mark_to_market(self, date, close_prices: Dict[str, float]) -> float:
+    def mark_to_market(
+        self, date, close_prices: Dict[str, float]
+    ) -> float:
         pos_val = 0.0
         for t, p in self.positions.items():
             price = close_prices.get(t, p.current_price)

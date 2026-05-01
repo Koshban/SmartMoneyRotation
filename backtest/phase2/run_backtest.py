@@ -179,6 +179,27 @@ CONFIG = {
     "action_params":      ACTIONPARAMS_V2,
     "breadth_params":     BREADTHPARAMS,
     "rotation_params":    ROTATIONPARAMS,
+    "buy_ranking_params": {
+    # How much to tilt toward momentum/beta (0=pure composite, 1=pure momentum)
+    "momentum_tilt": 0.50,
+
+    # Within the momentum signal, how much weight to give volatility (beta proxy)
+    "vol_preference": 0.30,
+
+    # FILTER: skip any ticker with annualized vol below this (kills bonds/utilities)
+    # SPY is ~15-20%, high-beta growth is 35-60%. Set to 0.25 to filter out low-vol.
+    "min_trailing_vol": 0.25,
+
+    # FILTER: skip any ticker with RS z-score below this (underperformers)
+    # 0.0 = must be at least matching benchmark. -0.5 = slight underperformance ok.
+    "min_rszscore": 0.0,
+
+    # Lookback window for trailing vol computation (trading days)
+    "vol_window": 60,
+
+    # Whether to compute/use realized vol at all
+    "use_realized_vol": True,
+},
 }
 
 

@@ -3,20 +3,19 @@ backtest/phase2/engine.py
 Core backtesting engine with pre-computed indicators for speed.
 
 Fixes applied:
+  - SIZING COLUMN FIX: searches for 'sigpositionpct_v2' (pipeline's actual output)
+  - HARD BETA FILTER: filters out low-vol names at action extraction time
+  - MOMENTUM TILT: buy ranking blends composite + momentum preference
   - EXIT DOUBLE-GATE REMOVED: sigexit_v2=1 on held tickers → SELL regardless
-    of action_v2 column. The signal layer's exit flag is authoritative.
-  - force_exits() runs unconditionally every day (not gated by prev_actions)
-  - process_signals() receives prev_scores
-  - try_upgrades() called exactly once per day
+  - force_exits() runs unconditionally every day
   - Position sizing uses current NAV (not frozen initial_capital)
-  - Exit metadata captured on closed trades for post-hoc analysis
-  - Daily debug spam moved to DEBUG level, only on first occurrence
-  - VARIABLE POSITION SIZING: extracts per-ticker position_pct from pipeline
+  - Exit metadata captured on closed trades
 """
 from __future__ import annotations
 
 import logging
 import time
+import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Set
 
@@ -56,13 +55,15 @@ class BacktestEngine:
         self.equity_curve: List[tuple] = []
         self.action_history: Dict = {}
 
-        # Pre-computed caches (populated in _precompute_all)
+        # Pre-computed caches
         self._precomputed_frames: Dict[str, pd.DataFrame] = {}
         self._precomputed_regime_df: pd.DataFrame | None = None
 
         # Diagnostic tracking
         self._columns_logged: bool = False
         self._sizing_logged: bool = False
+        self._momentum_logged: bool = False
+        self._beta_filter_logged: bool = False
         self._exit_source_counts: Dict[str, int] = {
             "signal_exit": 0,
             "force_exit_trailing": 0,
@@ -70,10 +71,15 @@ class BacktestEngine:
             "force_exit_other": 0,
         }
 
+        # Buy ranking config
+        self._buy_ranking_params = config.get("buy_ranking_params", {}) or {}
+
+    # ==================================================================
+    #  EXTRACT SCORES
+    # ==================================================================
     def _extract_scores(self, output: Dict) -> Dict[str, float]:
-        """Pull composite scores from the pipeline output table."""
         scores: Dict[str, float] = {}
-        for key in ("action_table", "snapshot", "actions"):
+        for key in ("action_table", "latest", "snapshot", "actions"):
             if key not in output:
                 continue
             df = output[key]
@@ -81,8 +87,8 @@ class BacktestEngine:
                 continue
             score_col = next(
                 (c for c in (
-                    "composite_v2", "scorecomposite_v2", "composite", "score",
-                    "total_score", "weighted_score",
+                    "scorecomposite_v2", "scoreadjusted_v2", "composite",
+                    "score", "total_score", "weighted_score",
                 ) if c in df.columns),
                 None,
             )
@@ -100,31 +106,105 @@ class BacktestEngine:
         return scores
 
     # ==================================================================
-    #  POSITION SIZING EXTRACTION — reads per-ticker weights from pipeline
+    #  MOMENTUM / BETA METRICS EXTRACTION
+    # ==================================================================
+    def _extract_momentum_metrics(self, output: Dict) -> Dict[str, Dict[str, float]]:
+        """
+        Extract per-ticker momentum and volatility metrics from pipeline output.
+        Returns {ticker: {rszscore, rsi14, adx14, realized_vol, closevsema30pct, ...}}
+        """
+        metrics: Dict[str, Dict[str, float]] = {}
+
+        MOMENTUM_COLS = (
+            "rszscore", "rs_zscore", "rsz_score",
+            "rsi14", "rsi_14",
+            "adx14", "adx_14",
+            "closevsema30pct", "close_vs_ema30_pct",
+            "realizedvol20d", "realized_vol", "hist_vol", "atr_pct", "atr14pct",
+            "macdhist", "macd_hist",
+            "relativevolume",
+        )
+
+        for key in ("action_table", "latest", "snapshot"):
+            df = output.get(key)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            available = [c for c in MOMENTUM_COLS if c in df.columns]
+            if not available:
+                continue
+
+            if not self._momentum_logged:
+                log.info(
+                    "[%s] MOMENTUM METRICS: found columns %s in '%s' (%d rows)",
+                    self.config_name, available, key, len(df),
+                )
+                self._momentum_logged = True
+
+            ticker_in_col = "ticker" in df.columns
+            for idx, row in df.iterrows():
+                ticker = str(row["ticker"]) if ticker_in_col else str(idx)
+                m = {}
+                for col in available:
+                    try:
+                        val = float(row[col])
+                        if pd.notna(val):
+                            m[col] = val
+                    except (TypeError, ValueError):
+                        pass
+                if m:
+                    metrics[ticker] = m
+            break
+
+        return metrics
+
+    # ==================================================================
+    #  COMPUTE REALIZED VOLATILITY (beta proxy) from precomputed frames
+    # ==================================================================
+    def _compute_trailing_vol(
+        self, day, tickers: List[str], window: int = 60
+    ) -> Dict[str, float]:
+        cutoff = pd.Timestamp(day)
+        vols: Dict[str, float] = {}
+
+        for t in tickers:
+            df = self._precomputed_frames.get(t)
+            if df is None or df.empty:
+                continue
+            sliced = df.loc[df.index <= cutoff]
+            if len(sliced) < window:
+                # Use whatever we have if at least 20 bars
+                if len(sliced) < 20:
+                    continue
+                recent = sliced["close"].iloc[-len(sliced):]
+            else:
+                recent = sliced["close"].iloc[-window:]
+            rets = recent.pct_change().dropna()
+            if len(rets) > 10:
+                vols[t] = float(rets.std() * np.sqrt(252))
+
+        return vols
+
+    # ==================================================================
+    #  POSITION SIZING EXTRACTION — FIXED column name
     # ==================================================================
     def _extract_position_sizes(self, output: Dict) -> Dict[str, float]:
         """
         Extract per-ticker position sizing from the pipeline output.
-
-        Looks for columns (in priority order):
-          - position_pct / position_size_pct
-          - weight / target_weight
-          - confidence / signal_strength
-          - size_multiplier
-
-        Returns {ticker: weight} where weight is a fraction (e.g. 0.10 = 10%).
-        If no sizing column found, returns empty dict (caller uses equal-weight).
+        Returns {ticker: weight} where weight is a fraction of NAV.
         """
         sizing: Dict[str, float] = {}
 
+        # ── FIXED: added 'sigpositionpct_v2' which is what signals_v2.py produces
         SIZING_CANDIDATES = (
+            "sigpositionpct_v2", "sigpositionpct",
             "position_pct", "position_size_pct",
             "weight", "target_weight",
             "confidence", "signal_strength",
             "size_multiplier", "size_mult",
         )
 
-        for key in ("action_table", "snapshot", "actions"):
+        for key in ("action_table", "latest", "snapshot", "actions"):
             if key not in output:
                 continue
             df = output[key]
@@ -138,13 +218,11 @@ class BacktestEngine:
             if size_col is None:
                 continue
 
-            # Log which column we found (once)
             if not self._sizing_logged:
                 log.info(
                     "[%s] SIZING: using column '%s' from pipeline output '%s'",
                     self.config_name, size_col, key,
                 )
-                # Show sample values
                 sample = df[size_col].dropna().head(5)
                 log.info(
                     "[%s] SIZING sample values: %s",
@@ -166,20 +244,16 @@ class BacktestEngine:
         return sizing
 
     # ==================================================================
-    #  EXIT METADATA EXTRACTION — for trade-level audit trail
+    #  EXIT METADATA EXTRACTION
     # ==================================================================
     def _extract_exit_metadata(self, output: Dict) -> Dict[str, Dict[str, Any]]:
-        """
-        Extract per-ticker exit diagnostic fields from the pipeline output.
-        Returns {ticker: {exit_reason, exit_momentum, ..., indicator values}}.
-        """
         metadata: Dict[str, Dict[str, Any]] = {}
-        for key in ("action_table", "snapshot"):
+        for key in ("action_table", "latest", "snapshot"):
             df = output.get(key)
             if not isinstance(df, pd.DataFrame) or df.empty:
                 continue
             if "exit_reason" not in df.columns:
-                break
+                continue
 
             ticker_in_col = "ticker" in df.columns
             for idx, row in df.iterrows():
@@ -194,9 +268,13 @@ class BacktestEngine:
                     "rsi_at_exit": float(row.get("rsi14", 0) or 0),
                     "adx_at_exit": float(row.get("adx14", 0) or 0),
                     "macdhist_at_exit": float(row.get("macdhist", 0) or 0),
-                    "closevsema30_at_exit": float(row.get("closevsema30pct", 0) or 0),
+                    "closevsema30_at_exit": float(
+                        row.get("closevsema30pct", 0) or 0
+                    ),
                     "rszscore_at_exit": float(row.get("rszscore", 0) or 0),
-                    "composite_at_exit": float(row.get("scorecomposite_v2", 0) or 0),
+                    "composite_at_exit": float(
+                        row.get("scorecomposite_v2", 0) or 0
+                    ),
                 }
             break
         return metadata
@@ -207,18 +285,11 @@ class BacktestEngine:
     def _extract_exit_flags(
         self, output: Dict, held_tickers: Set[str]
     ) -> Set[str]:
-        """
-        Scan pipeline output for held tickers with sigexit_v2 >= 1.
-        This is INDEPENDENT of the action_v2 column — the signal layer's
-        exit flag is authoritative for held positions.
-
-        Returns set of tickers that should be sold.
-        """
         if not held_tickers:
             return set()
 
         exit_tickers: Set[str] = set()
-        for key in ("action_table", "snapshot"):
+        for key in ("action_table", "latest", "snapshot"):
             df = output.get(key)
             if not isinstance(df, pd.DataFrame) or df.empty:
                 continue
@@ -229,7 +300,7 @@ class BacktestEngine:
                 None,
             )
             if exit_col is None:
-                break
+                continue
 
             ticker_in_col = "ticker" in df.columns
             for idx, row in df.iterrows():
@@ -255,14 +326,10 @@ class BacktestEngine:
         return exit_tickers
 
     # ==================================================================
-    #  EXIT CHURN DIAGNOSTIC — log distribution when churn is extreme
+    #  EXIT CHURN DIAGNOSTIC
     # ==================================================================
     def _log_exit_churn_diagnostic(self, output: Dict, day) -> None:
-        """
-        When >60% of the universe is flagged for exit, log the underlying
-        indicator distributions to diagnose threshold calibration.
-        """
-        for key in ("action_table", "snapshot"):
+        for key in ("action_table", "latest", "snapshot"):
             df = output.get(key)
             if not isinstance(df, pd.DataFrame) or df.empty:
                 continue
@@ -282,8 +349,8 @@ class BacktestEngine:
                     )
                     log.warning(
                         "[%s] %s EXIT DEEP DIVE — closevsema30pct: "
-                        "min=%.4f p10=%.4f p25=%.4f med=%.4f p75=%.4f max=%.4f | "
-                        "exit_trend=%d/%d tickers",
+                        "min=%.4f p10=%.4f p25=%.4f med=%.4f p75=%.4f "
+                        "max=%.4f | exit_trend=%d/%d tickers",
                         self.config_name,
                         day.strftime("%Y-%m-%d"),
                         float(col.min()),
@@ -305,8 +372,8 @@ class BacktestEngine:
                     )
                     log.warning(
                         "[%s] %s EXIT DEEP DIVE — rsi14: "
-                        "min=%.1f p10=%.1f p25=%.1f med=%.1f p75=%.1f max=%.1f | "
-                        "exit_momentum=%d/%d tickers",
+                        "min=%.1f p10=%.1f p25=%.1f med=%.1f p75=%.1f "
+                        "max=%.1f | exit_momentum=%d/%d tickers",
                         self.config_name,
                         day.strftime("%Y-%m-%d"),
                         float(rsi.min()),
@@ -328,8 +395,8 @@ class BacktestEngine:
                     )
                     log.warning(
                         "[%s] %s EXIT DEEP DIVE — rszscore: "
-                        "min=%.3f p10=%.3f p25=%.3f med=%.3f p75=%.3f max=%.3f | "
-                        "exit_rs=%d/%d tickers",
+                        "min=%.3f p10=%.3f p25=%.3f med=%.3f p75=%.3f "
+                        "max=%.3f | exit_rs=%d/%d tickers",
                         self.config_name,
                         day.strftime("%Y-%m-%d"),
                         float(rs.min()),
@@ -344,14 +411,9 @@ class BacktestEngine:
             break
 
     # ==================================================================
-    #  PRE-COMPUTATION — run all expensive rolling ops ONCE
+    #  PRE-COMPUTATION
     # ==================================================================
     def _precompute_all(self):
-        """
-        Pre-compute per-ticker indicators, RS z-scores, and benchmark
-        regime on the FULL history.  Each backtest day then just slices
-        into these frames — no recomputation.
-        """
         from refactor.pipeline_v2 import (
             _canonicalize_indicator_columns,
             _fill_missing_indicators,
@@ -364,7 +426,6 @@ class BacktestEngine:
 
         t0 = time.time()
 
-        # 1 — per-ticker indicators
         raw_frames = {}
         for ticker, df in self.data_source.ticker_data.items():
             if df is not None and not df.empty:
@@ -379,7 +440,6 @@ class BacktestEngine:
             self.config_name, len(raw_frames), time.time() - t0,
         )
 
-        # 2 — cross-sectional RS z-scores + regimes
         t1 = time.time()
         bench_df = self.data_source.benchmark_data
         if bench_df is not None and not bench_df.empty:
@@ -394,7 +454,6 @@ class BacktestEngine:
             self.config_name, time.time() - t1,
         )
 
-        # 3 — annotate scoreability
         for ticker in raw_frames:
             raw_frames[ticker] = annotate_scoreability(raw_frames[ticker])
 
@@ -405,10 +464,96 @@ class BacktestEngine:
         )
 
     # ==================================================================
-    #  CURRENT NAV CALCULATION — for dynamic position sizing
+    #  CURRENT NAV CALCULATION
     # ==================================================================
     def _compute_current_nav(self, tracker: PortfolioTracker) -> float:
         return tracker.nav
+
+    # ==================================================================
+    #  HARD BETA FILTER — applied at action extraction time
+    # ==================================================================
+    def _apply_beta_filter(
+        self,
+        actions: Dict[str, str],
+        day,
+        momentum_metrics: Dict[str, Dict[str, float]],
+    ) -> Dict[str, str]:
+        """
+        Remove BUY/STRONG_BUY actions for tickers that fail the hard beta filter.
+        This ensures low-beta names NEVER enter the portfolio regardless of score.
+
+        Uses realizedvol20d from pipeline output or trailing vol computation.
+        """
+        brp = self._buy_ranking_params
+        min_vol = brp.get("min_trailing_vol", 0.0)
+        min_rs = brp.get("min_rszscore", -99.0)
+
+        if min_vol <= 0 and min_rs <= -99:
+            return actions  # no filter configured
+
+        buy_tickers = [
+            t for t, a in actions.items() if a in ("BUY", "STRONG_BUY")
+        ]
+        if not buy_tickers:
+            return actions
+
+        # Compute trailing vol for buy candidates
+        trailing_vols = self._compute_trailing_vol(
+            day, buy_tickers, window=brp.get("vol_window", 60)
+        )
+
+        filtered_out = []
+        for t in buy_tickers:
+            vol = trailing_vols.get(t, 0.0)
+            mm = momentum_metrics.get(t, {})
+            # Try realizedvol20d from pipeline if trailing vol not available
+            if vol == 0.0:
+                vol = mm.get("realizedvol20d", mm.get("atr14pct", 0.0))
+                # atr14pct is daily, rough annualize
+                if vol > 0 and vol < 0.10:
+                    vol = vol * np.sqrt(252)
+
+            rs = mm.get("rszscore", mm.get("rs_zscore", 0.0))
+
+            remove = False
+            reason_parts = []
+
+            if min_vol > 0 and vol < min_vol and vol > 0:
+                remove = True
+                reason_parts.append(
+                    f"vol={vol:.3f}<{min_vol:.3f}"
+                )
+
+            if min_rs > -99 and rs < min_rs:
+                remove = True
+                reason_parts.append(
+                    f"rs={rs:.2f}<{min_rs:.2f}"
+                )
+
+            if remove:
+                filtered_out.append((t, "; ".join(reason_parts)))
+                actions[t] = "HOLD"  # downgrade to HOLD, don't buy
+
+        if filtered_out:
+            if not self._beta_filter_logged:
+                log.info(
+                    "[%s] BETA FILTER CONFIG: min_trailing_vol=%.3f "
+                    "min_rszscore=%.2f vol_window=%d",
+                    self.config_name, min_vol, min_rs,
+                    brp.get("vol_window", 60),
+                )
+                self._beta_filter_logged = True
+
+            log.info(
+                "[%s] %s BETA FILTER removed %d/%d buy candidates: %s",
+                self.config_name,
+                day.strftime("%Y-%m-%d"),
+                len(filtered_out),
+                len(buy_tickers),
+                [(t, r) for t, r in filtered_out[:8]],
+            )
+
+        return actions
 
     # ==================================================================
     #  MAIN LOOP
@@ -423,10 +568,8 @@ class BacktestEngine:
                 f"No trading days between {self.start_date} and {self.end_date}"
             )
 
-        # ── pre-compute everything once ───────────────────────
         self._precompute_all()
 
-        # ── read min-hold params from signal config ───────────
         sig_params = self.config.get("signal_params", {}) or {}
         min_hold = sig_params.get("min_hold_days", 5)
         min_profit = sig_params.get("min_profit_early_exit_pct", 0.05)
@@ -443,6 +586,29 @@ class BacktestEngine:
             upgrade_min_score_gap=sig_params.get("upgrade_min_score_gap", 999),
         )
 
+        # Log buy ranking config
+        brp = self._buy_ranking_params
+        log.info(
+            "[%s] BUY RANKING CONFIG: momentum_tilt=%.2f  "
+            "min_vol=%.3f  vol_preference=%.2f  "
+            "min_rszscore=%.2f  use_realized_vol=%s  vol_window=%d",
+            self.config_name,
+            brp.get("momentum_tilt", 0.4),
+            brp.get("min_trailing_vol", 0.0),
+            brp.get("vol_preference", 0.3),
+            brp.get("min_rszscore", -99),
+            brp.get("use_realized_vol", True),
+            brp.get("vol_window", 60),
+        )
+
+        if not brp:
+            log.warning(
+                "[%s] ⚠ buy_ranking_params IS EMPTY — using all defaults. "
+                "No beta filter will be applied! Add buy_ranking_params to "
+                "your config dict.",
+                self.config_name,
+            )
+
         log.info(
             "[%s] backtest %s → %s  (%d days, %d tickers)  "
             "min_hold=%dd  min_profit=%.0f%%  trailing_stop=%.0f%%  "
@@ -456,11 +622,12 @@ class BacktestEngine:
         prev_actions: Dict[str, str] = {}
         prev_scores: Dict[str, float] = {}
         prev_sizes: Dict[str, float] = {}
+        prev_momentum: Dict[str, Dict[str, float]] = {}
+        prev_trailing_vol: Dict[str, float] = {}
         prev_exit_metadata: Dict[str, Dict[str, Any]] = {}
         prev_exit_tickers: Set[str] = set()
         bench_start_close: float | None = None
 
-        # Cash utilization tracking
         cash_utilization_pcts: List[float] = []
 
         for i, day in enumerate(trading_days):
@@ -469,22 +636,28 @@ class BacktestEngine:
             try:
                 output = self._run_pipeline_fast(day, tickers)
 
-                # Debug: log columns only once (not every day)
+                # Debug: log columns only once
                 if not self._columns_logged:
-                    for key in ("action_table", "snapshot"):
+                    for key in ("action_table", "latest", "snapshot"):
                         df = output.get(key)
-                        if isinstance(df, pd.DataFrame):
+                        if isinstance(df, pd.DataFrame) and not df.empty:
                             log.info(
-                                "[%s] Pipeline output '%s' columns: %s",
-                                self.config_name, key, list(df.columns),
+                                "[%s] Pipeline output '%s' columns (%d): %s",
+                                self.config_name, key, len(df.columns),
+                                list(df.columns),
                             )
-                            if "sigexit_v2" in df.columns:
-                                log.info(
-                                    "[%s] sigexit_v2 present — exit signal "
-                                    "path is active",
-                                    self.config_name,
-                                )
-                            else:
+                            # Check for critical columns
+                            has_exit = "sigexit_v2" in df.columns
+                            has_sizing = "sigpositionpct_v2" in df.columns
+                            has_rs = "rszscore" in df.columns
+                            has_rsi = "rsi14" in df.columns
+                            log.info(
+                                "[%s] Critical columns: sigexit_v2=%s "
+                                "sigpositionpct_v2=%s rszscore=%s rsi14=%s",
+                                self.config_name,
+                                has_exit, has_sizing, has_rs, has_rsi,
+                            )
+                            if not has_exit:
                                 log.warning(
                                     "[%s] sigexit_v2 NOT in output — exits "
                                     "will only fire via force_exits!",
@@ -493,21 +666,39 @@ class BacktestEngine:
                             self._columns_logged = True
                             break
 
-                # Log exit churn diagnostic when extreme
                 self._log_exit_churn_diagnostic(output, day)
 
                 held = set(tracker.positions.keys())
                 actions = self._extract_actions(output, held_tickers=held)
                 scores = self._extract_scores(output)
                 sizes = self._extract_position_sizes(output)
+                momentum = self._extract_momentum_metrics(output)
 
-                # ── CRITICAL FIX: Extract exit flags DIRECTLY ──────
+                # ── HARD BETA FILTER: remove low-vol BUY actions ──────
+                actions = self._apply_beta_filter(actions, day, momentum)
+
+                # Compute trailing vol for remaining buy candidates
+                buy_candidates = [
+                    t for t, a in actions.items()
+                    if a in ("BUY", "STRONG_BUY")
+                ]
+                if buy_candidates and brp.get("use_realized_vol", True):
+                    trailing_vol = self._compute_trailing_vol(
+                        day, buy_candidates,
+                        window=brp.get("vol_window", 60),
+                    )
+                else:
+                    trailing_vol = {}
+
+                # ── Extract exit flags DIRECTLY ────────────────────────
                 exit_tickers = self._extract_exit_flags(output, held)
 
-                # Merge direct exit flags into actions
+                # Merge exit flags into actions
                 for ticker in exit_tickers:
                     if ticker not in actions or actions[ticker] != "SELL":
-                        if ticker in actions and actions[ticker] in ("BUY", "STRONG_BUY"):
+                        if ticker in actions and actions[ticker] in (
+                            "BUY", "STRONG_BUY"
+                        ):
                             log.warning(
                                 "[%s] %s CONFLICT: %s has BUY action but "
                                 "sigexit_v2=1 (held). Forcing SELL.",
@@ -517,7 +708,6 @@ class BacktestEngine:
                             )
                         actions[ticker] = "SELL"
 
-                # Extract exit metadata for trade-level audit trail
                 exit_metadata = self._extract_exit_metadata(output)
 
             except Exception as exc:
@@ -526,32 +716,35 @@ class BacktestEngine:
                     self.config_name, day.strftime("%Y-%m-%d"), exc,
                 )
                 actions, scores, sizes = {}, {}, {}
+                momentum, trailing_vol = {}, {}
                 exit_metadata = {}
                 exit_tickers = set()
 
             # ── 2. log signals ────────────────────────────────
-            buy_sigs = [t for t, a in actions.items() if a in ("BUY", "STRONG_BUY")]
+            buy_sigs = [
+                t for t, a in actions.items()
+                if a in ("BUY", "STRONG_BUY")
+            ]
             sell_sigs = [t for t, a in actions.items() if a == "SELL"]
             if buy_sigs or sell_sigs:
                 log.info(
-                    "[%s] %s  BUY %s | SELL %s",
+                    "[%s] %s  BUY(%d) %s | SELL(%d) %s",
                     self.config_name,
                     day.strftime("%Y-%m-%d"),
-                    buy_sigs if buy_sigs else "—",
-                    sell_sigs if sell_sigs else "—",
+                    len(buy_sigs),
+                    buy_sigs[:8] if buy_sigs else "—",
+                    len(sell_sigs),
+                    sell_sigs[:8] if sell_sigs else "—",
                 )
 
             # ── 3. execute PREVIOUS day's signals at TODAY's open ─
             prices_open = self._prices_fast(day, tickers, field="open")
 
             if i > 0:
-                # snapshot closed trade count before execution
                 n_closed_before = len(tracker.closed_trades)
 
                 # 3a — force-exit stale / stopped-out positions
                 tracker.force_exits(day, prices_open)
-
-                # Count force exits
                 n_force_closed = len(tracker.closed_trades) - n_closed_before
 
                 # 3b — signal-driven sells + score-ranked buys
@@ -562,10 +755,13 @@ class BacktestEngine:
                         day, prev_actions, prices_open,
                         scores=prev_scores,
                         current_nav=current_nav,
-                        position_sizes=prev_sizes,  # ← NEW: per-ticker sizing
+                        position_sizes=prev_sizes,
+                        momentum_metrics=prev_momentum,
+                        trailing_vols=prev_trailing_vol,
+                        buy_ranking_params=self._buy_ranking_params,
                     )
 
-                # 3c — upgrade weak held positions (single call)
+                # 3c — upgrade weak held positions
                 if prev_scores:
                     swaps = tracker.try_upgrades(
                         day,
@@ -582,27 +778,27 @@ class BacktestEngine:
                             swaps,
                         )
 
-                # Attach exit metadata to newly closed trades
+                # Attach exit metadata
                 n_closed_after = len(tracker.closed_trades)
                 if n_closed_after > n_closed_before:
                     for j, trade in enumerate(
                         tracker.closed_trades[n_closed_before:n_closed_after]
                     ):
                         ticker = trade.get("ticker", "")
-
-                        # Determine exit source
                         if j < n_force_closed:
-                            source = trade.get("exit_type", "force_exit_other")
+                            source = trade.get(
+                                "exit_type", "force_exit_other"
+                            )
                             trade.setdefault("exit_source", source)
                             self._exit_source_counts[
-                                source if source in self._exit_source_counts
+                                source
+                                if source in self._exit_source_counts
                                 else "force_exit_other"
                             ] += 1
                         else:
                             trade.setdefault("exit_source", "signal_exit")
                             self._exit_source_counts["signal_exit"] += 1
 
-                        # Attach indicator metadata from the exit signal
                         if ticker in prev_exit_metadata:
                             trade.update(prev_exit_metadata[ticker])
                         elif "exit_reason" not in trade:
@@ -614,7 +810,6 @@ class BacktestEngine:
             prices_close = self._prices_fast(day, tickers, field="close")
             port_value = tracker.mark_to_market(day, prices_close)
 
-            # refresh held-position scores for tomorrow's upgrades
             tracker.update_scores(scores)
 
             # ── 5. cash utilization tracking ──────────────────
@@ -627,9 +822,7 @@ class BacktestEngine:
                     if avg_cash > 40:
                         log.warning(
                             "[%s] %s CASH DRAG: avg cash=%.1f%% over last "
-                            "20 days. NAV=$%s but only %d/%d slots filled. "
-                            "Consider: (1) lower entry threshold, "
-                            "(2) lower min_rank_pct, (3) dynamic sizing.",
+                            "20 days. NAV=$%s but only %d/%d slots filled.",
                             self.config_name,
                             day.strftime("%Y-%m-%d"),
                             avg_cash,
@@ -642,7 +835,11 @@ class BacktestEngine:
             bench_value = self._benchmark_value(day, bench_start_close)
             if bench_value is not None and bench_start_close is None:
                 bench_df = self.data_source.benchmark_data
-                if bench_df is not None and not bench_df.empty and day in bench_df.index:
+                if (
+                    bench_df is not None
+                    and not bench_df.empty
+                    and day in bench_df.index
+                ):
                     bench_start_close = float(bench_df.loc[day, "close"])
                     bench_value = self.initial_capital
 
@@ -656,16 +853,21 @@ class BacktestEngine:
                 "cash_pct": 100.0 * tracker.cash / max(port_value, 1),
                 "n_positions": len(tracker.positions),
                 "positions": list(tracker.positions.keys()),
-                "n_buys": sum(1 for a in actions.values()
-                              if a in ("BUY", "STRONG_BUY")),
-                "n_sells": sum(1 for a in actions.values()
-                               if a == "SELL"),
+                "n_buys": sum(
+                    1 for a in actions.values()
+                    if a in ("BUY", "STRONG_BUY")
+                ),
+                "n_sells": sum(
+                    1 for a in actions.values() if a == "SELL"
+                ),
                 "n_exit_flags": len(exit_tickers),
             })
 
             prev_actions = actions
             prev_scores = scores
             prev_sizes = sizes
+            prev_momentum = momentum
+            prev_trailing_vol = trailing_vol
             prev_exit_metadata = exit_metadata
             prev_exit_tickers = exit_tickers
             self.action_history[day] = actions
@@ -689,7 +891,9 @@ class BacktestEngine:
             self.config_name, self._exit_source_counts,
         )
         if cash_utilization_pcts:
-            avg_cash_all = sum(cash_utilization_pcts) / len(cash_utilization_pcts)
+            avg_cash_all = (
+                sum(cash_utilization_pcts) / len(cash_utilization_pcts)
+            )
             log.info(
                 "[%s] CASH UTILIZATION: avg=%.1f%% min=%.1f%% max=%.1f%%",
                 self.config_name,
@@ -698,11 +902,27 @@ class BacktestEngine:
                 max(cash_utilization_pcts),
             )
 
+        # Log beta filter stats
+        if self._beta_filter_logged:
+            log.info(
+                "[%s] BETA FILTER was active during this backtest.",
+                self.config_name,
+            )
+        else:
+            log.warning(
+                "[%s] BETA FILTER never fired. Check buy_ranking_params "
+                "config: min_trailing_vol=%.3f min_rszscore=%.2f",
+                self.config_name,
+                brp.get("min_trailing_vol", 0.0),
+                brp.get("min_rszscore", -99.0),
+            )
+
         return {
             "config_name": self.config_name,
             "config": self.config,
             "equity_curve": pd.DataFrame(
-                self.equity_curve, columns=["date", "value", "benchmark"]
+                self.equity_curve,
+                columns=["date", "value", "benchmark"],
             ),
             "daily_log": pd.DataFrame(self.daily_log),
             "trade_log": (
@@ -720,12 +940,13 @@ class BacktestEngine:
             "exit_source_counts": dict(self._exit_source_counts),
             "avg_cash_pct": (
                 sum(cash_utilization_pcts) / len(cash_utilization_pcts)
-                if cash_utilization_pcts else 0
+                if cash_utilization_pcts
+                else 0
             ),
         }
 
     # ==================================================================
-    #  FAST PIPELINE — uses pre-computed data
+    #  FAST PIPELINE
     # ==================================================================
     def _run_pipeline_fast(self, day, tickers) -> Dict:
         from refactor.pipeline_v2 import run_pipeline_v2
@@ -733,7 +954,6 @@ class BacktestEngine:
         cutoff = pd.Timestamp(day)
         lookback = self.data_source.lookback_bars
 
-        # Slice pre-computed frames to current day
         tradable_frames = {}
         for t in tickers:
             if t not in self._precomputed_frames:
@@ -746,7 +966,6 @@ class BacktestEngine:
                 sliced = sliced.iloc[-lookback:]
             tradable_frames[t] = sliced
 
-        # Slice benchmark
         bench_df = self.data_source.benchmark_data
         if bench_df is not None:
             bench_df = bench_df.loc[bench_df.index <= cutoff]
@@ -776,7 +995,7 @@ class BacktestEngine:
         )
 
     # ==================================================================
-    #  Fast price lookup from pre-computed frames
+    #  Fast price lookup
     # ==================================================================
     def _prices_fast(
         self, day, tickers, field: str = "open"
@@ -812,17 +1031,11 @@ class BacktestEngine:
     def _extract_actions(
         self, output: Dict, held_tickers: Set[str] = None
     ) -> Dict[str, str]:
-        """
-        Extract ticker → action mapping from pipeline output.
-
-        BUY/STRONG_BUY  → BUY  (cross-sectional entry — unheld tickers only)
-        SELL/EXIT       → SELL (held tickers only)
-        """
         if held_tickers is None:
             held_tickers = set()
 
         actions: Dict[str, str] = {}
-        for key in ("action_table", "snapshot", "actions"):
+        for key in ("action_table", "latest", "snapshot", "actions"):
             if key not in output:
                 continue
             df = output[key]
@@ -839,7 +1052,9 @@ class BacktestEngine:
             ticker_in_col = "ticker" in df.columns
 
             for idx, row in df.iterrows():
-                ticker = str(row["ticker"]) if ticker_in_col else str(idx)
+                ticker = (
+                    str(row["ticker"]) if ticker_in_col else str(idx)
+                )
                 raw_action = str(row[act_col]).upper()
 
                 if raw_action in ("BUY", "STRONG_BUY"):
