@@ -479,16 +479,26 @@ SIGNAL_PARAMS = {
 # ═══════════════════════════════════════════════════════════════
 # 19. PORTFOLIO CONSTRUCTION
 # ═══════════════════════════════════════════════════════════════
+# Add to config.py, section 19 (PORTFOLIO_PARAMS)
+
 PORTFOLIO_PARAMS = {
     "total_capital":         100_000,
-    "max_positions":         10,
-    "min_positions":          3,
+    "max_positions":         12,
+    "min_positions":          4,
     "max_sector_pct":        0.35,
     "max_single_pct":        0.15,
-    "min_single_pct":        0.03,
+    "min_single_pct":        0.02,
     "target_invested_pct":   0.90,
     "rebalance_threshold":   0.05,
     "incumbent_bonus":       0.05,
+
+    # ── NEW: Volatility targeting ────────────────────────────
+    "vol_target_enabled":    True,
+    "portfolio_vol_target":  0.25,       # target 25% annualized portfolio vol
+    "position_vol_target":   0.02,       # each position targets 2% daily risk contribution
+    "vol_lookback":          20,         # realized vol calculation window
+    "vol_floor":             0.10,       # minimum assumed vol (prevents over-leveraging low-vol names)
+    "vol_cap":               0.80,       # maximum assumed vol (prevents dust positions)
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -942,7 +952,6 @@ MARKET_CONFIG = {
         "fetch_overrides":   {"exchange": "NSE", "currency": "INR"},
     },
 }
-
 
 # ═══════════════════════════════════════════════════════════════
 # 28. HELPER — look up group for any ticker across all markets
