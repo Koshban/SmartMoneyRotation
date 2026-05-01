@@ -59,48 +59,6 @@ python refactor/runner_v2.py --market IN --parquet-path data/in_cash.parquet --p
 # Run for a single trading day
 python refactor.runner_v2.py --market US --start 2025-04-25 --end 2025-04-25 --print-report -v
 
-# ── Standard Backtests ───────────────────────────────────────────
-
-# Both configs (loose + tight), US market, full year
-python backtest/phase2/run_backtest.py --market US --start 2020-01-01 --end 2026-04-20
-
-# ── Custom Capital & Positions ───────────────────────────────────
-
-# Start with $250k, max 30 positions
-python backtest.phase2.run_backtest.py --market US --start-date 2024-01-02 --end-date 2025-04-25 \
-    --initial-capital 250000 --max-positions 30
-
-# Conservative: $50k, max 10 positions, tight config
-python backtest.phase2.run_backtest.py --market US --start-date 2024-01-02 --end-date 2025-04-25 \
-    --config tight --initial-capital 50000 --max-positions 10
-
-# ── Verbose / Debug ──────────────────────────────────────────────
-
-# Full debug output
-python backtest.phase2.run_backtest.py --market US --start-date 2024-01-02 --end-date 2025-04-25 -v
-
-# ── Custom Data Path ─────────────────────────────────────────────
-
-# Explicit parquet file
-python backtest.phase2.run_backtest.py --market US --start-date 2024-01-02 --end-date 2025-04-25 \
-    --parquet-path /path/to/your/data.parquet
-
-# ── Other Markets ────────────────────────────────────────────────
-
-# Hong Kong
-python backtest.phase2.run_backtest.py --market HK --start-date 2024-01-02 --end-date 2025-04-25 -v
-
-# India
-python backtest.phase2.run_backtest.py --market IN --start-date 2024-01-02 --end-date 2025-04-25 -v
-
-# ── Short Period Test ────────────────────────────────────────────
-
-# Quick 1-month sanity check
-python backtest.phase2.run_backtest.py --market US --start-date 2025-03-01 --end-date 2025-04-25 --config loose -v
-
-# Single week
-python backtest.phase2.run_backtest.py --market US --start-date 2025-04-21 --end-date 2025-04-25 -v
-
 # ── Full run: both models ───────────────────────────────────
 python run_combined.py --market US
 python run_combined.py --market US --holdings NVDA,CRWD,CEG -v

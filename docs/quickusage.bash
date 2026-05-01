@@ -23,7 +23,7 @@
 ingest_cash.py [-h] [--market {us,hk,in,all}] [--period PERIOD] [--days DAYS] [--source {yfinance,ibkr}] [--full] [--backfill]
 
 python src/ingest_cash.py --market all --period 20y 
-python src/ingest_cash.py --market in --period 5d --source ibkr
+python src/ingest_cash.py --market all --period 2d --source ibkr
 python src/db/load_db.py --market all --type cash
 
 python src/ingest_options.py --market us      
