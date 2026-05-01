@@ -88,6 +88,58 @@ def _count_actions(actions: pd.DataFrame | None) -> dict[str, int]:
     return summary
 
 
+def _build_thematic_rotation_section(result: dict) -> dict:
+    """Build thematic rotation quadrant summary."""
+    logger.info(
+        "_build_thematic_rotation_section: keys containing 'thematic'=%s",
+        [k for k in result.keys() if "thematic" in k.lower()]
+    )
+    thematic_summary = result.get("thematic_summary", pd.DataFrame())
+    logger.info(
+        "_build_thematic_rotation_section: thematic_summary type=%s empty=%s",
+        type(thematic_summary).__name__,
+        thematic_summary.empty if hasattr(thematic_summary, 'empty') else 'N/A',
+    )
+
+    logger.info(
+    "_build_thematic_rotation_section: columns=%s rows=%d",
+    list(thematic_summary.columns), len(thematic_summary),
+    )
+
+    if thematic_summary is None or thematic_summary.empty:
+        return {"available": False, "heatmap": [], "quadrant_counts": {}}
+
+    heatmap = []
+    for _, row in thematic_summary.iterrows():
+        heatmap.append({
+            "theme": str(row.get("theme", "")),
+            "regime": str(row.get("regime", "")),
+            "etf_composite": round(float(row.get("etf_composite", 0)), 4),
+            "momentum": round(float(row.get("momentum", 0)), 4),
+            "trend": round(float(row.get("trend", 0)), 4),
+            "return20d": round(float(row.get("return20d", 0)), 4),
+            "n_etfs": int(row.get("n_etfs", 0)),
+            "etfs": str(row.get("etfs", "")),
+        })
+
+    quadrant_counts = {}
+    if "regime" in thematic_summary.columns:
+        for regime in ("leading", "improving", "weakening", "lagging"):
+            names = thematic_summary.loc[
+                thematic_summary["regime"] == regime, "theme"
+            ].tolist()
+            quadrant_counts[regime] = {
+                "count": len(names),
+                "themes": names,
+            }
+
+    return {
+        "available": True,
+        "heatmap": heatmap,
+        "quadrant_counts": quadrant_counts,
+    }
+
+
 # ── Column-name resolution helper ────────────────────────────────────────
 # rotation_v2 uses short names (rs_mom, etf_composite, …) while earlier
 # report code assumed longer names (rs_momentum, excess_return_20d, …).
@@ -476,6 +528,7 @@ def build_report_v2(result: dict) -> dict:
         "header": _build_header(result, latest),
         "regime": _build_regime_section(meta, breadth_info),
         "rotation": _build_rotation_section(result),
+        "thematic_rotation": _build_thematic_rotation_section(result),   # ← ADD
         "scoring": _build_scoring_section(scored),
         "actions": action_summary,
         "portfolio": _build_portfolio_section(portfolio, review),
@@ -541,6 +594,48 @@ def to_text_v2(report: dict) -> str:
     lines.append(thin)
     lines.append("  SECTOR ROTATION (RRG Quadrants)")
     lines.append(thin)
+
+    # ── THEMATIC ROTATION ─────────────────────────────────────────────────────
+    thematic_rot = report.get("thematic_rotation", {})
+    if thematic_rot.get("available"):
+        lines.append(thin)
+        lines.append("  THEMATIC ROTATION (ETF Composite Quadrants)")
+        lines.append(thin)
+
+        # Quadrant summary
+        tqc = thematic_rot.get("quadrant_counts", {})
+        for quadrant in ("leading", "improving", "weakening", "lagging"):
+            info = tqc.get(quadrant, {})
+            count = info.get("count", 0)
+            themes = ", ".join(info.get("themes", [])) or "none"
+            lines.append(f"  {quadrant.upper():<12s}  ({count})  {themes}")
+        lines.append("")
+
+        # Heatmap table
+        thematic_heatmap = thematic_rot.get("heatmap", [])
+        if thematic_heatmap:
+            lines.append(
+                f"  {'#':>4s}  {'Theme':<28s}  {'Regime':<11s}  "
+                f"{'Composite':>9s}  {'Momentum':>9s}  {'Trend':>7s}  "
+                f"{'Ret 20d':>8s}  {'ETFs':>5s}  {'Constituents'}"
+            )
+            lines.append("  " + "-" * 105)
+            for idx, entry in enumerate(thematic_heatmap, 1):
+                theme    = str(entry.get("theme", ""))[:27]
+                regime   = str(entry.get("regime", ""))
+                comp     = _safe_float(entry.get("etf_composite"))
+                mom      = _safe_float(entry.get("momentum"))
+                trend    = _safe_float(entry.get("trend"))
+                ret20    = _safe_float(entry.get("return20d"))
+                n_etfs   = int(entry.get("n_etfs", 0))
+                etfs_str = str(entry.get("etfs", ""))
+
+                lines.append(
+                    f"  {idx:>4d}  {theme:<28s}  {regime:<11s}  "
+                    f"{comp:>9.4f}  {mom:>+9.4f}  {trend:>7.4f}  "
+                    f"{ret20:>+8.1%}  {n_etfs:>5d}  {etfs_str}"
+                )
+        lines.append("")
 
     if rot.get("available"):
         # Quadrant summary

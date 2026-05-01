@@ -185,6 +185,96 @@ def _canonicalize_indicator_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = out.rename(columns=existing)
     return out
 
+def _compute_thematic_rotation(
+    etf_ranking: pd.DataFrame,
+    thematic_etf_map: dict[str, list[str]],
+) -> dict:
+    """
+    Compute per-theme rotation quadrants by averaging ETF-level scores
+    for each theme's constituent ETFs.
+
+    Returns dict with keys: thematic_summary (DataFrame), thematic_regimes (dict).
+    """
+    if etf_ranking.empty or not thematic_etf_map:
+        return {"thematic_summary": pd.DataFrame(), "thematic_regimes": {}}
+
+    comp_col = "etf_composite"
+    mom_col = "sub_momentum"
+    ticker_col = "ticker"
+
+    if comp_col not in etf_ranking.columns or ticker_col not in etf_ranking.columns:
+        logger.warning(
+            "_compute_thematic_rotation: etf_ranking missing required columns "
+            "(%s, %s) — skipping",
+            comp_col, ticker_col,
+        )
+        return {"thematic_summary": pd.DataFrame(), "thematic_regimes": {}}
+
+    has_mom = mom_col in etf_ranking.columns
+
+    rows = []
+    for theme, tickers in thematic_etf_map.items():
+        mask = etf_ranking[ticker_col].isin(tickers)
+        subset = etf_ranking.loc[mask]
+        if subset.empty:
+            continue
+
+        avg_composite = float(subset[comp_col].mean())
+        avg_momentum = float(subset[mom_col].mean()) if has_mom else 0.0
+        avg_trend = float(subset["sub_trend"].mean()) if "sub_trend" in subset.columns else 0.0
+        avg_ret20 = float(subset["return20d"].mean()) if "return20d" in subset.columns else 0.0
+        n_etfs = len(subset)
+        etf_tickers = subset[ticker_col].tolist()
+
+        rows.append({
+            "theme": theme,
+            "etf_composite": avg_composite,
+            "momentum": avg_momentum,
+            "trend": avg_trend,
+            "return20d": avg_ret20,
+            "n_etfs": n_etfs,
+            "etfs": ", ".join(etf_tickers),
+        })
+
+    if not rows:
+        return {"thematic_summary": pd.DataFrame(), "thematic_regimes": {}}
+
+    summary = pd.DataFrame(rows).sort_values("etf_composite", ascending=False).reset_index(drop=True)
+
+    # Classify quadrants: level vs median, momentum vs 0
+    median_composite = summary["etf_composite"].median()
+
+    def _classify_theme(row):
+        high_level = row["etf_composite"] >= median_composite
+        positive_mom = row["momentum"] >= 0
+        if high_level and positive_mom:
+            return "leading"
+        elif not high_level and positive_mom:
+            return "improving"
+        elif high_level and not positive_mom:
+            return "weakening"
+        else:
+            return "lagging"
+
+    summary["regime"] = summary.apply(_classify_theme, axis=1)
+
+    thematic_regimes = dict(zip(summary["theme"], summary["regime"]))
+
+    logger.info(
+        "Thematic rotation computed: themes=%d  regimes=%s",
+        len(summary),
+        summary["regime"].value_counts().to_dict(),
+    )
+    logger.info(
+        "Thematic summary:\n%s",
+        summary[["theme", "regime", "etf_composite", "momentum", "return20d", "n_etfs", "etfs"]].to_string(index=False),
+    )
+
+    return {
+        "thematic_summary": summary,
+        "thematic_regimes": thematic_regimes,
+    }
+
 
 def _fill_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -876,6 +966,12 @@ def run_pipeline_v2(
     sector_summary = rotation_result["sector_summary"]
     etf_ranking    = rotation_result.get("etf_ranking", pd.DataFrame())
 
+    # ── D2b. THEMATIC ROTATION ────────────────────────────────────────────────
+    _thematic_etf_map = config.get("thematic_etf_map", {})
+    thematic_rotation_result = _compute_thematic_rotation(etf_ranking, _thematic_etf_map)
+    thematic_summary = thematic_rotation_result["thematic_summary"]
+    thematic_regimes = thematic_rotation_result["thematic_regimes"]
+
     # ── E. leadership snapshot ────────────────────────────────────────────────
     if precomputed:
         leadership_snapshot = pd.DataFrame()
@@ -1348,5 +1444,7 @@ def run_pipeline_v2(
         "sector_summary": sector_summary,
         "sector_regimes": sector_regimes,
         "etf_ranking": etf_ranking,
+        "thematic_summary": thematic_summary,          # ← ADD
+        "thematic_regimes": thematic_regimes,          # ← ADD
         "leadership_snapshot": leadership_snapshot,
     }

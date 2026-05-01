@@ -1,6 +1,8 @@
 """refactor/runner_v2.py"""
 from __future__ import annotations
-
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.run_logger import RunLogger
 from utils.display_results import print_run_summary
 

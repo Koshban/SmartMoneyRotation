@@ -75,32 +75,6 @@ bash
 # Download 20 years of data
 python -m backtest.data_loader --years 20
 
-# ── Inspect universes ──────────────────────────────────────
-python -m backtest.runner --show-universe --universe us        # full US from universe.py
-python -m backtest.runner --show-universe --universe hk        # full HK from universe.py
-python -m backtest.runner --show-universe --universe in     # full India from universe.py
-python -m backtest.runner --show-universe --universe us_core   # hardcoded 41 ETFs
-
-# ── Run backtests ──────────────────────────────────────────
-python -m backtest.runner --universe us --start 2022           # full US vs SPY
-python -m backtest.runner --universe hk --start 2020           # full HK vs 2800.HK
-python -m backtest.runner --universe in --start 2022        # full India vs NIFTYBEES.NS
-
-# ── Compare strategies per market ──────────────────────────
-python -m backtest.runner --compare --universe us              # all 19 US strategies
-python -m backtest.runner --compare --universe hk              # all 4 HK strategies
-python -m backtest.runner --compare --universe in           # all 4 India strategies
-
-# ── Specific strategy ─────────────────────────────────────
-python -m backtest.runner --strategy hk_momentum --universe hk
-python -m backtest.runner --strategy in_low_churn --universe in
-
-# ── List what's available ─────────────────────────────────
-python -m backtest.runner --list --universe hk                 # HK strategies
-python -m backtest.runner --list --universe in              # India strategies
-
-
-
 Usage:
     python run_bounce_scan.py                    # default market (US)
     python run_bounce_scan.py --market IN        # Indian market
