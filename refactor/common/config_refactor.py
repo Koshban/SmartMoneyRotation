@@ -142,15 +142,9 @@ SIGNALPARAMS_V2 = {
     "position_range_pct": 0.08,
     "position_max_pct": 0.12,
     "size_multipliers": {
-        "calm": 1.00,
-        "volatile": 0.75,            # was 0.70
-        "chaotic": 0.40,             # was 0.35
-    },
-
-    # REMOVED (were causing churn via double-gating):
-    # continuation_min_trend, pullback_min_trend, pullback_max_short_extension,
-    # pullback_rsi_max, relative_setup_rank_pct, chaotic_exit_bump,
-    # pullback_min_short_extension, continuation_min_participation
+    "calm": 1.00, "moderate": 0.95, "elevated": 0.88,
+    "volatile": 0.75, "chaotic": 0.60,
+    }
 }
 
 

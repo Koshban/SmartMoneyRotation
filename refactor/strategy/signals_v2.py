@@ -181,9 +181,9 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     ).astype(int)
 
     # ── position sizing ─────────────────────────────────────────────
-    pos_base = p.get("position_base_pct", 0.04)
-    pos_range = p.get("position_range_pct", 0.08)
-    pos_max = p.get("position_max_pct", 0.12)
+    pos_base = p.get("position_base_pct", 0.075)    # was 0.04
+    pos_range = p.get("position_range_pct", 0.045)  # was 0.08 (narrower range, more uniform)
+    pos_max = p.get("position_max_pct", 0.14)       # was 0.12
 
     size_mult = volreg.map(p["size_multipliers"]).fillna(1.0)
     entry_thresh = p["base_entry_threshold"]

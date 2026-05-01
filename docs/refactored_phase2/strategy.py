@@ -3744,10 +3744,10 @@ def _log_preview(out: pd.DataFrame, cols: list[str], label: str, n: int = 40) ->
 #  Factor > 1.0 means thresholds are loosened (easier to trigger exit).
 _VOL_EXIT_TIGHTENING: dict[str, float] = {
     "calm":     1.00,   # normal thresholds
-    "moderate": 1.10,   # slightly easier exits
-    "elevated": 1.25,   # meaningfully easier exits
-    "volatile": 1.40,   # much easier exits
-    "chaotic":  1.60,   # aggressive exits
+    "moderate": 1.00,   # slightly easier exits
+    "elevated": 1.05,   # meaningfully easier exits
+    "volatile": 1.10,   # much easier exits
+    "chaotic":  1.25,   # aggressive exits
 }
 
 
@@ -3795,19 +3795,19 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     # These defaults are calibrated for a universe of liquid ETFs.
     # For single stocks, you may want slightly looser thresholds.
 
-    exit_rsi_thresh = float(p.get("exit_rsi_thresh", 43.0))           # ← was 35
-    exit_ema_pct_thresh = float(p.get("exit_ema_pct_thresh", -2.5))   # ← was -5.0
-    exit_rs_z_thresh = float(p.get("exit_rs_z_thresh", -0.7))        # ← was -1.5
-    exit_adx_thresh = float(p.get("exit_adx_thresh", 18.0))          # ← was 12
-    exit_composite_floor = float(p.get("exit_composite_floor", 0.38)) # ← was 0.15
-    exit_min_conditions = int(p.get("exit_min_conditions", 2))        # keep at 2
+    exit_rsi_thresh = float(p.get("exit_rsi_thresh", 38.0))           # ← was 35
+    exit_ema_pct_thresh = float(p.get("exit_ema_pct_thresh", -4.5))   # ← was -5.0
+    exit_rs_z_thresh = float(p.get("exit_rs_z_thresh", -1.2))        # ← was -1.5
+    exit_adx_thresh = float(p.get("exit_adx_thresh", 14.0))          # ← was 12
+    exit_composite_floor = float(p.get("exit_composite_floor", 0.30)) # ← was 0.15
+    exit_min_conditions = int(p.get("exit_min_conditions", 3))        # keep at 2
     exit_vol_adaptive = bool(p.get("exit_vol_adaptive", True))        # ← NEW
 
     # ── NEW: severe single-condition immediate exits ────────────────
     # These bypass the convergence requirement for catastrophic events.
-    exit_rsi_severe = float(p.get("exit_rsi_severe", 28.0))
-    exit_ema_severe = float(p.get("exit_ema_severe", -7.0))
-    exit_rs_severe = float(p.get("exit_rs_severe", -2.0))
+    exit_rsi_severe = float(p.get("exit_rsi_severe", 22.0))
+    exit_ema_severe = float(p.get("exit_ema_severe", -10.0))
+    exit_rs_severe = float(p.get("exit_rs_severe", -2.5))
 
     logger.info(
         "Exit params (per-position, TUNED): rsi_thresh=%.1f ema_pct_thresh=%.2f "
@@ -3885,9 +3885,9 @@ def apply_signals_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
     ).astype(int)
 
     # ── position sizing ─────────────────────────────────────────────
-    pos_base = p.get("position_base_pct", 0.04)
-    pos_range = p.get("position_range_pct", 0.08)
-    pos_max = p.get("position_max_pct", 0.12)
+    pos_base = p.get("position_base_pct", 0.075)    # was 0.04
+    pos_range = p.get("position_range_pct", 0.045)  # was 0.08 (narrower range, more uniform)
+    pos_max = p.get("position_max_pct", 0.14)       # was 0.12
 
     size_mult = volreg.map(p["size_multipliers"]).fillna(1.0)
     entry_thresh = p["base_entry_threshold"]
@@ -4300,6 +4300,5 @@ def apply_convergence_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
         logger.debug("Lowest adjusted scores:\n%s", out.sort_values("scoreadjusted_v2", ascending=True)[cols].head(50).to_string(index=False))
 
     return out.sort_values(["convergence_tier_v2", "scoreadjusted_v2"], ascending=[False, False])
-
 
 #####################################################
