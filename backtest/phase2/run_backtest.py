@@ -188,11 +188,11 @@ CONFIG = {
 
     # FILTER: skip any ticker with annualized vol below this (kills bonds/utilities)
     # SPY is ~15-20%, high-beta growth is 35-60%. Set to 0.25 to filter out low-vol.
-    "min_trailing_vol": 0.25,
+    "min_trailing_vol": 0.21,
 
     # FILTER: skip any ticker with RS z-score below this (underperformers)
     # 0.0 = must be at least matching benchmark. -0.5 = slight underperformance ok.
-    "min_rszscore": 0.0,
+    "min_rszscore": -0.50,
 
     # Lookback window for trailing vol computation (trading days)
     "vol_window": 60,
