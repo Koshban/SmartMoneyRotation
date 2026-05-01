@@ -4,8 +4,9 @@ Virtual portfolio tracker with minimum hold period,
 trailing stop, max hold duration, and score-ranked buys.
 
 Features:
-  - Dynamic position sizing: _buy() uses current_nav (passed per-call)
-    instead of frozen initial_capital. Slot size grows with equity.
+  - VARIABLE POSITION SIZING: _buy() accepts per-ticker weight from pipeline.
+    Falls back to equal-weight (1/max_positions) if no weight provided.
+  - Dynamic position sizing: uses current NAV (not frozen initial_capital).
   - force_exits() tags exit_type on closed trade records for attribution.
   - _can_sell() uses calendar-day semantics for min hold period.
   - market_value property on Position for clean NAV calculation.
@@ -31,6 +32,7 @@ class Position:
     peak_price: float = 0.0
     latest_score: float = 0.0
     current_price: float = 0.0
+    target_weight: float = 0.0  # the weight used at entry (for diagnostics)
 
     def __post_init__(self):
         if self.peak_price == 0.0:
@@ -89,10 +91,6 @@ class PortfolioTracker:
 
     # ──────────────────────────────────────────────────────────
     #  Min-hold check
-    #
-    #  NOTE: Uses calendar days, not trading days.
-    #  min_hold_days=5 means 5 calendar days (≈3 trading days).
-    #  If you want 5 trading days, set min_hold_days=7.
     # ──────────────────────────────────────────────────────────
     def _can_sell(self, pos: Position, date, current_price: float) -> bool:
         held_days = (date - pos.entry_date).days
@@ -109,9 +107,6 @@ class PortfolioTracker:
 
     # ──────────────────────────────────────────────────────────
     #  Force exits: trailing stop + max hold
-    #
-    #  Returns list of tickers force-sold.
-    #  Tags each closed trade with 'exit_type' for attribution.
     # ──────────────────────────────────────────────────────────
     def force_exits(self, date, prices, **kw) -> List[str]:
         force_sold = []
@@ -174,17 +169,9 @@ class PortfolioTracker:
         prices: Dict[str, float],
         max_upgrades: int = 2,
     ) -> List[Tuple[str, str]]:
-        """
-        Compare the weakest held positions against the strongest
-        un-held candidates.  If the score gap exceeds the threshold,
-        sell the held position and buy the candidate.
-
-        Returns list of (sold_ticker, bought_ticker) pairs.
-        """
         if not self.positions or not candidate_scores:
             return []
 
-        # Rank held positions by latest score (ascending = weakest first)
         held_scored = [
             (t, pos.latest_score)
             for t, pos in self.positions.items()
@@ -192,7 +179,6 @@ class PortfolioTracker:
         ]
         held_scored.sort(key=lambda x: x[1])
 
-        # Rank candidates by score (descending = strongest first)
         candidates = [
             (t, s)
             for t, s in candidate_scores.items()
@@ -237,7 +223,7 @@ class PortfolioTracker:
         return swaps
 
     # ──────────────────────────────────────────────────────────
-    #  Process signals — accepts current_nav for dynamic sizing
+    #  Process signals — accepts per-ticker position sizes
     # ──────────────────────────────────────────────────────────
     def process_signals(
         self,
@@ -246,8 +232,10 @@ class PortfolioTracker:
         prices: Dict[str, float],
         scores: Optional[Dict[str, float]] = None,
         current_nav: Optional[float] = None,
+        position_sizes: Optional[Dict[str, float]] = None,
     ) -> None:
         scores = scores or {}
+        position_sizes = position_sizes or {}
 
         # ── sells first (respect min hold) ────────────────────
         blocked_sells = []
@@ -285,19 +273,36 @@ class PortfolioTracker:
             return
 
         for ticker in buy_tickers[:slots]:
-            self._buy(date, ticker, prices[ticker], current_nav=current_nav)
+            # Pass per-ticker weight if available
+            ticker_weight = position_sizes.get(ticker)
+            self._buy(
+                date, ticker, prices[ticker],
+                current_nav=current_nav,
+                target_weight=ticker_weight,
+            )
 
     # ──────────────────────────────────────────────────────────
     #  Update held positions' scores (call each day)
     # ──────────────────────────────────────────────────────────
     def update_scores(self, scores: Dict[str, float]) -> None:
-        """Refresh latest_score on each held position for upgrade logic."""
         for ticker, pos in self.positions.items():
             if ticker in scores:
                 pos.latest_score = scores[ticker]
 
     # ──────────────────────────────────────────────────────────
-    #  Buy — DYNAMIC SIZING based on current NAV
+    #  Buy — VARIABLE SIZING: uses per-ticker weight if provided
+    #
+    #  Priority:
+    #    1. target_weight (from pipeline's position_pct column)
+    #    2. Equal-weight fallback: 1 / max_positions
+    #
+    #  The weight is interpreted as a fraction of NAV.
+    #  E.g. 0.12 means "allocate 12% of NAV to this position".
+    #
+    #  Constraints:
+    #    - Never exceed 95% of available cash
+    #    - Never exceed 25% of NAV (hard cap per position)
+    #    - Minimum $1,000 target value to avoid dust trades
     # ──────────────────────────────────────────────────────────
     def _buy(
         self,
@@ -305,24 +310,34 @@ class PortfolioTracker:
         ticker: str,
         raw_price: float,
         current_nav: Optional[float] = None,
+        target_weight: Optional[float] = None,
     ) -> None:
         exec_price = raw_price * (1 + self.slippage_rate)
 
-        # Use current NAV (if provided) instead of frozen initial_capital.
-        # Slot size = NAV / max_positions (equal-weight target).
-        # Capped at 95% of available cash to prevent over-commitment.
         sizing_nav = current_nav if current_nav else self.nav
-        slot_target = sizing_nav / self.max_positions
 
+        # Determine position weight
+        if target_weight is not None and target_weight > 0:
+            # Use pipeline-provided weight, capped at 25% of NAV
+            weight = min(target_weight, 0.25)
+            slot_target = sizing_nav * weight
+            sizing_source = f"pipeline_weight={target_weight:.3f}"
+        else:
+            # Equal-weight fallback
+            weight = 1.0 / self.max_positions
+            slot_target = sizing_nav * weight
+            sizing_source = f"equal_weight=1/{self.max_positions}"
+
+        # Cap at 95% of available cash
         target_value = min(slot_target, self.cash * 0.95)
 
         if target_value < 1_000:
             log.debug(
                 "  SKIP BUY %-10s: target_value=$%.0f too small "
-                "(nav=$%s, cash=$%s, slots=%d)",
+                "(nav=$%s, cash=$%s, weight=%.3f, source=%s)",
                 ticker, target_value,
                 f"{sizing_nav:,.0f}", f"{self.cash:,.0f}",
-                self.max_positions,
+                weight, sizing_source,
             )
             return
 
@@ -334,7 +349,6 @@ class PortfolioTracker:
         commission = cost * self.commission_rate
         total = cost + commission
         if total > self.cash:
-            # Try smaller allocation (use all remaining cash minus commission buffer)
             max_cost = self.cash / (1 + self.commission_rate)
             shares = int(max_cost / exec_price)
             if shares <= 0:
@@ -354,16 +368,19 @@ class PortfolioTracker:
             cost_basis=total,
             peak_price=exec_price,
             current_price=exec_price,
+            target_weight=weight,
         )
         self._total_buys += 1
 
         log.info(
             "  ▲ BUY  %-10s  %d shares @ %.2f  cost $%s  "
-            "(slot=$%s, nav=$%s)",
+            "(weight=%.1f%%, slot=$%s, nav=$%s, %s)",
             ticker, shares, exec_price,
             f"{total:,.0f}",
+            weight * 100,
             f"{slot_target:,.0f}",
             f"{sizing_nav:,.0f}",
+            sizing_source,
         )
 
     # ──────────────────────────────────────────────────────────
@@ -408,6 +425,7 @@ class PortfolioTracker:
             "peak_price": pos.peak_price,
             "max_favorable": (pos.peak_price / pos.entry_price) - 1.0,
             "latest_score": pos.latest_score,
+            "entry_weight": pos.target_weight,
         }
         if exit_type:
             trade_record["exit_type"] = exit_type

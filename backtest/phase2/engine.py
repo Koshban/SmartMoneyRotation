@@ -11,6 +11,7 @@ Fixes applied:
   - Position sizing uses current NAV (not frozen initial_capital)
   - Exit metadata captured on closed trades for post-hoc analysis
   - Daily debug spam moved to DEBUG level, only on first occurrence
+  - VARIABLE POSITION SIZING: extracts per-ticker position_pct from pipeline
 """
 from __future__ import annotations
 
@@ -61,6 +62,7 @@ class BacktestEngine:
 
         # Diagnostic tracking
         self._columns_logged: bool = False
+        self._sizing_logged: bool = False
         self._exit_source_counts: Dict[str, int] = {
             "signal_exit": 0,
             "force_exit_trailing": 0,
@@ -96,6 +98,72 @@ class BacktestEngine:
                         scores[str(ticker)] = float(row[score_col])
             break
         return scores
+
+    # ==================================================================
+    #  POSITION SIZING EXTRACTION — reads per-ticker weights from pipeline
+    # ==================================================================
+    def _extract_position_sizes(self, output: Dict) -> Dict[str, float]:
+        """
+        Extract per-ticker position sizing from the pipeline output.
+
+        Looks for columns (in priority order):
+          - position_pct / position_size_pct
+          - weight / target_weight
+          - confidence / signal_strength
+          - size_multiplier
+
+        Returns {ticker: weight} where weight is a fraction (e.g. 0.10 = 10%).
+        If no sizing column found, returns empty dict (caller uses equal-weight).
+        """
+        sizing: Dict[str, float] = {}
+
+        SIZING_CANDIDATES = (
+            "position_pct", "position_size_pct",
+            "weight", "target_weight",
+            "confidence", "signal_strength",
+            "size_multiplier", "size_mult",
+        )
+
+        for key in ("action_table", "snapshot", "actions"):
+            if key not in output:
+                continue
+            df = output[key]
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            size_col = next(
+                (c for c in SIZING_CANDIDATES if c in df.columns),
+                None,
+            )
+            if size_col is None:
+                continue
+
+            # Log which column we found (once)
+            if not self._sizing_logged:
+                log.info(
+                    "[%s] SIZING: using column '%s' from pipeline output '%s'",
+                    self.config_name, size_col, key,
+                )
+                # Show sample values
+                sample = df[size_col].dropna().head(5)
+                log.info(
+                    "[%s] SIZING sample values: %s",
+                    self.config_name, sample.tolist(),
+                )
+                self._sizing_logged = True
+
+            ticker_in_col = "ticker" in df.columns
+            for idx, row in df.iterrows():
+                ticker = str(row["ticker"]) if ticker_in_col else str(idx)
+                try:
+                    val = float(row[size_col])
+                    if pd.notna(val) and val > 0:
+                        sizing[ticker] = val
+                except (TypeError, ValueError):
+                    pass
+            break
+
+        return sizing
 
     # ==================================================================
     #  EXIT METADATA EXTRACTION — for trade-level audit trail
@@ -339,19 +407,6 @@ class BacktestEngine:
     # ==================================================================
     #  CURRENT NAV CALCULATION — for dynamic position sizing
     # ==================================================================
-    # def _compute_current_nav(self, tracker: PortfolioTracker) -> float:
-    #     """
-    #     Estimate NAV for position sizing.
-        
-    #     Uses entry_price as a conservative proxy since the original tracker
-    #     doesn't store current market price on Position objects.
-    #     The real MTM happens in mark_to_market() at end of day.
-    #     """
-    #     nav = tracker.cash
-    #     for ticker, pos in tracker.positions.items():
-    #         nav += pos.shares * pos.entry_price
-    #     return nav
-
     def _compute_current_nav(self, tracker: PortfolioTracker) -> float:
         return tracker.nav
 
@@ -400,6 +455,7 @@ class BacktestEngine:
 
         prev_actions: Dict[str, str] = {}
         prev_scores: Dict[str, float] = {}
+        prev_sizes: Dict[str, float] = {}
         prev_exit_metadata: Dict[str, Dict[str, Any]] = {}
         prev_exit_tickers: Set[str] = set()
         bench_start_close: float | None = None
@@ -443,19 +499,15 @@ class BacktestEngine:
                 held = set(tracker.positions.keys())
                 actions = self._extract_actions(output, held_tickers=held)
                 scores = self._extract_scores(output)
+                sizes = self._extract_position_sizes(output)
 
                 # ── CRITICAL FIX: Extract exit flags DIRECTLY ──────
-                # This is independent of the action_v2 column.
-                # sigexit_v2=1 on a HELD ticker → SELL, period.
                 exit_tickers = self._extract_exit_flags(output, held)
 
                 # Merge direct exit flags into actions
-                # (these override any HOLD from the action layer)
                 for ticker in exit_tickers:
                     if ticker not in actions or actions[ticker] != "SELL":
                         if ticker in actions and actions[ticker] in ("BUY", "STRONG_BUY"):
-                            # Edge case: pipeline says BUY but we hold it
-                            # and exit flag is set. Exit takes priority.
                             log.warning(
                                 "[%s] %s CONFLICT: %s has BUY action but "
                                 "sigexit_v2=1 (held). Forcing SELL.",
@@ -473,7 +525,7 @@ class BacktestEngine:
                     "[%s] pipeline error %s: %s",
                     self.config_name, day.strftime("%Y-%m-%d"), exc,
                 )
-                actions, scores = {}, {}
+                actions, scores, sizes = {}, {}, {}
                 exit_metadata = {}
                 exit_tickers = set()
 
@@ -497,25 +549,20 @@ class BacktestEngine:
                 n_closed_before = len(tracker.closed_trades)
 
                 # 3a — force-exit stale / stopped-out positions
-                #       runs UNCONDITIONALLY — not gated by prev_actions
                 tracker.force_exits(day, prices_open)
 
                 # Count force exits
                 n_force_closed = len(tracker.closed_trades) - n_closed_before
 
                 # 3b — signal-driven sells + score-ranked buys
-                #       CRITICAL: prev_exit_tickers ensures sigexit_v2
-                #       tickers get SELL action even if action layer said HOLD
                 if prev_actions:
-                    # ─── DYNAMIC POSITION SIZING ──────────────────
-                    # Pass current NAV so tracker can size new positions
-                    # based on current equity, not frozen initial_capital.
                     current_nav = self._compute_current_nav(tracker)
 
                     tracker.process_signals(
                         day, prev_actions, prices_open,
                         scores=prev_scores,
-                        current_nav=current_nav,  # ← NEW: enables dynamic sizing
+                        current_nav=current_nav,
+                        position_sizes=prev_sizes,  # ← NEW: per-ticker sizing
                     )
 
                 # 3c — upgrade weak held positions (single call)
@@ -545,7 +592,6 @@ class BacktestEngine:
 
                         # Determine exit source
                         if j < n_force_closed:
-                            # These were closed by force_exits
                             source = trade.get("exit_type", "force_exit_other")
                             trade.setdefault("exit_source", source)
                             self._exit_source_counts[
@@ -553,7 +599,6 @@ class BacktestEngine:
                                 else "force_exit_other"
                             ] += 1
                         else:
-                            # These were closed by process_signals (sigexit_v2)
                             trade.setdefault("exit_source", "signal_exit")
                             self._exit_source_counts["signal_exit"] += 1
 
@@ -576,7 +621,6 @@ class BacktestEngine:
             if port_value > 0:
                 cash_pct = 100.0 * tracker.cash / port_value
                 cash_utilization_pcts.append(cash_pct)
-                # Warn if cash consistently too high
                 if i > 20 and i % 20 == 0:
                     recent_cash = cash_utilization_pcts[-20:]
                     avg_cash = sum(recent_cash) / len(recent_cash)
@@ -621,6 +665,7 @@ class BacktestEngine:
 
             prev_actions = actions
             prev_scores = scores
+            prev_sizes = sizes
             prev_exit_metadata = exit_metadata
             prev_exit_tickers = exit_tickers
             self.action_history[day] = actions
@@ -772,11 +817,6 @@ class BacktestEngine:
 
         BUY/STRONG_BUY  → BUY  (cross-sectional entry — unheld tickers only)
         SELL/EXIT       → SELL (held tickers only)
-
-        NOTE: This method extracts actions from the action_v2 column.
-        The DIRECT exit flag check (_extract_exit_flags) runs separately
-        and merges its results into the final action dict. This means
-        sigexit_v2=1 triggers a SELL even if action_v2 says "HOLD".
         """
         if held_tickers is None:
             held_tickers = set()
@@ -803,17 +843,12 @@ class BacktestEngine:
                 raw_action = str(row[act_col]).upper()
 
                 if raw_action in ("BUY", "STRONG_BUY"):
-                    # Only emit BUY for tickers NOT already held
                     if ticker not in held_tickers:
                         actions[ticker] = raw_action
 
                 elif raw_action in ("SELL", "EXIT", "STRONG_SELL"):
-                    # Only emit SELL for tickers we actually hold
                     if ticker in held_tickers:
                         actions[ticker] = "SELL"
-                    # NOTE: No longer double-gating with sigexit_v2 here.
-                    # The action layer says SELL → we trust it.
-                    # sigexit_v2 is checked independently in _extract_exit_flags.
 
             break
 
