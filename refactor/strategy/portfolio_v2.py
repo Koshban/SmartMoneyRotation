@@ -57,9 +57,9 @@ DEFAULT_MIN_WEIGHT = 0.04
 ROTATION_CAP_MULT: dict[str, float] = {
     "leading":   1.00,
     "improving": 1.00,
-    "weakening": 0.60,
-    "lagging":   0.30,
-    "unknown":   0.70,
+    "weakening": 0.85,
+    "lagging":   0.60,
+    "unknown":   0.85,
 }
 
 # ── Exposure scaling by market regime ─────────────────────────────────────────
@@ -67,14 +67,14 @@ ROTATION_CAP_MULT: dict[str, float] = {
 # exposure.  In a strong/calm environment the portfolio can be fully
 # invested; in a weak/chaotic one it scales down significantly.
 BREADTH_EXPOSURE: dict[str, float] = {
-    "strong": 1.00, "healthy": 0.95, "moderate": 0.88,
-    "neutral": 0.80, "mixed": 0.72, "narrow": 0.65,
-    "weak": 0.50, "critical": 0.35, "unknown": 0.75,
+    "strong": 1.00, "healthy": 1.00, "moderate": 0.95,
+    "neutral": 0.92, "mixed": 0.88, "narrow": 0.82,
+    "weak": 0.75, "critical": 0.60, "unknown": 0.90,
 }
 VOL_EXPOSURE: dict[str, float] = {
-    "calm": 1.00, "low": 0.97, "normal": 0.92, "moderate": 0.85,
-    "elevated": 0.72, "stressed": 0.55, "chaotic": 0.38,
-    "unknown": 0.80,
+    "calm": 1.00, "low": 1.00, "normal": 0.97, "moderate": 0.95,
+    "elevated": 0.88, "stressed": 0.75, "chaotic": 0.60,
+    "unknown": 0.92,
 }
 
 
