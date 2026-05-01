@@ -1,14 +1,16 @@
 """
 backtest/phase2/tracker.py
 Virtual portfolio tracker with minimum hold period,
-trailing stop, max hold duration, and momentum-tilted buy ranking.
+trailing stop, max hold duration, and score-ranked buys.
 
-Key features:
-  - MOMENTUM/BETA-TILTED BUY RANKING
-  - VARIABLE POSITION SIZING from pipeline (sigpositionpct_v2)
-  - Dynamic sizing uses current NAV
-  - force_exits() tags exit_type for attribution
-  - Trailing stop at open price (gap-down protection)
+Features:
+  - MOMENTUM/BETA-TILTED BUY RANKING: among BUY candidates, ranks by a
+    blended score that favors high-momentum, high-vol names.
+  - VARIABLE POSITION SIZING: _buy() accepts per-ticker weight from pipeline.
+  - Dynamic sizing uses current NAV (not frozen initial_capital).
+  - force_exits() tags exit_type for attribution.
+  - Trailing stop fires at open price (gap-down protection).
+  - MIN BETA FILTER: optionally skips low-vol names entirely.
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ class Position:
     latest_score: float = 0.0
     current_price: float = 0.0
     target_weight: float = 0.0
-    entry_momentum_rank: float = 0.0
+    entry_momentum_rank: float = 0.0  # diagnostic: the blended rank at entry
 
     def __post_init__(self):
         if self.peak_price == 0.0:
@@ -80,12 +82,18 @@ class PortfolioTracker:
         self._filtered_low_vol: int = 0
         self._ranking_logged: bool = False
 
+    # ──────────────────────────────────────────────────────────
+    #  NAV
+    # ──────────────────────────────────────────────────────────
     @property
     def nav(self) -> float:
         return self.cash + sum(
             pos.market_value for pos in self.positions.values()
         )
 
+    # ──────────────────────────────────────────────────────────
+    #  Min-hold check
+    # ──────────────────────────────────────────────────────────
     def _can_sell(self, pos: Position, date, current_price: float) -> bool:
         held_days = (date - pos.entry_date).days
         if held_days >= self.min_hold_days:
@@ -99,6 +107,9 @@ class PortfolioTracker:
             return True
         return False
 
+    # ──────────────────────────────────────────────────────────
+    #  Force exits: trailing stop + max hold
+    # ──────────────────────────────────────────────────────────
     def force_exits(self, date, prices, **kw) -> List[str]:
         force_sold = []
         for ticker in list(self.positions):
@@ -121,9 +132,8 @@ class PortfolioTracker:
 
             if drawdown_from_entry < -0.25:
                 log.warning(
-                    "  ⚠ BIG LOSS %-10s  from_entry=%.1f%%  "
-                    "from_peak=%.1f%%  price=$%.2f  peak=$%.2f  "
-                    "entry=$%.2f  held=%dd",
+                    "  ⚠ BIG LOSS %-10s  from_entry=%.1f%%  from_peak=%.1f%%  "
+                    "price=$%.2f  peak=$%.2f  entry=$%.2f  held=%dd",
                     ticker,
                     drawdown_from_entry * 100,
                     drawdown_from_peak * 100,
@@ -134,9 +144,7 @@ class PortfolioTracker:
             exit_type = None
 
             if held_days >= self.max_hold_days:
-                reason = (
-                    f"max_hold ({held_days}d >= {self.max_hold_days}d)"
-                )
+                reason = f"max_hold ({held_days}d >= {self.max_hold_days}d)"
                 exit_type = "force_exit_max_hold"
             elif drawdown_from_peak <= -self.trailing_stop_pct:
                 reason = (
@@ -152,6 +160,9 @@ class PortfolioTracker:
 
         return force_sold
 
+    # ──────────────────────────────────────────────────────────
+    #  Upgrade
+    # ──────────────────────────────────────────────────────────
     def try_upgrades(
         self,
         date,
@@ -214,6 +225,17 @@ class PortfolioTracker:
 
     # ──────────────────────────────────────────────────────────
     #  BLENDED BUY RANKING — momentum/beta tilt
+    #
+    #  The ranking formula:
+    #    blended_rank = composite_rank * (1 - tilt) + momentum_rank * tilt
+    #
+    #  Where momentum_rank is derived from:
+    #    - rszscore (relative strength z-score vs benchmark)
+    #    - trailing realized volatility (higher vol = higher beta proxy)
+    #    - rsi14 (current momentum)
+    #
+    #  This ensures that among all BUY candidates with similar scores,
+    #  we pick the ones with higher beta / stronger momentum.
     # ──────────────────────────────────────────────────────────
     def _rank_buy_candidates(
         self,
@@ -224,86 +246,120 @@ class PortfolioTracker:
         params: Dict,
     ) -> List[str]:
         """
-        Re-rank buy candidates: blended composite + momentum/vol preference.
+        Re-rank buy candidates using blended composite + momentum score.
+
+        params keys:
+            momentum_tilt:     0.0-1.0, how much to favor momentum (default 0.4)
+            vol_preference:    0.0-1.0, weight of vol in momentum score (default 0.3)
+            min_trailing_vol:  minimum annualized vol to pass filter (default 0.0)
+            min_rszscore:      minimum RS z-score to pass filter (default -99)
+            prefer_strong_buy: bonus multiplier for STRONG_BUY (default 1.0, no bonus)
+
+        Returns: buy_tickers sorted best-first (highest blended rank).
         """
         if not buy_tickers:
             return []
 
         tilt = params.get("momentum_tilt", 0.4)
         vol_weight = params.get("vol_preference", 0.3)
+        min_vol = params.get("min_trailing_vol", 0.0)
+        min_rs = params.get("min_rszscore", -99.0)
 
-        n = len(buy_tickers)
-        if n == 1:
-            return buy_tickers
-
-        # ── Compute composite rank (percentile) ──────────────
-        score_sorted = sorted(
-            buy_tickers, key=lambda t: scores.get(t, 0.0)
-        )
-        composite_rank = {
-            t: i / max(n - 1, 1) for i, t in enumerate(score_sorted)
-        }
-
-        # ── Compute momentum rank ────────────────────────────
-        momentum_raw = {}
+        # ── Step 1: Filter out low-vol / low-RS names ────────────
+        filtered = []
         for t in buy_tickers:
+            vol = trailing_vols.get(t, 0.0)
+            mm = momentum_metrics.get(t, {})
+            rs = mm.get("rszscore", mm.get("rs_zscore", 0.0))
+
+            # Filter: skip low-vol names (likely bonds, utilities, stable large caps)
+            if min_vol > 0 and vol < min_vol:
+                self._filtered_low_vol += 1
+                log.debug(
+                    "  FILTER %-10s: trailing_vol=%.3f < min_vol=%.3f",
+                    t, vol, min_vol,
+                )
+                continue
+
+            # Filter: skip negative RS z-score (underperforming benchmark)
+            if rs < min_rs:
+                log.debug(
+                    "  FILTER %-10s: rszscore=%.3f < min_rszscore=%.3f",
+                    t, rs, min_rs,
+                )
+                continue
+
+            filtered.append(t)
+
+        if not filtered:
+            # If all filtered out, fall back to original list (safety)
+            log.debug(
+                "  RANKING: all %d candidates filtered out, using unfiltered",
+                len(buy_tickers),
+            )
+            filtered = buy_tickers
+
+        # ── Step 2: Compute composite rank (percentile) ──────────
+        n = len(filtered)
+        if n == 1:
+            return filtered
+
+        # Sort by composite score → assign percentile rank (0=worst, 1=best)
+        score_sorted = sorted(filtered, key=lambda t: scores.get(t, 0.0))
+        composite_rank = {t: i / (n - 1) for i, t in enumerate(score_sorted)}
+
+        # ── Step 3: Compute momentum rank ────────────────────────
+        # Momentum signal = weighted blend of rszscore + trailing_vol + rsi
+        momentum_raw = {}
+        for t in filtered:
             mm = momentum_metrics.get(t, {})
             rs = mm.get("rszscore", mm.get("rs_zscore", 0.0))
             rsi = mm.get("rsi14", mm.get("rsi_14", 50.0))
-            vol = trailing_vols.get(t, 0.30)
-            # Also try realizedvol20d from pipeline
-            if vol == 0.30 and "realizedvol20d" in mm:
-                vol = mm["realizedvol20d"]
+            vol = trailing_vols.get(t, 0.30)  # default 30% annualized
 
-            # Normalize RSI to 0-1 scale (30-70 → 0-1)
+            # Normalize RSI to 0-1 scale (30-70 range → 0-1)
             rsi_norm = max(0.0, min(1.0, (rsi - 30) / 40.0))
 
-            # Normalize RS z-score (-3 to +3 → 0-1)
+            # Normalize RS z-score (typically -3 to +3 → 0-1)
             rs_norm = max(0.0, min(1.0, (rs + 2.0) / 4.0))
 
-            # Normalize vol (0.15 to 0.80 → 0-1)
+            # Normalize vol (0.15 to 0.80 typical range → 0-1)
             vol_norm = max(0.0, min(1.0, (vol - 0.15) / 0.65))
 
-            # Blend: RS primary, vol as configured, RSI secondary
-            rs_weight = max(0.3, 1.0 - vol_weight - 0.2)
+            # Blend: RS is primary, vol preference configurable, RSI secondary
+            rs_weight = 1.0 - vol_weight - 0.2  # remainder after vol + rsi
             momentum_raw[t] = (
-                rs_norm * rs_weight
-                + vol_norm * vol_weight
-                + rsi_norm * 0.2
+                rs_norm * max(rs_weight, 0.3) +
+                vol_norm * vol_weight +
+                rsi_norm * 0.2
             )
 
         # Rank momentum (percentile)
-        mom_sorted = sorted(
-            buy_tickers, key=lambda t: momentum_raw.get(t, 0.0)
-        )
-        momentum_rank = {
-            t: i / max(n - 1, 1) for i, t in enumerate(mom_sorted)
-        }
+        mom_sorted = sorted(filtered, key=lambda t: momentum_raw.get(t, 0.0))
+        momentum_rank = {t: i / (n - 1) for i, t in enumerate(mom_sorted)}
 
-        # ── Blend ────────────────────────────────────────────
+        # ── Step 4: Blend ────────────────────────────────────────
         blended = {}
-        for t in buy_tickers:
+        for t in filtered:
             blended[t] = (
-                composite_rank[t] * (1.0 - tilt)
-                + momentum_rank[t] * tilt
+                composite_rank[t] * (1.0 - tilt) +
+                momentum_rank[t] * tilt
             )
 
-        result = sorted(
-            buy_tickers, key=lambda t: blended[t], reverse=True
-        )
+        # Sort descending (highest blended rank = best candidate)
+        result = sorted(filtered, key=lambda t: blended[t], reverse=True)
 
-        # ── Log ranking (first time + every 50th) ────────────
-        if not self._ranking_logged and len(result) >= 2:
+        # ── Log ranking details (first time only) ────────────────
+        if not self._ranking_logged and len(result) >= 3:
             log.info(
-                "  RANKING (tilt=%.2f, vol_pref=%.2f):",
-                tilt, vol_weight,
+                "  RANKING (tilt=%.2f, vol_pref=%.2f, min_vol=%.3f, min_rs=%.1f):",
+                tilt, vol_weight, min_vol, min_rs,
             )
-            for t in result[:6]:
+            for t in result[:5]:
                 mm = momentum_metrics.get(t, {})
                 log.info(
-                    "    %-12s  comp_rank=%.2f  mom_rank=%.2f  "
-                    "blended=%.3f  score=%.3f  rs=%.2f  vol=%.3f  "
-                    "rsi=%.1f",
+                    "    %-12s  composite_rank=%.2f  mom_rank=%.2f  "
+                    "blended=%.3f  score=%.3f  rs=%.2f  vol=%.3f",
                     t,
                     composite_rank.get(t, 0),
                     momentum_rank.get(t, 0),
@@ -311,7 +367,11 @@ class PortfolioTracker:
                     scores.get(t, 0),
                     mm.get("rszscore", mm.get("rs_zscore", 0)),
                     trailing_vols.get(t, 0),
-                    mm.get("rsi14", mm.get("rsi_14", 0)),
+                )
+            if len(buy_tickers) > len(filtered):
+                log.info(
+                    "    (filtered %d → %d candidates)",
+                    len(buy_tickers), len(filtered),
                 )
             self._ranking_logged = True
 
@@ -346,10 +406,7 @@ class PortfolioTracker:
                     continue
                 pos = self.positions[ticker]
                 if self._can_sell(pos, date, prices[ticker]):
-                    self._sell(
-                        date, ticker, prices[ticker],
-                        exit_type="signal_exit",
-                    )
+                    self._sell(date, ticker, prices[ticker], exit_type="signal_exit")
                 else:
                     held = (date - pos.entry_date).days
                     blocked_sells.append((ticker, held))
@@ -382,9 +439,7 @@ class PortfolioTracker:
             )
         else:
             # Fallback: pure composite score ranking
-            buy_tickers.sort(
-                key=lambda t: scores.get(t, 0.0), reverse=True
-            )
+            buy_tickers.sort(key=lambda t: scores.get(t, 0.0), reverse=True)
 
         slots = self.max_positions - len(self.positions)
         if slots <= 0 or not buy_tickers:
@@ -398,6 +453,9 @@ class PortfolioTracker:
                 target_weight=ticker_weight,
             )
 
+    # ──────────────────────────────────────────────────────────
+    #  Update held positions' scores
+    # ──────────────────────────────────────────────────────────
     def update_scores(self, scores: Dict[str, float]) -> None:
         for ticker, pos in self.positions.items():
             if ticker in scores:
@@ -538,9 +596,10 @@ class PortfolioTracker:
             exit_type or "unknown",
         )
 
-    def mark_to_market(
-        self, date, close_prices: Dict[str, float]
-    ) -> float:
+    # ──────────────────────────────────────────────────────────
+    #  Mark-to-market
+    # ──────────────────────────────────────────────────────────
+    def mark_to_market(self, date, close_prices: Dict[str, float]) -> float:
         pos_val = 0.0
         for t, p in self.positions.items():
             price = close_prices.get(t, p.current_price)

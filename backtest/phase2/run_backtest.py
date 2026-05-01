@@ -192,7 +192,7 @@ CONFIG = {
 
     # FILTER: skip any ticker with RS z-score below this (underperformers)
     # 0.0 = must be at least matching benchmark. -0.5 = slight underperformance ok.
-    "min_rszscore": 0.0,
+    "min_rszscore": -0.5,
 
     # Lookback window for trailing vol computation (trading days)
     "vol_window": 60,
