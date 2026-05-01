@@ -2,17 +2,16 @@
 backtest/phase2/engine.py
 Core backtesting engine with pre-computed indicators for speed.
 
-Fixes applied:
-  - EXIT DOUBLE-GATE REMOVED: sigexit_v2=1 on held tickers → SELL regardless
-    of action_v2 column. The signal layer's exit flag is authoritative.
-  - force_exits() runs unconditionally every day (not gated by prev_actions)
-  - process_signals() receives prev_scores
-  - try_upgrades() called exactly once per day
-  - Position sizing uses current NAV (not frozen initial_capital)
-  - Exit metadata captured on closed trades for post-hoc analysis
-  - Daily debug spam moved to DEBUG level, only on first occurrence
-  - VARIABLE POSITION SIZING: extracts per-ticker position_pct from pipeline
-  - MOMENTUM/BETA TILT: buy ranking blends composite + momentum preference
+KEY CHANGE: Signal capping via _cap_buy_signals() ensures that:
+  - At most MAX_BUY_SIGNALS_PER_DAY buy signals are acted on
+  - Top STRONG_BUY_LIMIT get STRONG_BUY, rest become BUY
+  - This mirrors real-life trading: you can't act on 81 signals/day
+
+Other fixes:
+  - EXIT DOUBLE-GATE REMOVED: sigexit_v2=1 on held tickers → SELL
+  - force_exits() runs unconditionally every day
+  - Position sizing: equal weight (operator decides real sizing)
+  - MOMENTUM/BETA TILT in buy ranking
 """
 from __future__ import annotations
 
@@ -27,6 +26,10 @@ from backtest.phase2.tracker import PortfolioTracker
 
 log = logging.getLogger(__name__)
 
+# ── Signal caps (must match portfolio_v2.py) ──────────────────────────────────
+STRONG_BUY_LIMIT = 15
+MAX_BUY_SIGNALS_PER_DAY = 25
+
 
 class BacktestEngine:
 
@@ -38,7 +41,7 @@ class BacktestEngine:
         start_date: str,
         end_date: str,
         initial_capital: float = 1_000_000.0,
-        max_positions: int = 12,
+        max_positions: int = 25,
         commission_rate: float = 0.0010,
         slippage_rate: float = 0.0010,
         config_name: str = "default",
@@ -66,6 +69,7 @@ class BacktestEngine:
         self._columns_logged: bool = False
         self._sizing_logged: bool = False
         self._momentum_logged: bool = False
+        self._signal_cap_logged: bool = False
         self._exit_source_counts: Dict[str, int] = {
             "signal_exit": 0,
             "force_exit_trailing": 0,
@@ -75,6 +79,75 @@ class BacktestEngine:
 
         # Buy ranking config
         self._buy_ranking_params = config.get("buy_ranking_params", {}) or {}
+
+        # Signal cap config (can be overridden via config)
+        signal_cap_cfg = config.get("signal_cap_params", {}) or {}
+        self._strong_buy_limit = signal_cap_cfg.get(
+            "strong_buy_limit", STRONG_BUY_LIMIT
+        )
+        self._max_buy_signals = signal_cap_cfg.get(
+            "max_buy_signals", MAX_BUY_SIGNALS_PER_DAY
+        )
+
+    # ==================================================================
+    #  SIGNAL CAPPING — the key change for real-life signal quality
+    # ==================================================================
+    def _cap_buy_signals(
+        self,
+        actions: Dict[str, str],
+        scores: Dict[str, float],
+    ) -> Dict[str, str]:
+        """
+        Cap total buy signals per day and enforce STRONG_BUY limit.
+
+        This is the CORE mechanism that reduces 81 signals/day → ~20.
+        In real trading, you cannot meaningfully act on 81 names.
+        The top 15 by score get STRONG_BUY, next 5-10 get BUY, rest dropped.
+
+        Sell signals pass through unchanged.
+        """
+        # Separate sells from buys
+        sells = {t: a for t, a in actions.items() if a == "SELL"}
+        buys = {t: a for t, a in actions.items() if a in ("BUY", "STRONG_BUY")}
+
+        if not buys:
+            return sells
+
+        # Rank buy candidates by composite score (higher = better)
+        ranked_tickers = sorted(
+            buys.keys(),
+            key=lambda t: scores.get(t, 0.0),
+            reverse=True,
+        )
+
+        # Cap total signals
+        ranked_tickers = ranked_tickers[:self._max_buy_signals]
+
+        # Assign tiers: top N = STRONG_BUY, rest = BUY
+        capped = {}
+        for i, ticker in enumerate(ranked_tickers):
+            if i < self._strong_buy_limit:
+                capped[ticker] = "STRONG_BUY"
+            else:
+                capped[ticker] = "BUY"
+
+        # Log the first time we cap
+        if not self._signal_cap_logged and len(buys) > self._max_buy_signals:
+            log.info(
+                "[%s] SIGNAL CAP: %d raw buy signals → %d "
+                "(%d STRONG_BUY + %d BUY). Dropped %d low-ranked names.",
+                self.config_name,
+                len(buys),
+                len(capped),
+                min(self._strong_buy_limit, len(capped)),
+                max(0, len(capped) - self._strong_buy_limit),
+                len(buys) - len(capped),
+            )
+            self._signal_cap_logged = True
+
+        # Merge sells back in
+        capped.update(sells)
+        return capped
 
     def _extract_scores(self, output: Dict) -> Dict[str, float]:
         """Pull composite scores from the pipeline output table."""
@@ -111,14 +184,9 @@ class BacktestEngine:
     def _extract_momentum_metrics(self, output: Dict) -> Dict[str, Dict[str, float]]:
         """
         Extract per-ticker momentum and volatility metrics from the pipeline.
-
-        Returns {ticker: {rszscore, rsi14, adx14, realized_vol, closevsema30pct}}
-
-        These are used to tilt buy ranking toward high-beta/high-momentum names.
         """
         metrics: Dict[str, Dict[str, float]] = {}
 
-        # Columns to look for (in priority order for momentum signal)
         MOMENTUM_COLS = (
             "rszscore", "rs_zscore", "rsz_score",
             "rsi14", "rsi_14",
@@ -133,10 +201,8 @@ class BacktestEngine:
             if not isinstance(df, pd.DataFrame) or df.empty:
                 continue
 
-            # Find which momentum columns are available
             available = [c for c in MOMENTUM_COLS if c in df.columns]
             if not available:
-                # Try to compute realized vol from precomputed frames
                 break
 
             if not self._momentum_logged:
@@ -164,13 +230,10 @@ class BacktestEngine:
         return metrics
 
     # ==================================================================
-    #  COMPUTE REALIZED VOLATILITY (beta proxy) from precomputed frames
+    #  COMPUTE REALIZED VOLATILITY
     # ==================================================================
     def _compute_trailing_vol(self, day, tickers: List[str], window: int = 60) -> Dict[str, float]:
-        """
-        Compute annualized trailing volatility for each ticker as a beta proxy.
-        Higher vol ≈ higher beta in practice for equity names.
-        """
+        """Compute annualized trailing volatility for each ticker."""
         cutoff = pd.Timestamp(day)
         vols: Dict[str, float] = {}
 
@@ -195,7 +258,6 @@ class BacktestEngine:
         """
         Extract per-ticker position sizing from the pipeline output.
         Returns {ticker: weight} where weight is a fraction of NAV.
-        If no sizing column found, returns empty dict (caller uses equal-weight).
         """
         sizing: Dict[str, float] = {}
 
@@ -510,7 +572,7 @@ class BacktestEngine:
             upgrade_min_score_gap=sig_params.get("upgrade_min_score_gap", 999),
         )
 
-        # ── log buy ranking config ───────────────────────────
+        # ── log config ────────────────────────────────────────
         brp = self._buy_ranking_params
         log.info(
             "[%s] BUY RANKING CONFIG: momentum_tilt=%.2f  "
@@ -523,13 +585,18 @@ class BacktestEngine:
             brp.get("min_rszscore", -99),
             brp.get("use_realized_vol", True),
         )
+        log.info(
+            "[%s] SIGNAL CAP CONFIG: strong_buy_limit=%d  max_buy_signals=%d",
+            self.config_name, self._strong_buy_limit, self._max_buy_signals,
+        )
 
         log.info(
             "[%s] backtest %s → %s  (%d days, %d tickers)  "
-            "min_hold=%dd  min_profit=%.0f%%  trailing_stop=%.0f%%  "
+            "max_positions=%d  min_hold=%dd  trailing_stop=%.0f%%  "
             "max_hold=%dd",
             self.config_name, self.start_date, self.end_date,
-            len(trading_days), len(tickers), min_hold, min_profit * 100,
+            len(trading_days), len(tickers), self.max_positions,
+            min_hold,
             sig_params.get("trailing_stop_pct", 0.18) * 100,
             sig_params.get("max_hold_days", 120),
         )
@@ -543,8 +610,9 @@ class BacktestEngine:
         prev_exit_tickers: Set[str] = set()
         bench_start_close: float | None = None
 
-        # Cash utilization tracking
+        # Diagnostics
         cash_utilization_pcts: List[float] = []
+        daily_signal_counts: List[int] = []
 
         for i, day in enumerate(trading_days):
 
@@ -582,6 +650,19 @@ class BacktestEngine:
                 held = set(tracker.positions.keys())
                 actions = self._extract_actions(output, held_tickers=held)
                 scores = self._extract_scores(output)
+
+                # ══════════════════════════════════════════════════
+                #  SIGNAL CAPPING — the critical change
+                # ══════════════════════════════════════════════════
+                raw_buy_count = sum(
+                    1 for a in actions.values() if a in ("BUY", "STRONG_BUY")
+                )
+                actions = self._cap_buy_signals(actions, scores)
+                capped_buy_count = sum(
+                    1 for a in actions.values() if a in ("BUY", "STRONG_BUY")
+                )
+                daily_signal_counts.append(capped_buy_count)
+
                 sizes = self._extract_position_sizes(output)
                 momentum = self._extract_momentum_metrics(output)
 
@@ -598,7 +679,7 @@ class BacktestEngine:
                 else:
                     trailing_vol = {}
 
-                # ── CRITICAL FIX: Extract exit flags DIRECTLY ──────
+                # ── Extract exit flags DIRECTLY ────────────────
                 exit_tickers = self._extract_exit_flags(output, held)
 
                 # Merge direct exit flags into actions
@@ -626,16 +707,20 @@ class BacktestEngine:
                 momentum, trailing_vol = {}, {}
                 exit_metadata = {}
                 exit_tickers = set()
+                daily_signal_counts.append(0)
 
             # ── 2. log signals ────────────────────────────────
             buy_sigs = [t for t, a in actions.items() if a in ("BUY", "STRONG_BUY")]
             sell_sigs = [t for t, a in actions.items() if a == "SELL"]
+            strong_buys = [t for t, a in actions.items() if a == "STRONG_BUY"]
             if buy_sigs or sell_sigs:
                 log.info(
-                    "[%s] %s  BUY %s | SELL %s",
+                    "[%s] %s  STRONG_BUY(%d) %s | BUY(%d) | SELL %s",
                     self.config_name,
                     day.strftime("%Y-%m-%d"),
-                    buy_sigs if buy_sigs else "—",
+                    len(strong_buys),
+                    strong_buys[:5] if strong_buys else "—",
+                    len(buy_sigs) - len(strong_buys),
                     sell_sigs if sell_sigs else "—",
                 )
 
@@ -749,8 +834,9 @@ class BacktestEngine:
                 "cash_pct": 100.0 * tracker.cash / max(port_value, 1),
                 "n_positions": len(tracker.positions),
                 "positions": list(tracker.positions.keys()),
-                "n_buys": sum(1 for a in actions.values()
-                              if a in ("BUY", "STRONG_BUY")),
+                "n_buys_raw": raw_buy_count if 'raw_buy_count' in dir() else 0,
+                "n_buys_capped": capped_buy_count if 'capped_buy_count' in dir() else 0,
+                "n_strong_buys": len(strong_buys) if 'strong_buys' in dir() else 0,
                 "n_sells": sum(1 for a in actions.values()
                                if a == "SELL"),
                 "n_exit_flags": len(exit_tickers),
@@ -792,6 +878,15 @@ class BacktestEngine:
                 min(cash_utilization_pcts),
                 max(cash_utilization_pcts),
             )
+        if daily_signal_counts:
+            avg_signals = sum(daily_signal_counts) / len(daily_signal_counts)
+            max_signals = max(daily_signal_counts)
+            log.info(
+                "[%s] SIGNAL STATS: avg=%.1f/day  max=%d/day  "
+                "cap=%d  (raw pipeline avg was higher)",
+                self.config_name, avg_signals, max_signals,
+                self._max_buy_signals,
+            )
 
         return {
             "config_name": self.config_name,
@@ -816,6 +911,10 @@ class BacktestEngine:
             "avg_cash_pct": (
                 sum(cash_utilization_pcts) / len(cash_utilization_pcts)
                 if cash_utilization_pcts else 0
+            ),
+            "avg_daily_signals": (
+                sum(daily_signal_counts) / len(daily_signal_counts)
+                if daily_signal_counts else 0
             ),
         }
 

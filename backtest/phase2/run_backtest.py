@@ -2,9 +2,7 @@
 backtest/phase2/run_backtest.py
 CLI entry point — single-config backtest.
 
-    python -m backtest.phase2.run_backtest --market HK --start 2025-10-01 --end 2026-04-20
-    python -m backtest.phase2.run_backtest --market IN --start 2025-06-01 --end 2026-04-20
-    python -m backtest.phase2.run_backtest --market US --start 2025-06-01 --end 2026-04-20
+    python -m backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20
 """
 from __future__ import annotations
 
@@ -44,13 +42,7 @@ LOGS_DIR = Path("logs") / "backtest"
 
 
 def _setup_logging(market: str, level: int = logging.INFO) -> Path:
-    """
-    Configure the root logger to write to both:
-      • stderr   (concise, INFO+)
-      • file     (verbose, DEBUG+)
-
-    Returns the path to the log file.
-    """
+    """Configure dual logging (file + console)."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -59,7 +51,6 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # ── file handler (verbose — captures DEBUG from all modules) ──
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
@@ -68,7 +59,6 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
     ))
     root.addHandler(fh)
 
-    # ── console handler (concise — INFO only) ─────────────────────
     ch = logging.StreamHandler()
     ch.setLevel(level)
     ch.setFormatter(logging.Formatter(
@@ -77,7 +67,6 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
     ))
     root.addHandler(ch)
 
-    # ── silence noisy modules on the console ──────────────────────
     for noisy in (
         "refactor.strategy.rotation_v2",
         "refactor.pipeline_v2",
@@ -90,7 +79,6 @@ def _setup_logging(market: str, level: int = logging.INFO) -> Path:
 
 
 def _log_and_print(msg: str, rich_msg: str | None = None, level: int = logging.INFO):
-    """Log a plain-text message AND print a (possibly styled) version to Rich console."""
     log.log(level, msg)
     console.print(rich_msg if rich_msg is not None else msg)
 
@@ -167,7 +155,7 @@ def load_data(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SINGLE CONFIG — imported from refactor.common.config_refactor
+#  SINGLE CONFIG
 # ══════════════════════════════════════════════════════════════════
 
 CONFIG = {
@@ -180,26 +168,25 @@ CONFIG = {
     "breadth_params":     BREADTHPARAMS,
     "rotation_params":    ROTATIONPARAMS,
     "buy_ranking_params": {
-    # How much to tilt toward momentum/beta (0=pure composite, 1=pure momentum)
-    "momentum_tilt": 0.50,
-
-    # Within the momentum signal, how much weight to give volatility (beta proxy)
-    "vol_preference": 0.30,
-
-    # FILTER: skip any ticker with annualized vol below this (kills bonds/utilities)
-    # SPY is ~15-20%, high-beta growth is 35-60%. Set to 0.25 to filter out low-vol.
-    "min_trailing_vol": 0.25,
-
-    # FILTER: skip any ticker with RS z-score below this (underperformers)
-    # 0.0 = must be at least matching benchmark. -0.5 = slight underperformance ok.
-    "min_rszscore": -0.50,
-
-    # Lookback window for trailing vol computation (trading days)
-    "vol_window": 60,
-
-    # Whether to compute/use realized vol at all
-    "use_realized_vol": True,
-},
+        # How much to tilt toward momentum/beta (0=pure composite, 1=pure momentum)
+        "momentum_tilt": 0.50,
+        # Within the momentum signal, how much weight to give vol (beta proxy)
+        "vol_preference": 0.30,
+        # FILTER: skip tickers with annualized vol below this
+        "min_trailing_vol": 0.25,
+        # FILTER: skip tickers with RS z-score below this
+        "min_rszscore": -0.50,
+        # Lookback window for trailing vol (trading days)
+        "vol_window": 60,
+        # Whether to compute/use realized vol
+        "use_realized_vol": True,
+    },
+    "signal_cap_params": {
+        # Top 15 names get STRONG_BUY
+        "strong_buy_limit": 15,
+        # Total buy signals per day (STRONG_BUY + BUY)
+        "max_buy_signals": 25,
+    },
 }
 
 
@@ -208,16 +195,13 @@ CONFIG = {
 # ══════════════════════════════════════════════════════════════════
 
 def _edge(port_val: float, bench_val: float, higher_is_better: bool = True) -> str:
-    """Return a Rich-styled string for the edge column."""
     diff = port_val - bench_val
-    # For metrics where lower is better (vol, drawdown), flip sign for colour
     is_good = diff > 0 if higher_is_better else diff < 0
     colour = "green" if is_good else ("red" if (diff != 0) else "dim")
     return f"[{colour}]{diff:+.2%}[/{colour}]"
 
 
 def _edge_ratio(port_val: float, bench_val: float) -> str:
-    """Edge for ratio metrics (not percentages)."""
     diff = port_val - bench_val
     colour = "green" if diff > 0 else ("red" if diff < 0 else "dim")
     return f"[{colour}]{diff:+.3f}[/{colour}]"
@@ -233,7 +217,7 @@ def _print_metrics(
     benchmark_name: str = "",
 ) -> None:
     """Pretty-print backtest metrics with side-by-side comparison."""
-    m = metrics  # shorthand
+    m = metrics
 
     actual_start = m.get("actual_start", "?")
     actual_end = m.get("actual_end", "?")
@@ -258,7 +242,6 @@ def _print_metrics(
         padding=(1, 2),
     ))
 
-    # ── Data coverage warning ─────────────────────────────────────
     if expected > 0 and n_days < expected * 0.85:
         console.print(
             f"  [yellow]⚠  Data coverage:[/] {n_days} trading days found vs "
@@ -281,7 +264,6 @@ def _print_metrics(
     t1.add_column(f"Benchmark ({benchmark_name})", justify="right", min_width=12)
     t1.add_column("Edge", justify="right", min_width=10)
 
-    # helper: percentage row
     def _pct_row(label, port_key, bench_key, higher_is_better=True):
         pv = m.get(port_key, 0)
         bv = m.get(bench_key, 0)
@@ -310,7 +292,6 @@ def _print_metrics(
     _pct_row("Max Drawdown",    "max_drawdown",        "benchmark_max_dd",       higher_is_better=False)
     _ratio_row("Calmar Ratio",  "calmar_ratio",        "benchmark_calmar")
 
-    # Max DD duration (portfolio only)
     dd_dur = m.get("max_dd_duration_days", 0)
     t1.add_row("Max DD Duration", f"{dd_dur:.0f} days", "—", "—")
 
@@ -380,10 +361,10 @@ def _print_metrics(
     console.print()
 
     # ══════════════════════════════════════════════════════════════
-    #  TABLE 4 — Portfolio Utilisation
+    #  TABLE 4 — Portfolio Utilisation & Signal Quality
     # ══════════════════════════════════════════════════════════════
     t4 = Table(
-        title="Portfolio Utilisation",
+        title="Portfolio Utilisation & Signal Quality",
         show_header=True,
         header_style="bold cyan",
         title_style="bold",
@@ -396,6 +377,7 @@ def _print_metrics(
     t4.add_row("Max Positions Held", f"{m.get('max_positions_held', 0):.0f}")
     t4.add_row("Total Buy Signals", f"{m.get('total_buy_signals', 0):,.0f}")
     t4.add_row("Total Sell Signals", f"{m.get('total_sell_signals', 0):,.0f}")
+    t4.add_row("Avg Signals/Day (capped)", f"{m.get('avg_daily_signals', 0):.1f}")
 
     console.print(t4)
     console.print()
@@ -411,21 +393,19 @@ def main():
     )
     parser.add_argument(
         "--market", required=True,
-        help="Market code as defined in common/universe.py  (e.g. HK, IN, US)",
+        help="Market code (e.g. HK, IN, US)",
     )
     parser.add_argument("--start", required=True, help="Start date  YYYY-MM-DD")
     parser.add_argument("--end",   required=True, help="End date    YYYY-MM-DD")
     parser.add_argument("--capital", type=float, default=1_000_000)
-    parser.add_argument("--max-positions", type=int, default=12)
+    parser.add_argument("--max-positions", type=int, default=25)
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--lookback", type=int, default=300,
                         help="Lookback bars for indicator warmup")
     args = parser.parse_args()
 
-    # ── set up dual logging (file + console) ──────────────────
     log_file = _setup_logging(args.market)
 
-    # ── log the full command / args ───────────────────────────
     log.info("=" * 70)
     log.info("Backtest started  market=%s  start=%s  end=%s", args.market, args.start, args.end)
     log.info("capital=%.0f  max_positions=%d  lookback=%d", args.capital, args.max_positions, args.lookback)
@@ -440,7 +420,7 @@ def main():
 
     # ── run backtest ──────────────────────────────────────────
     console.rule("[bold cyan]Running backtest")
-    log.info("--- Running backtest with config from config_refactor ---")
+    log.info("--- Running backtest ---")
 
     engine = BacktestEngine(
         data_source=ds,
@@ -454,6 +434,10 @@ def main():
     )
     results = engine.run()
     metrics = compute_metrics(results)
+
+    # Add signal quality metric
+    metrics["avg_daily_signals"] = results.get("avg_daily_signals", 0)
+
     results["metrics"] = metrics
 
     # ── display ───────────────────────────────────────────────
@@ -465,7 +449,7 @@ def main():
     for key, val in metrics.items():
         log.info("  %-30s  %s", key, val)
 
-    # ── compact summary for quick scan ────────────────────────
+    # ── compact summary ───────────────────────────────────────
     bench_ret = metrics.get("benchmark_total_return", 0)
     ann_ret = metrics.get("annualized_return", 0)
     bench_cagr = metrics.get("benchmark_ann_return", 0)
@@ -480,6 +464,7 @@ def main():
         f"(total {bench_ret:+.1%} / CAGR {bench_cagr:+.1%})",
         f"Strategy        : ${results['final_value']:,.0f}  "
         f"(total {metrics['total_return']:+.1%} / CAGR {ann_ret:+.1%} / alpha {alpha:+.1%})",
+        f"Avg signals/day : {metrics.get('avg_daily_signals', 0):.1f} (cap=25)",
     ]
     console.print()
     for line in summary_lines:
@@ -489,18 +474,11 @@ def main():
     out = Path("backtest_results") / args.market
     out.mkdir(parents=True, exist_ok=True)
 
-    # Metrics CSV
     metrics_rows = [{"Metric": k, "Value": v} for k, v in metrics.items()]
     pd.DataFrame(metrics_rows).to_csv(out / "metrics.csv", index=False)
-
-    # Equity curve (includes benchmark column)
     results["equity_curve"].to_csv(out / "equity_curve.csv", index=False)
-
-    # Trade log
     if not results["trade_log"].empty:
         results["trade_log"].to_csv(out / "trades.csv", index=False)
-
-    # Daily log
     results["daily_log"].to_csv(out / "daily_log.csv", index=False)
 
     _log_and_print(

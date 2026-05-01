@@ -69,10 +69,10 @@ def compute_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── portfolio utilisation ─────────────────────────────────────
     dl = results.get("daily_log", pd.DataFrame())
-    avg_pos = dl["n_positions"].mean() if not dl.empty else 0
-    max_pos = int(dl["n_positions"].max()) if not dl.empty else 0
-    total_buys = int(dl["n_buys"].sum()) if not dl.empty else 0
-    total_sells = int(dl["n_sells"].sum()) if not dl.empty else 0
+    avg_pos = dl["n_positions"].mean() if ("n_positions" in dl.columns and not dl.empty) else 0
+    max_pos = int(dl["n_positions"].max()) if ("n_positions" in dl.columns and not dl.empty) else 0
+    total_buys = int(dl["n_buys"].sum()) if ("n_buys" in dl.columns and not dl.empty) else 0
+    total_sells = int(dl["n_sells"].sum()) if ("n_sells" in dl.columns and not dl.empty) else 0
 
     # ── trade stats ───────────────────────────────────────────────
     tm = _trade_metrics(trades)
