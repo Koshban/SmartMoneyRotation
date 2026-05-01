@@ -45,12 +45,21 @@ DEFAULT_MAX_SINGLE_WEIGHT = 0.08  # ~equal weight for 12-25 names
 DEFAULT_MIN_WEIGHT = 0.02
 
 # ── Rotation-aware sector cap multipliers ─────────────────────────────────────
+# ROTATION_CAP_MULT: dict[str, float] = {
+#     "leading":   1.00,
+#     "improving": 1.00,
+#     "weakening": 0.80,
+#     "lagging":   0.55,
+#     "unknown":   0.85,
+# }
+
+# ── Set all rotation caps to 1.0 (no penalizing lagging sectors) ──────────────
 ROTATION_CAP_MULT: dict[str, float] = {
     "leading":   1.00,
     "improving": 1.00,
-    "weakening": 0.80,
-    "lagging":   0.55,
-    "unknown":   0.85,
+    "weakening": 1.00,
+    "lagging":   1.00,
+    "unknown":   1.00,
 }
 
 # ── Exposure scaling by market regime ─────────────────────────────────────────
@@ -58,17 +67,27 @@ ROTATION_CAP_MULT: dict[str, float] = {
 # When fewer stocks participate in a rally, it signals fragility BEFORE the drop.
 # We keep this simple — not trying to time perfectly, just reducing exposure
 # when the market's internal health is deteriorating.
+# BREADTH_EXPOSURE: dict[str, float] = {
+#     "strong": 1.00, "healthy": 1.00, "moderate": 0.95,
+#     "neutral": 0.90, "mixed": 0.85, "narrow": 0.75,
+#     "weak": 0.60, "critical": 0.40, "unknown": 0.90,
+# }
+# VOL_EXPOSURE: dict[str, float] = {
+#     "calm": 1.00, "low": 1.00, "normal": 1.00, "moderate": 0.95,
+#     "elevated": 0.85, "stressed": 0.70, "chaotic": 0.50,
+#     "unknown": 0.95,
+# }
+# ── Set all exposure to 1.0 (no scaling) ─────────────────────────────────────
 BREADTH_EXPOSURE: dict[str, float] = {
-    "strong": 1.00, "healthy": 1.00, "moderate": 0.95,
-    "neutral": 0.90, "mixed": 0.85, "narrow": 0.75,
-    "weak": 0.60, "critical": 0.40, "unknown": 0.90,
+    "strong": 1.00, "healthy": 1.00, "moderate": 1.00,
+    "neutral": 1.00, "mixed": 1.00, "narrow": 1.00,
+    "weak": 1.00, "critical": 1.00, "unknown": 1.00,
 }
 VOL_EXPOSURE: dict[str, float] = {
-    "calm": 1.00, "low": 1.00, "normal": 1.00, "moderate": 0.95,
-    "elevated": 0.85, "stressed": 0.70, "chaotic": 0.50,
-    "unknown": 0.95,
+    "calm": 1.00, "low": 1.00, "normal": 1.00, "moderate": 1.00,
+    "elevated": 1.00, "stressed": 1.00, "chaotic": 1.00,
+    "unknown": 1.00,
 }
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers

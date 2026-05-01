@@ -1350,8 +1350,8 @@ def run_pipeline_v2(
         "etf_ranking": etf_ranking,
         "leadership_snapshot": leadership_snapshot,
     }
-
-######################
+    
+#####################################
 """refactor/runner_v2.py"""
 from __future__ import annotations
 
@@ -2779,8 +2779,8 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
-#################################
+    
+###########################################
 """
 refactor/report_v2.py
 
@@ -3571,3 +3571,5 @@ def to_text_v2(report: dict) -> str:
         len(lines), len(text),
     )
     return text
+    
+#####################################

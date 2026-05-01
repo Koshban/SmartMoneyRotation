@@ -73,7 +73,7 @@ INTERNATIONAL = [
 
 HK_ETFS = ["2800.HK", "2828.HK", "3033.HK", "3067.HK"]
 
-FIXED_INCOME = ["TLT", "IEF", "HYG", "LQD", "TIP", "AGG"]
+FIXED_INCOME = ["TLT", "AGG"]
 
 COMMODITIES = ["GLD", "SLV", "USO", "UNG", "DBA", "DBC"]
 

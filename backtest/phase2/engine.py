@@ -479,60 +479,28 @@ class BacktestEngine:
     # ==================================================================
     #  PRE-COMPUTATION
     # ==================================================================
+    # ==================================================================
+    #  PRE-COMPUTATION (with caching)
+    # ==================================================================
     def _precompute_all(self):
-        """Pre-compute per-ticker indicators, RS z-scores, and benchmark regime."""
-        from refactor.pipeline_v2 import (
-            _canonicalize_indicator_columns,
-            _fill_missing_indicators,
-            annotate_scoreability,
+        """Load cached indicators or compute and cache them."""
+        from backtest.phase2.data_cache import load_or_compute_indicators
+
+        invalidate = self.config.get("invalidate_cache", False)
+
+        self._precomputed_frames, self._precomputed_regime_df = load_or_compute_indicators(
+            data_source=self.data_source,
+            market=self.market,
+            vol_regime_params=self.config.get("vol_regime_params"),
+            invalidate=invalidate,
         )
-        from refactor.strategy.adapters_v2 import ensure_columns
-        from refactor.strategy.regime_v2 import classify_volatility_regime
-        from refactor.strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
-        from compute.indicators import compute_all_indicators
-
-        t0 = time.time()
-
-        # 1 — per-ticker indicators
-        raw_frames = {}
-        for ticker, df in self.data_source.ticker_data.items():
-            if df is not None and not df.empty:
-                enriched = compute_all_indicators(df.copy())
-                enriched = _canonicalize_indicator_columns(enriched)
-                enriched = _fill_missing_indicators(enriched)
-                enriched = ensure_columns(enriched)
-                raw_frames[ticker] = enriched
 
         log.info(
-            "[%s] Pre-computed indicators for %d tickers (%.1fs)",
-            self.config_name, len(raw_frames), time.time() - t0,
+            "[%s] Pre-computation ready: %d tickers (cached=%s)",
+            self.config_name,
+            len(self._precomputed_frames),
+            not invalidate,
         )
-
-        # 2 — cross-sectional RS z-scores + regimes
-        t1 = time.time()
-        bench_df = self.data_source.benchmark_data
-        if bench_df is not None and not bench_df.empty:
-            raw_frames = compute_rs_zscores(raw_frames, bench_df)
-            raw_frames = enrich_rs_regimes(raw_frames)
-            self._precomputed_regime_df = classify_volatility_regime(
-                bench_df,
-                params=self.config.get("vol_regime_params"),
-            )
-        log.info(
-            "[%s] Pre-computed RS + regimes (%.1fs)",
-            self.config_name, time.time() - t1,
-        )
-
-        # 3 — annotate scoreability
-        for ticker in raw_frames:
-            raw_frames[ticker] = annotate_scoreability(raw_frames[ticker])
-
-        self._precomputed_frames = raw_frames
-        log.info(
-            "[%s] Pre-computation complete: %d tickers, total %.1fs",
-            self.config_name, len(raw_frames), time.time() - t0,
-        )
-
     # ==================================================================
     #  CURRENT NAV CALCULATION
     # ==================================================================

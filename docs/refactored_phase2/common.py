@@ -51,13 +51,13 @@ SCORINGWEIGHTS_V2 = {
     "participation": 0.20,
     "risk":          0.20,
     "regime":        0.15,
-    "rotation":      0.15,   # ← ADD THIS
+    "rotation":      0.15,
 }
 
 SCORINGPARAMS_V2 = {
     "trend": {
-        "w_stock_rs": 0.50,       # was 0.45 — stock's own momentum matters most
-        "w_sector_rs": 0.20,      # was 0.25 — less weight when rotation disabled
+        "w_stock_rs": 0.50,
+        "w_sector_rs": 0.20,
         "w_rs_accel": 0.15,
         "w_trend_confirm": 0.15,
     },
@@ -74,13 +74,13 @@ SCORINGPARAMS_V2 = {
         "w_extension_penalty": 0.20,
     },
     "regime": {
-        "w_breadth": 0.50,        # was 0.60 — less reliance on possibly-missing data
-        "w_vol_regime": 0.50,     # was 0.40
+        "w_breadth": 0.50,
+        "w_vol_regime": 0.50,
     },
     "penalties": {
-        "rsi_soft_low": 35.0,     # was 38 — allow slightly oversold names
-        "rsi_soft_high": 80.0,    # was 78 — tolerate more stretch
-        "adx_soft_min": 14.0,     # was 16 — don't punish early-stage trends
+        "rsi_soft_low": 35.0,
+        "rsi_soft_high": 80.0,
+        "adx_soft_min": 14.0,
         "atrp_high": 0.07,
         "extension_warn": 0.12,
         "extension_bad": 0.22,
@@ -94,63 +94,57 @@ SCORINGPARAMS_V2 = {
 # ═══════════════════════════════════════════════════════════════════════════════
 SIGNALPARAMS_V2 = {
     # ── Mechanical risk controls (NEW) ──
-    "trailing_stop_pct": 0.18,        # sell if price drops 18% from peak
-    "max_hold_days": 120,             # force review after 120 days
-    "upgrade_min_score_gap": 999,    # swap if candidate beats held by 0.12+
-    
+    "trailing_stop_pct": 0.18,
+    "max_hold_days": 120,
+    "upgrade_min_score_gap": 999,
+
     # ── Core thresholds (these are the 3 real gates) ──
-    "base_entry_threshold": 0.50,     # was 0.58 — let the score do the work
-    "base_exit_threshold": 0.35,      # was 0.42 — wider hold band
+    "base_entry_threshold": 0.50,
+    "base_exit_threshold": 0.35,
 
     # ── RS filter: soft penalty, not hard block ──
-    "allowed_rs_regimes": ("leading", "improving", "weakening"),  # added weakening
+    "allowed_rs_regimes": ("leading", "improving", "weakening"),
     "blocked_sector_regimes": ("lagging",),
-    "rs_fail_penalty": 0.04,          # was 0.08 — devastating when rotation disabled
-    "breadth_fail_penalty": 0.02,     # was 0.03
+    "rs_fail_penalty": 0.04,
+    "breadth_fail_penalty": 0.02,
 
     # ── Hard blocks: only extreme conditions ──
     "hard_block_breadth_regimes": ("critical",),
     "hard_block_vol_regimes": ("chaotic",),
 
     # ── Rank gate (relaxed) ──
-    "min_rank_pct": 0.70,             # was 0.80 — top 30% can buy
-    "exit_rank_floor": 0.15,          # was 0.20
+    "min_rank_pct": 0.70,
+    "exit_rank_floor": 0.15,
 
     # ── Regime adjustments (smaller bumps) ──
     "regime_entry_adjustment": {
         "calm": 0.00,
-        "volatile": 0.02,            # was 0.03
-        "chaotic": 0.06,             # was 0.10
+        "volatile": 0.02,
+        "chaotic": 0.06,
     },
     "breadth_entry_adjustment": {
-        "strong": -0.02,             # was -0.01
-        "neutral": 0.00,             # was 0.02
-        "weak": 0.04,                # was 0.07
-        "critical": 0.10,            # was 0.12
-        "unknown": 0.00,             # was 0.00 in loose — kept neutral
+        "strong": -0.02,
+        "neutral": 0.00,
+        "weak": 0.04,
+        "critical": 0.10,
+        "unknown": 0.00,
     },
 
     # ── Minimum hold (NEW) ──
     "min_hold_days": 5,
-    "min_profit_early_exit_pct": 0.05,   # can exit before 5d if ≥ +5%
+    "min_profit_early_exit_pct": 0.05,
 
     # ── Cooldown ──
-    "cooldown_days": 3,               # was 4
+    "cooldown_days": 3,
 
     # ── Position sizing ──
     "position_base_pct": 0.04,
     "position_range_pct": 0.08,
     "position_max_pct": 0.12,
     "size_multipliers": {
-        "calm": 1.00,
-        "volatile": 0.75,            # was 0.70
-        "chaotic": 0.40,             # was 0.35
+        "calm": 1.00, "moderate": 0.95, "elevated": 0.88,
+        "volatile": 0.75, "chaotic": 0.60,
     },
-
-    # REMOVED (were causing churn via double-gating):
-    # continuation_min_trend, pullback_min_trend, pullback_max_short_extension,
-    # pullback_rsi_max, relative_setup_rank_pct, chaotic_exit_bump,
-    # pullback_min_short_extension, continuation_min_participation
 }
 
 
@@ -173,7 +167,7 @@ CONVERGENCEPARAMS_V2 = {
     "rotation_rec_map": {
         "leading":   "STRONGBUY",
         "improving": "BUY",
-        "weakening": "HOLD",          # loose: weakening = HOLD not SELL
+        "weakening": "HOLD",
         "lagging":   "SELL",
     },
     "rotation_rec_default": "HOLD",
@@ -192,34 +186,33 @@ CONVERGENCEPARAMS_V2 = {
 # is determined by score + percentile only — no secondary gate cascade.
 
 ACTIONPARAMS_V2 = {
-# If you ever want to loosen it back (e.g., broader market with 4 leading sectors), just lower min_score to 0.70 or raise max_strong_buy to 20.
     "strong_buy": {
-    "min_percentile": 0.90,        # was 0.85
-    "min_score": 0.75,             # was 0.68
-    "score_above_entry": 0.06,
-    "require_confirmed": True,     # NEW
-    "allowed_regimes": ["leading", "improving"],  # NEW
-},
-"max_strong_buy": 15,              # NEW
+        "min_percentile": 0.90,
+        "min_score": 0.75,
+        "score_above_entry": 0.06,
+        "require_confirmed": True,
+        "allowed_regimes": ["leading", "improving"],
+    },
+    "max_strong_buy": 15,
     "buy": {
-        "min_percentile": 0.50,       # was 0.65
-        "min_score": 0.52,            # was 0.62
-        "score_above_entry": 0.01,    # was 0.02
+        "min_percentile": 0.50,
+        "min_score": 0.52,
+        "score_above_entry": 0.01,
     },
     "hold": {
-        "min_percentile": 0.25,       # was 0.35
-        "min_score": 0.42,            # was 0.54
+        "min_percentile": 0.25,
+        "min_score": 0.42,
     },
     "sell": {
-        "floor_score": 0.35,          # was 0.50
-        "floor_percentile": 0.10,     # was 0.15
+        "floor_score": 0.35,
+        "floor_percentile": 0.10,
     },
     "overextended": {
-    "max_ema_pct": 0.15,
-    "max_rsi": 80.0,
-    "buy_top_n": 5,              # only top 5 composite scores → BUY
-    "buy_min_percentile": 0.85,  # or: must be in top 15%
-},
+        "max_ema_pct": 0.15,
+        "max_rsi": 80.0,
+        "buy_top_n": 5,
+        "buy_min_percentile": 0.85,
+    },
 }
 
 
@@ -240,6 +233,32 @@ BREADTHPARAMS = {
         "pct_advancing": 0.15,
         "net_new_highs": 0.20,
     },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ██  BREADTH → PORTFOLIO EXPOSURE SCALING                                   ██
+# ═══════════════════════════════════════════════════════════════════════════════
+# Maps breadth regime to capital deployment. In weak breadth, we slash
+# exposure to 40% and block new entries — this is the primary 2022 defense.
+
+BREADTH_PORTFOLIO = {
+    "strong_exposure":     1.00,       # full deployment in strong breadth
+    "neutral_exposure":    0.75,       # reduce 25% in neutral
+    "weak_exposure":       0.40,       # aggressive reduction in weak breadth
+    "weak_block_new":      True,       # no new positions in weak regime
+    "weak_raise_entry":    0.10,       # raise entry threshold by 10pts in weak
+    "neutral_raise_entry": 0.03,       # raise entry threshold by 3pts in neutral
+}
+
+# Simple breadth regime classification for the backtest engine.
+# Uses % of universe above SMA50 as a proxy when full McClellan unavailable.
+
+BREADTH_REGIME_PARAMS = {
+    "breadth_proxy":       "pct_above_sma50",
+    "strong_threshold":    0.65,       # >65% above SMA50 = strong
+    "weak_threshold":      0.35,       # <35% above SMA50 = weak
+    "smoothing_window":    5,          # smooth to avoid whipsaws
 }
 
 
@@ -266,7 +285,86 @@ ROTATIONPARAMS = {
     },
 }
 
-########################################
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ██  STOP-LOSS & RISK MANAGEMENT                                           ██
+# ═══════════════════════════════════════════════════════════════════════════════
+# Three-layer defense:
+#   1. Hard cap — unconditional max loss per position (never breached)
+#   2. Trailing stop — ATR-based, activates after position gains +10%
+#   3. Ratchet — locks in progressively more profit at milestones
+#
+# Together these ensure worst-case single trade loss is -20%, and
+# big winners are never allowed to fully round-trip.
+
+STOP_LOSS_PARAMS = {
+    # ── Initial stop ─────────────────────────────────────────
+    "atr_multiplier":        2.0,       # initial stop = entry - 2*ATR
+    "atr_period":            14,
+
+    # ── Hard cap (unconditional) ─────────────────────────────
+    "max_loss_pct":          0.20,      # NEVER let a position lose more than 20%
+    "max_loss_enabled":      True,
+
+    # ── Trailing stop ────────────────────────────────────────
+    "trailing_enabled":      True,
+    "trail_activation_pct":  0.10,      # start trailing after +10% gain
+    "trail_atr_multiplier":  2.5,       # trail at 2.5*ATR below high-water mark
+    "trail_pct_fallback":    0.15,      # if ATR unavailable, trail at 15% below peak
+
+    # ── Profit lock-in (ratchet) ─────────────────────────────
+    "ratchet_enabled":       True,
+    "ratchet_levels": [
+        # (gain_threshold, minimum_lock_pct)
+        (0.30, 0.10),                   # at +30%, lock in at least +10%
+        (0.50, 0.25),                   # at +50%, lock in at least +25%
+        (1.00, 0.50),                   # at +100%, lock in at least +50%
+    ],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ██  PORTFOLIO CONSTRUCTION                                                 ██
+# ═══════════════════════════════════════════════════════════════════════════════
+# Volatility-targeted position sizing: each position targets equal risk
+# contribution. High-vol names get smaller weights, low-vol names get larger.
+
+PORTFOLIO_PARAMS = {
+    "total_capital":         100_000,
+    "max_positions":         12,
+    "min_positions":          4,
+    "max_sector_pct":        0.30,
+    "max_single_pct":        0.12,
+    "min_single_pct":        0.03,
+    "target_invested_pct":   0.90,
+    "rebalance_threshold":   0.05,
+    "incumbent_bonus":       0.05,
+
+    # ── Volatility targeting ─────────────────────────────────
+    "vol_target_enabled":    True,
+    "portfolio_vol_target":  0.25,      # target 25% annualized portfolio vol
+    "position_vol_target":   0.02,      # each position targets 2% daily risk contribution
+    "vol_lookback":          20,        # realized vol calculation window
+    "vol_floor":             0.10,      # minimum assumed vol (prevents over-leveraging)
+    "vol_cap":               0.80,      # maximum assumed vol (prevents dust positions)
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ██  CORRELATION LIMITS                                                     ██
+# ═══════════════════════════════════════════════════════════════════════════════
+# Prevents portfolio from becoming a single-factor bet (e.g., all semis).
+
+CORRELATION_LIMITS = {
+    "enabled":              True,
+    "lookback_days":        60,
+    "max_avg_correlation":  0.60,       # portfolio avg pairwise corr must stay below
+    "max_pair_correlation": 0.85,       # no two positions with corr > 0.85
+    "cluster_max_pct":      0.40,       # max 40% in a correlated cluster (corr > 0.70)
+}
+
+
+##############################
 """ refactor/common/market_config_v2.py"""
 from __future__ import annotations
 
@@ -346,8 +444,8 @@ def get_market_config_v2(market: str) -> dict:
     cfg["leadership_universe"] = list(cfg["leadership_universe_fn"]())
     cfg["tradable_universe"] = list(cfg["tradable_universe_fn"]())
     return cfg
-
-################################
+    
+######################
 """ refactor/common/universe_loader_v2.py """
 from __future__ import annotations
 
@@ -355,5 +453,3 @@ from __future__ import annotations
 def get_universe_for_market(market: str):
     from common.universe import get_universe_for_market as gufm
     return gufm(market)
-
-##################################################

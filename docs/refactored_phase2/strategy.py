@@ -1,4 +1,3 @@
-""" runner_v2.py → run_strategy_v2() → run_pipeline_v2() → build_portfolio_v2()"""
 """
 refactor/strategy/adapters_v2.py
 
@@ -373,7 +372,7 @@ def validate_frame(
         "total_checked": len(cols_to_check),
     }
     
-####################################
+##################################
 """
 refactor/strategy/breadth_v2.py
 
@@ -608,571 +607,7 @@ def compute_breadth(
 
     return breadth
     
-########################
-"""
-refactor/strategy/portfolio_v2.py
-
-Portfolio construction for the v2 pipeline.
-
-Takes the scored-and-actioned universe and selects a concentrated
-portfolio of up to ``max_positions`` names, subject to:
-
-    1.  Only STRONG_BUY and BUY actions are eligible.
-    2.  Sector concentration caps are *dynamic* — sectors in the
-        ``leading`` or ``improving`` rotation quadrant receive the full
-        ``max_sector_weight``, while ``weakening`` sectors get 60 % of
-        the cap and ``lagging`` sectors get 30 %.
-    3.  Theme diversification: no more than ``max_theme_names`` names
-        from any single theme.
-    4.  Position sizing is inverse-ATR weighted (lower volatility →
-        larger weight), then capped per name at ``max_single_weight``.
-    5.  Total exposure is scaled by a market-regime multiplier derived
-        from the breadth and volatility regime columns already present
-        on every row.
-
-Output
-------
-``build_portfolio_v2`` returns a dict with:
-
-    selected   – DataFrame of the final portfolio with per-name
-                 weights, risk metrics, and selection reasoning.
-    meta       – dict with portfolio-level summary statistics:
-                 selected_count, candidate_count, target_exposure,
-                 breadth_regime, vol_regime, sector_tilt, etc.
-
-Design notes
-------------
-The builder is intentionally *stateless* — it takes a single snapshot
-and produces a target portfolio.  It does not track prior holdings,
-turnover cost, or rebalancing frequency.  Those concerns belong in
-an execution layer that compares today's target with yesterday's
-holdings.
-"""
-from __future__ import annotations
-
-import logging
-
-import numpy as np
-import pandas as pd
-
-logger = logging.getLogger(__name__)
-
-# ── Defaults ──────────────────────────────────────────────────────────────────
-DEFAULT_MAX_POSITIONS = 8
-DEFAULT_MAX_SECTOR_WEIGHT = 0.35
-DEFAULT_MAX_THEME_NAMES = 2
-DEFAULT_MAX_SINGLE_WEIGHT = 0.20
-DEFAULT_MIN_WEIGHT = 0.04
-
-# ── Rotation-aware sector cap multipliers ─────────────────────────────────────
-ROTATION_CAP_MULT: dict[str, float] = {
-    "leading":   1.00,
-    "improving": 1.00,
-    "weakening": 0.85,
-    "lagging":   0.60,
-    "unknown":   0.85,
-}
-
-# ── Exposure scaling by market regime ─────────────────────────────────────────
-# The product of breadth and vol multipliers gives target gross
-# exposure.  In a strong/calm environment the portfolio can be fully
-# invested; in a weak/chaotic one it scales down significantly.
-BREADTH_EXPOSURE: dict[str, float] = {
-    "strong": 1.00, "healthy": 1.00, "moderate": 0.95,
-    "neutral": 0.92, "mixed": 0.88, "narrow": 0.82,
-    "weak": 0.75, "critical": 0.60, "unknown": 0.90,
-}
-VOL_EXPOSURE: dict[str, float] = {
-    "calm": 1.00, "low": 1.00, "normal": 0.97, "moderate": 0.95,
-    "elevated": 0.88, "stressed": 0.75, "chaotic": 0.60,
-    "unknown": 0.92,
-}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _safe_float(value, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    try:
-        f = float(value)
-        return default if np.isnan(f) else f
-    except (TypeError, ValueError):
-        return default
-
-
-def _effective_sector_cap(
-    sector_regime: str,
-    base_cap: float,
-) -> float:
-    """Return the dynamic sector weight cap given the rotation regime."""
-    mult = ROTATION_CAP_MULT.get(
-        str(sector_regime).lower(),
-        ROTATION_CAP_MULT["unknown"],
-    )
-    return base_cap * mult
-
-
-def _target_exposure(breadth: str, vol: str) -> float:
-    """
-    Compute target gross exposure from breadth and volatility regimes.
-
-    Returns a value in roughly [0.13, 1.00].
-    """
-    b = BREADTH_EXPOSURE.get(str(breadth).lower(), BREADTH_EXPOSURE["unknown"])
-    v = VOL_EXPOSURE.get(str(vol).lower(), VOL_EXPOSURE["unknown"])
-    return round(b * v, 4)
-
-
-def _inverse_atr_weights(atr_pct_series: pd.Series) -> pd.Series:
-    """
-    Compute raw inverse-ATR weights.
-
-    Names with lower ATR% get proportionally larger weights.
-    A floor of 0.005 prevents division by zero for ultra-low-vol names.
-    """
-    clamped = atr_pct_series.clip(lower=0.005).fillna(0.03)
-    inv = 1.0 / clamped
-    total = inv.sum()
-    if total <= 0:
-        return pd.Series(1.0 / len(clamped), index=clamped.index)
-    return inv / total
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Public API
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def build_portfolio_v2(
-    action_table: pd.DataFrame,
-    max_positions: int = DEFAULT_MAX_POSITIONS,
-    max_sector_weight: float = DEFAULT_MAX_SECTOR_WEIGHT,
-    max_theme_names: int = DEFAULT_MAX_THEME_NAMES,
-    max_single_weight: float = DEFAULT_MAX_SINGLE_WEIGHT,
-    min_weight: float = DEFAULT_MIN_WEIGHT,
-) -> dict:
-    """
-    Build a concentrated target portfolio from the actioned universe.
-
-    Parameters
-    ----------
-    action_table : DataFrame
-        Output of the action generator.  Must contain ``action_v2``,
-        ``ticker``, and scoring columns.  Expected but optional:
-        ``scoreadjusted_v2``, ``score_percentile_v2``, ``atr14pct``,
-        ``sector``, ``theme``, ``sectrsregime``, ``breadthregime``,
-        ``volregime``, ``conviction_v2``.
-    max_positions : int
-        Maximum number of names in the final portfolio.
-    max_sector_weight : float
-        Base maximum weight for any single GICS sector (before
-        rotation-regime adjustment).
-    max_theme_names : int
-        Maximum number of names from any single theme.
-    max_single_weight : float
-        Hard cap on any individual position.
-    min_weight : float
-        Minimum weight for inclusion.  Names that would receive less
-        than this after all caps are applied are dropped.
-
-    Returns
-    -------
-    dict
-        ``selected`` (DataFrame) and ``meta`` (dict).
-    """
-    # ── 0. empty guard ────────────────────────────────────────────────────────
-    breadth_regime = "unknown"
-    vol_regime = "unknown"
-
-    if action_table.empty or "action_v2" not in action_table.columns:
-        logger.info("build_portfolio_v2: empty action table, returning empty portfolio")
-        return _empty_portfolio(breadth_regime, vol_regime)
-
-    # Resolve market regimes from the first row (uniform across rows)
-    breadth_regime = str(
-        action_table["breadthregime"].iloc[0]
-        if "breadthregime" in action_table.columns
-        else "unknown"
-    ).lower()
-    vol_regime = str(
-        action_table["volregime"].iloc[0]
-        if "volregime" in action_table.columns
-        else "unknown"
-    ).lower()
-
-    # ── 1. filter to eligible actions ─────────────────────────────────────────
-    eligible_mask = action_table["action_v2"].isin(["STRONG_BUY", "BUY"])
-    candidates = action_table.loc[eligible_mask].copy()
-
-    if candidates.empty:
-        logger.info(
-            "build_portfolio_v2: no STRONG_BUY or BUY candidates "
-            "(total rows=%d)",
-            len(action_table),
-        )
-        return _empty_portfolio(breadth_regime, vol_regime)
-
-    logger.info(
-        "Portfolio candidates: %d STRONG_BUY + BUY out of %d total",
-        len(candidates), len(action_table),
-    )
-
-    # ── 2. rank candidates ────────────────────────────────────────────────────
-    # Primary sort: action tier (STRONG_BUY first), then adjusted score
-    tier_map = {"STRONG_BUY": 1, "BUY": 2}
-    candidates["_tier"] = candidates["action_v2"].map(tier_map).fillna(3).astype(int)
-
-    score_col = (
-        "scoreadjusted_v2"
-        if "scoreadjusted_v2" in candidates.columns
-        else "scorecomposite_v2"
-    )
-    candidates["_sort_score"] = (
-        pd.to_numeric(candidates.get(score_col, 0.0), errors="coerce")
-        .fillna(0.0)
-    )
-    candidates = candidates.sort_values(
-        ["_tier", "_sort_score"],
-        ascending=[True, False],
-    ).reset_index(drop=True)
-
-    # ── 3. greedy selection with constraints ──────────────────────────────────
-    selected_indices: list[int] = []
-    sector_weight_used: dict[str, float] = {}
-    theme_count: dict[str, int] = {}
-
-    # Pre-compute inverse-ATR raw weights for the full candidate pool
-    atr_col = (
-        pd.to_numeric(candidates.get("atr14pct", 0.03), errors="coerce")
-        .fillna(0.03)
-    )
-    raw_weights = _inverse_atr_weights(atr_col)
-
-    for idx in candidates.index:
-        if len(selected_indices) >= max_positions:
-            break
-
-        row = candidates.loc[idx]
-        ticker = str(row.get("ticker", ""))
-        sector = str(row.get("sector", "Unknown"))
-        theme = str(row.get("theme", "Unknown"))
-        sect_regime = str(row.get("sectrsregime", "unknown")).lower()
-        raw_w = float(raw_weights.loc[idx])
-
-        # ── sector cap (rotation-aware) ───────────────────────────────────
-        effective_cap = _effective_sector_cap(sect_regime, max_sector_weight)
-        current_sector_w = sector_weight_used.get(sector, 0.0)
-        proposed_w = min(raw_w, max_single_weight)
-
-        if current_sector_w + proposed_w > effective_cap:
-            room = effective_cap - current_sector_w
-            if room < min_weight:
-                logger.debug(
-                    "Portfolio: skipping %s — sector %s at %.1f%% "
-                    "(cap %.1f%% for %s regime)",
-                    ticker, sector,
-                    current_sector_w * 100, effective_cap * 100,
-                    sect_regime,
-                )
-                continue
-            proposed_w = room
-
-        # ── theme diversification ─────────────────────────────────────────
-        if theme != "Unknown":
-            current_theme_n = theme_count.get(theme, 0)
-            if current_theme_n >= max_theme_names:
-                logger.debug(
-                    "Portfolio: skipping %s — theme %s already has %d names",
-                    ticker, theme, current_theme_n,
-                )
-                continue
-
-        # ── accept ────────────────────────────────────────────────────────
-        selected_indices.append(idx)
-        sector_weight_used[sector] = current_sector_w + proposed_w
-        if theme != "Unknown":
-            theme_count[theme] = theme_count.get(theme, 0) + 1
-
-    if not selected_indices:
-        logger.info("build_portfolio_v2: all candidates filtered by constraints")
-        return _empty_portfolio(breadth_regime, vol_regime)
-
-    selected = candidates.loc[selected_indices].copy()
-
-    # ── 4. final weight calculation ───────────────────────────────────────────
-    # Re-derive inverse-ATR weights among selected names only
-    sel_atr = (
-        pd.to_numeric(selected.get("atr14pct", 0.03), errors="coerce")
-        .fillna(0.03)
-    )
-    sel_raw_w = _inverse_atr_weights(sel_atr)
-
-    # Apply per-name and per-sector caps iteratively
-    final_w = sel_raw_w.clip(upper=max_single_weight).copy()
-
-    for _ in range(5):  # iterate to redistribute excess
-        # enforce rotation-aware sector caps
-        for sector in selected["sector"].unique():
-            sect_mask = selected["sector"] == sector
-            sector_total = float(final_w.loc[sect_mask].sum())
-            # all names in this sector share the same regime in practice,
-            # but take the mode for safety
-            regimes = (
-                selected.loc[sect_mask, "sectrsregime"]
-                .astype(str).str.lower()
-            )
-            regime_mode = regimes.mode().iloc[0] if not regimes.empty else "unknown"
-            cap = _effective_sector_cap(regime_mode, max_sector_weight)
-
-            if sector_total > cap and sector_total > 0:
-                scale = cap / sector_total
-                final_w.loc[sect_mask] *= scale
-
-        # enforce single-name cap
-        final_w = final_w.clip(upper=max_single_weight)
-
-        # renormalise so total = 1
-        total = final_w.sum()
-        if total > 0:
-            final_w = final_w / total
-        else:
-            final_w = pd.Series(
-                1.0 / len(final_w), index=final_w.index,
-            )
-
-    # ── 5. apply exposure scaling ─────────────────────────────────────────────
-    gross_target = _target_exposure(breadth_regime, vol_regime)
-    final_w = final_w * gross_target
-
-    # Drop names below minimum weight
-    keep_mask = final_w >= min_weight
-    if not keep_mask.all():
-        dropped = selected.loc[~keep_mask, "ticker"].tolist()
-        logger.info(
-            "Portfolio: dropping %d names below min_weight %.2f%%: %s",
-            len(dropped), min_weight * 100, dropped,
-        )
-        selected = selected.loc[keep_mask].copy()
-        final_w = final_w.loc[keep_mask]
-
-        # Renormalise to target exposure
-        if final_w.sum() > 0:
-            final_w = final_w / final_w.sum() * gross_target
-
-    selected["portfolio_weight"] = final_w.values
-    selected["portfolio_weight_pct"] = (final_w.values * 100).round(2)
-
-    # ── 6. enrich with selection metadata ─────────────────────────────────────
-    selected["selection_rank"] = range(1, len(selected) + 1)
-
-    # per-name effective sector cap for transparency
-    selected["effective_sector_cap"] = selected.apply(
-        lambda r: _effective_sector_cap(
-            str(r.get("sectrsregime", "unknown")).lower(),
-            max_sector_weight,
-        ),
-        axis=1,
-    )
-
-    # selection reason
-    def _reason(r):
-        parts = [
-            str(r.get("action_v2", "")),
-            f"score={_safe_float(r.get(score_col), 0):.3f}",
-            f"atr={_safe_float(r.get('atr14pct'), 0):.4f}",
-            f"sect={r.get('sector', 'Unknown')}({r.get('sectrsregime', 'unknown')})",
-            f"w={r.get('portfolio_weight_pct', 0):.1f}%",
-        ]
-        return " | ".join(parts)
-
-    selected["selection_reason"] = selected.apply(_reason, axis=1)
-
-    # Clean up internal sort columns
-    selected = selected.drop(columns=["_tier", "_sort_score"], errors="ignore")
-    selected = selected.reset_index(drop=True)
-
-    # ── 7. build sector tilt summary ──────────────────────────────────────────
-    sector_tilt = _build_sector_tilt(selected, max_sector_weight)
-
-    # ── 8. build rotation exposure summary ────────────────────────────────────
-    rotation_exposure = _build_rotation_exposure(selected)
-
-    # ── 9. meta ───────────────────────────────────────────────────────────────
-    meta = {
-        "selected_count": len(selected),
-        "candidate_count": len(candidates),
-        "total_universe": len(action_table),
-        "target_exposure": gross_target,
-        "actual_exposure": round(float(selected["portfolio_weight"].sum()), 4),
-        "cash_reserve": round(
-            1.0 - float(selected["portfolio_weight"].sum()), 4,
-        ),
-        "breadth_regime": breadth_regime,
-        "vol_regime": vol_regime,
-        "max_positions": max_positions,
-        "max_sector_weight_base": max_sector_weight,
-        "max_single_weight": max_single_weight,
-        "max_theme_names": max_theme_names,
-        "sector_tilt": sector_tilt,
-        "rotation_exposure": rotation_exposure,
-    }
-
-    # ── 10. logging ───────────────────────────────────────────────────────────
-    logger.info(
-        "Portfolio built: %d names  exposure=%.1f%%  cash=%.1f%%  "
-        "breadth=%s  vol=%s",
-        meta["selected_count"],
-        meta["actual_exposure"] * 100,
-        meta["cash_reserve"] * 100,
-        breadth_regime,
-        vol_regime,
-    )
-
-    if sector_tilt:
-        logger.info("Sector tilt:")
-        for entry in sector_tilt:
-            logger.info(
-                "  %-20s  regime=%-10s  weight=%5.1f%%  cap=%5.1f%%  "
-                "names=%d",
-                entry["sector"],
-                entry["regime"],
-                entry["weight_pct"],
-                entry["effective_cap_pct"],
-                entry["count"],
-            )
-
-    if rotation_exposure:
-        logger.info("Rotation quadrant exposure:")
-        for entry in rotation_exposure:
-            logger.info(
-                "  %-10s  weight=%5.1f%%  names=%d",
-                entry["quadrant"],
-                entry["weight_pct"],
-                entry["count"],
-            )
-
-    if logger.isEnabledFor(logging.DEBUG):
-        preview_cols = [c for c in [
-            "selection_rank", "ticker", "action_v2", "portfolio_weight_pct",
-            score_col, "atr14pct", "sector", "sectrsregime",
-            "effective_sector_cap", "theme", "conviction_v2",
-            "selection_reason",
-        ] if c in selected.columns]
-        logger.debug(
-            "Portfolio detail:\n%s",
-            selected[preview_cols].to_string(index=False),
-        )
-
-    return {
-        "selected": selected,
-        "meta": meta,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Sector tilt summary
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _build_sector_tilt(
-    selected: pd.DataFrame,
-    base_cap: float,
-) -> list[dict]:
-    """
-    Build a summary of portfolio weight by sector, including the
-    effective rotation-adjusted cap for each.
-    """
-    if selected.empty or "sector" not in selected.columns:
-        return []
-
-    rows = []
-    for sector in sorted(selected["sector"].unique()):
-        mask = selected["sector"] == sector
-        subset = selected.loc[mask]
-        weight = float(subset["portfolio_weight"].sum())
-        count = len(subset)
-
-        # Determine the sector's rotation regime (mode among selected names)
-        if "sectrsregime" in subset.columns:
-            regimes = subset["sectrsregime"].astype(str).str.lower()
-            regime = regimes.mode().iloc[0] if not regimes.empty else "unknown"
-        else:
-            regime = "unknown"
-
-        cap = _effective_sector_cap(regime, base_cap)
-
-        rows.append({
-            "sector": sector,
-            "regime": regime,
-            "weight": round(weight, 4),
-            "weight_pct": round(weight * 100, 1),
-            "effective_cap": round(cap, 4),
-            "effective_cap_pct": round(cap * 100, 1),
-            "count": count,
-            "headroom_pct": round((cap - weight) * 100, 1),
-        })
-
-    return sorted(rows, key=lambda r: r["weight"], reverse=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Rotation exposure summary
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _build_rotation_exposure(selected: pd.DataFrame) -> list[dict]:
-    """
-    Summarise portfolio weight by rotation quadrant.
-
-    This gives a single-glance view of how the portfolio is positioned
-    relative to the sector rotation cycle.
-    """
-    if selected.empty or "sectrsregime" not in selected.columns:
-        return []
-
-    rows = []
-    for quadrant in ("leading", "improving", "weakening", "lagging", "unknown"):
-        mask = selected["sectrsregime"].astype(str).str.lower() == quadrant
-        subset = selected.loc[mask]
-        if subset.empty:
-            continue
-        weight = float(subset["portfolio_weight"].sum())
-        rows.append({
-            "quadrant": quadrant,
-            "weight": round(weight, 4),
-            "weight_pct": round(weight * 100, 1),
-            "count": len(subset),
-            "tickers": sorted(subset["ticker"].tolist()),
-        })
-
-    return sorted(rows, key=lambda r: r["weight"], reverse=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Empty result
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _empty_portfolio(breadth_regime: str, vol_regime: str) -> dict:
-    return {
-        "selected": pd.DataFrame(),
-        "meta": {
-            "selected_count": 0,
-            "candidate_count": 0,
-            "total_universe": 0,
-            "target_exposure": _target_exposure(breadth_regime, vol_regime),
-            "actual_exposure": 0.0,
-            "cash_reserve": 1.0,
-            "breadth_regime": breadth_regime,
-            "vol_regime": vol_regime,
-            "max_positions": DEFAULT_MAX_POSITIONS,
-            "max_sector_weight_base": DEFAULT_MAX_SECTOR_WEIGHT,
-            "max_single_weight": DEFAULT_MAX_SINGLE_WEIGHT,
-            "max_theme_names": DEFAULT_MAX_THEME_NAMES,
-            "sector_tilt": [],
-            "rotation_exposure": [],
-        },
-    }
-################
+################################
 
 """refactor/strategy/enrich_v2.py – Enrich scored tickers with blended rotation data.
 
@@ -1481,7 +916,756 @@ def _incremental_composite_update(
         float(delta.mean()),
     )
     
-#######################
+#######################################
+"""
+refactor/strategy/portfolio_v2.py
+
+Portfolio construction for the v2 pipeline.
+
+PURPOSE: Generate a CLEAN, LIMITED set of actionable signals.
+    - STRONG_BUY: top 15 names by blended rank (the best of the best)
+    - BUY: next 5-10 names (good but not top tier)
+    - Everything else: not signalled
+
+Design philosophy:
+    - No parameter stuffing to beautify backtests
+    - Equal-weight positions (operator decides sizing in real life)
+    - Signal QUALITY over quantity
+    - Breadth/vol regime scaling kept only as a leading indicator
+      (it reflects CURRENT market health, not hindsight)
+
+Output
+------
+``build_portfolio_v2`` returns a dict with:
+
+    selected   – DataFrame of the final portfolio with per-name
+                 weights, risk metrics, and selection reasoning.
+    meta       – dict with portfolio-level summary statistics.
+"""
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pandas as pd
+from refactor.strategy.ranking_v2 import rank_and_filter_candidates
+
+logger = logging.getLogger(__name__)
+
+# ── Signal Caps (the CORE constraint) ─────────────────────────────────────────
+STRONG_BUY_LIMIT = 15       # Max names that get STRONG_BUY per day
+MAX_BUY_SIGNALS = 25        # Total buy signals (STRONG_BUY + BUY) per day
+
+# ── Portfolio Defaults ────────────────────────────────────────────────────────
+DEFAULT_MAX_POSITIONS = 25   # Real portfolio holds 20-30 names
+DEFAULT_MAX_SECTOR_WEIGHT = 0.40  # No more than 40% in one sector
+DEFAULT_MAX_THEME_NAMES = 3
+DEFAULT_MAX_SINGLE_WEIGHT = 0.08  # ~equal weight for 12-25 names
+DEFAULT_MIN_WEIGHT = 0.02
+
+# ── Rotation-aware sector cap multipliers ─────────────────────────────────────
+# ROTATION_CAP_MULT: dict[str, float] = {
+#     "leading":   1.00,
+#     "improving": 1.00,
+#     "weakening": 0.80,
+#     "lagging":   0.55,
+#     "unknown":   0.85,
+# }
+
+# ── Set all rotation caps to 1.0 (no penalizing lagging sectors) ──────────────
+ROTATION_CAP_MULT: dict[str, float] = {
+    "leading":   1.00,
+    "improving": 1.00,
+    "weakening": 1.00,
+    "lagging":   1.00,
+    "unknown":   1.00,
+}
+
+# ── Exposure scaling by market regime ─────────────────────────────────────────
+# These ARE leading indicators: breadth divergence precedes crashes by weeks.
+# When fewer stocks participate in a rally, it signals fragility BEFORE the drop.
+# We keep this simple — not trying to time perfectly, just reducing exposure
+# when the market's internal health is deteriorating.
+# BREADTH_EXPOSURE: dict[str, float] = {
+#     "strong": 1.00, "healthy": 1.00, "moderate": 0.95,
+#     "neutral": 0.90, "mixed": 0.85, "narrow": 0.75,
+#     "weak": 0.60, "critical": 0.40, "unknown": 0.90,
+# }
+# VOL_EXPOSURE: dict[str, float] = {
+#     "calm": 1.00, "low": 1.00, "normal": 1.00, "moderate": 0.95,
+#     "elevated": 0.85, "stressed": 0.70, "chaotic": 0.50,
+#     "unknown": 0.95,
+# }
+# ── Set all exposure to 1.0 (no scaling) ─────────────────────────────────────
+BREADTH_EXPOSURE: dict[str, float] = {
+    "strong": 1.00, "healthy": 1.00, "moderate": 1.00,
+    "neutral": 1.00, "mixed": 1.00, "narrow": 1.00,
+    "weak": 1.00, "critical": 1.00, "unknown": 1.00,
+}
+VOL_EXPOSURE: dict[str, float] = {
+    "calm": 1.00, "low": 1.00, "normal": 1.00, "moderate": 1.00,
+    "elevated": 1.00, "stressed": 1.00, "chaotic": 1.00,
+    "unknown": 1.00,
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _safe_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        f = float(value)
+        return default if np.isnan(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
+def _effective_sector_cap(
+    sector_regime: str,
+    base_cap: float,
+) -> float:
+    """Return the dynamic sector weight cap given the rotation regime."""
+    mult = ROTATION_CAP_MULT.get(
+        str(sector_regime).lower(),
+        ROTATION_CAP_MULT["unknown"],
+    )
+    return base_cap * mult
+
+
+def _target_exposure(breadth: str, vol: str) -> float:
+    """
+    Compute target gross exposure from breadth and volatility regimes.
+    Returns a value in roughly [0.20, 1.00].
+    """
+    b = BREADTH_EXPOSURE.get(str(breadth).lower(), BREADTH_EXPOSURE["unknown"])
+    v = VOL_EXPOSURE.get(str(vol).lower(), VOL_EXPOSURE["unknown"])
+    return round(b * v, 4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_portfolio_v2(
+    action_table: pd.DataFrame,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
+    max_sector_weight: float = DEFAULT_MAX_SECTOR_WEIGHT,
+    max_theme_names: int = DEFAULT_MAX_THEME_NAMES,
+    max_single_weight: float = DEFAULT_MAX_SINGLE_WEIGHT,
+    min_weight: float = DEFAULT_MIN_WEIGHT,
+    strong_buy_limit: int = STRONG_BUY_LIMIT,
+    max_buy_signals: int = MAX_BUY_SIGNALS,
+) -> dict:
+    """
+    Build a concentrated target portfolio from the actioned universe.
+
+    The CORE job: produce at most `max_buy_signals` clean signals per day,
+    with the top `strong_buy_limit` labelled STRONG_BUY and the rest as BUY.
+
+    Parameters
+    ----------
+    action_table : DataFrame
+        Output of the action generator.
+    max_positions : int
+        Maximum number of names in the final portfolio.
+    max_sector_weight : float
+        Base maximum weight for any single GICS sector.
+    max_theme_names : int
+        Maximum number of names from any single theme.
+    max_single_weight : float
+        Hard cap on any individual position.
+    min_weight : float
+        Minimum weight for inclusion.
+    strong_buy_limit : int
+        Maximum names that receive STRONG_BUY (top tier only).
+    max_buy_signals : int
+        Total buy signals emitted (STRONG_BUY + BUY combined).
+
+    Returns
+    -------
+    dict with ``selected`` (DataFrame) and ``meta`` (dict).
+    """
+    # ── 0. empty guard ────────────────────────────────────────────────────────
+    breadth_regime = "unknown"
+    vol_regime = "unknown"
+
+    if action_table.empty or "action_v2" not in action_table.columns:
+        logger.info("build_portfolio_v2: empty action table, returning empty portfolio")
+        return _empty_portfolio(breadth_regime, vol_regime)
+
+    # Resolve market regimes from the first row (uniform across rows)
+    breadth_regime = str(
+        action_table["breadthregime"].iloc[0]
+        if "breadthregime" in action_table.columns
+        else "unknown"
+    ).lower()
+    vol_regime = str(
+        action_table["volregime"].iloc[0]
+        if "volregime" in action_table.columns
+        else "unknown"
+    ).lower()
+
+    # ── 1. filter to eligible actions ─────────────────────────────────────────
+    eligible_mask = action_table["action_v2"].isin(["STRONG_BUY", "BUY"])
+    candidates = action_table.loc[eligible_mask].copy()
+
+    if candidates.empty:
+        logger.info(
+            "build_portfolio_v2: no STRONG_BUY or BUY candidates "
+            "(total rows=%d)",
+            len(action_table),
+        )
+        return _empty_portfolio(breadth_regime, vol_regime)
+
+    logger.info(
+        "Portfolio candidates (raw): %d STRONG_BUY + BUY out of %d total",
+        len(candidates), len(action_table),
+    )
+
+    # ── 2. RANK + FILTER candidates ──────────────────────────────────────────
+    score_col = (
+        "scoreadjusted_v2"
+        if "scoreadjusted_v2" in candidates.columns
+        else "scorecomposite_v2"
+    )
+
+    ranking_params = {
+        "tilt": 0.50,
+        "vol_pref": 0.30,
+        "min_vol": 0.25,
+        "min_rs": -0.5,
+        "vol_col": "realizedvol20d",
+        "rs_col": "rszscore",
+        "score_col": score_col,
+        "momentum_col": "rszscore",
+    }
+    candidates = rank_and_filter_candidates(candidates, ranking_params)
+
+    if candidates.empty:
+        logger.info(
+            "build_portfolio_v2: all candidates filtered by ranking",
+        )
+        return _empty_portfolio(breadth_regime, vol_regime)
+
+    # ── 3. HARD CAP: limit total signals ──────────────────────────────────────
+    #
+    # This is the MOST IMPORTANT step for real trading signal quality.
+    # After ranking, we only keep the top `max_buy_signals` names.
+    # Top `strong_buy_limit` get STRONG_BUY, the rest get BUY.
+    #
+    candidates = candidates.reset_index(drop=True)
+
+    if len(candidates) > max_buy_signals:
+        logger.info(
+            "Portfolio: capping signals from %d → %d (STRONG_BUY=%d, BUY=%d)",
+            len(candidates), max_buy_signals,
+            strong_buy_limit, max_buy_signals - strong_buy_limit,
+        )
+        candidates = candidates.iloc[:max_buy_signals].copy()
+
+    # Reassign action tiers based on RANK (not original pipeline action)
+    # Top N = STRONG_BUY, rest = BUY
+    new_actions = []
+    for i in range(len(candidates)):
+        if i < strong_buy_limit:
+            new_actions.append("STRONG_BUY")
+        else:
+            new_actions.append("BUY")
+    candidates["action_v2"] = new_actions
+
+    logger.info(
+        "Portfolio signals after cap: %d STRONG_BUY + %d BUY = %d total",
+        sum(1 for a in new_actions if a == "STRONG_BUY"),
+        sum(1 for a in new_actions if a == "BUY"),
+        len(new_actions),
+    )
+
+    # ── 4. greedy selection with sector/theme constraints ─────────────────────
+    selected_indices: list[int] = []
+    sector_weight_used: dict[str, float] = {}
+    theme_count: dict[str, int] = {}
+
+    # Equal weight target per position
+    equal_weight = 1.0 / max_positions
+
+    for idx in candidates.index:
+        if len(selected_indices) >= max_positions:
+            break
+
+        row = candidates.loc[idx]
+        ticker = str(row.get("ticker", ""))
+        sector = str(row.get("sector", "Unknown"))
+        theme = str(row.get("theme", "Unknown"))
+        sect_regime = str(row.get("sectrsregime", "unknown")).lower()
+
+        # ── sector cap (rotation-aware) ───────────────────────────────────
+        effective_cap = _effective_sector_cap(sect_regime, max_sector_weight)
+        current_sector_w = sector_weight_used.get(sector, 0.0)
+
+        if current_sector_w + equal_weight > effective_cap:
+            room = effective_cap - current_sector_w
+            if room < min_weight:
+                logger.debug(
+                    "Portfolio: skipping %s — sector %s at %.1f%% "
+                    "(cap %.1f%% for %s regime)",
+                    ticker, sector,
+                    current_sector_w * 100, effective_cap * 100,
+                    sect_regime,
+                )
+                continue
+
+        # ── theme diversification ─────────────────────────────────────────
+        if theme != "Unknown":
+            current_theme_n = theme_count.get(theme, 0)
+            if current_theme_n >= max_theme_names:
+                logger.debug(
+                    "Portfolio: skipping %s — theme %s already has %d names",
+                    ticker, theme, current_theme_n,
+                )
+                continue
+
+        # ── accept ────────────────────────────────────────────────────────
+        selected_indices.append(idx)
+        sector_weight_used[sector] = current_sector_w + equal_weight
+        if theme != "Unknown":
+            theme_count[theme] = theme_count.get(theme, 0) + 1
+
+    if not selected_indices:
+        logger.info("build_portfolio_v2: all candidates filtered by constraints")
+        return _empty_portfolio(breadth_regime, vol_regime)
+
+    selected = candidates.loc[selected_indices].copy()
+
+    # ── 5. EQUAL WEIGHT allocation ───────────────────────────────────────────
+    # Simple 1/N weighting. In real life, the operator decides sizing.
+    n_selected = len(selected)
+    base_weight = 1.0 / n_selected
+
+    # ── 6. apply exposure scaling (leading indicator) ─────────────────────────
+    # Breadth + vol regime reflects CURRENT market health.
+    # When breadth narrows (fewer stocks participating), it's a LEADING
+    # signal of trouble — this happens BEFORE the crash, not after.
+    gross_target = _target_exposure(breadth_regime, vol_regime)
+
+    final_weights = pd.Series(
+        base_weight * gross_target, index=selected.index
+    )
+
+    # Drop names below minimum weight (shouldn't happen with equal weight, but safety)
+    keep_mask = final_weights >= min_weight
+    if not keep_mask.all():
+        dropped = selected.loc[~keep_mask, "ticker"].tolist()
+        logger.info(
+            "Portfolio: dropping %d names below min_weight %.2f%%: %s",
+            len(dropped), min_weight * 100, dropped,
+        )
+        selected = selected.loc[keep_mask].copy()
+        final_weights = final_weights.loc[keep_mask]
+
+    selected["portfolio_weight"] = final_weights.values
+    selected["portfolio_weight_pct"] = (final_weights.values * 100).round(2)
+
+    # ── 7. enrich with selection metadata ─────────────────────────────────────
+    selected["selection_rank"] = range(1, len(selected) + 1)
+
+    selected["effective_sector_cap"] = selected.apply(
+        lambda r: _effective_sector_cap(
+            str(r.get("sectrsregime", "unknown")).lower(),
+            max_sector_weight,
+        ),
+        axis=1,
+    )
+
+    def _reason(r):
+        parts = [
+            str(r.get("action_v2", "")),
+            f"rank={r.get('selection_rank', '?')}",
+            f"score={_safe_float(r.get(score_col), 0):.3f}",
+            f"sect={r.get('sector', 'Unknown')}({r.get('sectrsregime', 'unknown')})",
+            f"w={r.get('portfolio_weight_pct', 0):.1f}%",
+        ]
+        return " | ".join(parts)
+
+    selected["selection_reason"] = selected.apply(_reason, axis=1)
+
+    # Clean up internal columns
+    selected = selected.drop(
+        columns=["_tier", "_sort_score"], errors="ignore"
+    )
+    selected = selected.reset_index(drop=True)
+
+    # ── 8. build sector tilt summary ──────────────────────────────────────────
+    sector_tilt = _build_sector_tilt(selected, max_sector_weight)
+
+    # ── 9. build rotation exposure summary ────────────────────────────────────
+    rotation_exposure = _build_rotation_exposure(selected)
+
+    # ── 10. meta ──────────────────────────────────────────────────────────────
+    meta = {
+        "selected_count": len(selected),
+        "candidate_count": len(candidates),
+        "total_universe": len(action_table),
+        "target_exposure": gross_target,
+        "actual_exposure": round(float(selected["portfolio_weight"].sum()), 4),
+        "cash_reserve": round(
+            1.0 - float(selected["portfolio_weight"].sum()), 4,
+        ),
+        "breadth_regime": breadth_regime,
+        "vol_regime": vol_regime,
+        "max_positions": max_positions,
+        "strong_buy_limit": strong_buy_limit,
+        "max_buy_signals": max_buy_signals,
+        "strong_buy_count": int(
+            (selected["action_v2"] == "STRONG_BUY").sum()
+        ),
+        "buy_count": int((selected["action_v2"] == "BUY").sum()),
+        "max_sector_weight_base": max_sector_weight,
+        "max_single_weight": max_single_weight,
+        "max_theme_names": max_theme_names,
+        "sector_tilt": sector_tilt,
+        "rotation_exposure": rotation_exposure,
+    }
+
+    # ── 11. logging ───────────────────────────────────────────────────────────
+    logger.info(
+        "Portfolio built: %d names (%d STRONG_BUY + %d BUY)  "
+        "exposure=%.1f%%  cash=%.1f%%  breadth=%s  vol=%s",
+        meta["selected_count"],
+        meta["strong_buy_count"],
+        meta["buy_count"],
+        meta["actual_exposure"] * 100,
+        meta["cash_reserve"] * 100,
+        breadth_regime,
+        vol_regime,
+    )
+
+    if sector_tilt:
+        logger.info("Sector tilt:")
+        for entry in sector_tilt:
+            logger.info(
+                "  %-20s  regime=%-10s  weight=%5.1f%%  cap=%5.1f%%  "
+                "names=%d",
+                entry["sector"],
+                entry["regime"],
+                entry["weight_pct"],
+                entry["effective_cap_pct"],
+                entry["count"],
+            )
+
+    if rotation_exposure:
+        logger.info("Rotation quadrant exposure:")
+        for entry in rotation_exposure:
+            logger.info(
+                "  %-10s  weight=%5.1f%%  names=%d",
+                entry["quadrant"],
+                entry["weight_pct"],
+                entry["count"],
+            )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        preview_cols = [c for c in [
+            "selection_rank", "ticker", "action_v2", "portfolio_weight_pct",
+            score_col, "sector", "sectrsregime",
+            "effective_sector_cap", "theme",
+            "selection_reason",
+        ] if c in selected.columns]
+        logger.debug(
+            "Portfolio detail:\n%s",
+            selected[preview_cols].to_string(index=False),
+        )
+
+    return {
+        "selected": selected,
+        "meta": meta,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sector tilt summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_sector_tilt(
+    selected: pd.DataFrame,
+    base_cap: float,
+) -> list[dict]:
+    """Build a summary of portfolio weight by sector."""
+    if selected.empty or "sector" not in selected.columns:
+        return []
+
+    rows = []
+    for sector in sorted(selected["sector"].unique()):
+        mask = selected["sector"] == sector
+        subset = selected.loc[mask]
+        weight = float(subset["portfolio_weight"].sum())
+        count = len(subset)
+
+        if "sectrsregime" in subset.columns:
+            regimes = subset["sectrsregime"].astype(str).str.lower()
+            regime = regimes.mode().iloc[0] if not regimes.empty else "unknown"
+        else:
+            regime = "unknown"
+
+        cap = _effective_sector_cap(regime, base_cap)
+
+        rows.append({
+            "sector": sector,
+            "regime": regime,
+            "weight": round(weight, 4),
+            "weight_pct": round(weight * 100, 1),
+            "effective_cap": round(cap, 4),
+            "effective_cap_pct": round(cap * 100, 1),
+            "count": count,
+            "headroom_pct": round((cap - weight) * 100, 1),
+        })
+
+    return sorted(rows, key=lambda r: r["weight"], reverse=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Rotation exposure summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_rotation_exposure(selected: pd.DataFrame) -> list[dict]:
+    """Summarise portfolio weight by rotation quadrant."""
+    if selected.empty or "sectrsregime" not in selected.columns:
+        return []
+
+    rows = []
+    for quadrant in ("leading", "improving", "weakening", "lagging", "unknown"):
+        mask = selected["sectrsregime"].astype(str).str.lower() == quadrant
+        subset = selected.loc[mask]
+        if subset.empty:
+            continue
+        weight = float(subset["portfolio_weight"].sum())
+        rows.append({
+            "quadrant": quadrant,
+            "weight": round(weight, 4),
+            "weight_pct": round(weight * 100, 1),
+            "count": len(subset),
+            "tickers": sorted(subset["ticker"].tolist()),
+        })
+
+    return sorted(rows, key=lambda r: r["weight"], reverse=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Empty result
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _empty_portfolio(breadth_regime: str, vol_regime: str) -> dict:
+    return {
+        "selected": pd.DataFrame(),
+        "meta": {
+            "selected_count": 0,
+            "candidate_count": 0,
+            "total_universe": 0,
+            "target_exposure": _target_exposure(breadth_regime, vol_regime),
+            "actual_exposure": 0.0,
+            "cash_reserve": 1.0,
+            "breadth_regime": breadth_regime,
+            "vol_regime": vol_regime,
+            "max_positions": DEFAULT_MAX_POSITIONS,
+            "strong_buy_limit": STRONG_BUY_LIMIT,
+            "max_buy_signals": MAX_BUY_SIGNALS,
+            "strong_buy_count": 0,
+            "buy_count": 0,
+            "max_sector_weight_base": DEFAULT_MAX_SECTOR_WEIGHT,
+            "max_single_weight": DEFAULT_MAX_SINGLE_WEIGHT,
+            "max_theme_names": DEFAULT_MAX_THEME_NAMES,
+            "sector_tilt": [],
+            "rotation_exposure": [],
+        },
+    }
+    
+#########################################
+"""refactor/strategy/ranking_v2.py"""
+from __future__ import annotations
+
+import logging
+import pandas as pd
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_RANKING_PARAMS = {
+    "tilt": 0.50,           # blend weight toward momentum_rank vs composite_rank
+    "vol_pref": 0.30,       # bonus for higher-beta names (options leverage)
+    "min_beta": 1.3,        # CHANGED: filter on beta, not raw vol
+    "min_rs": -0.5,         # minimum RS z-score to keep
+    "beta_col": "beta_60d", # NEW: column name for beta
+    "rs_col": "rszscore",
+    "score_col": "scoreadjusted_v2",
+    "momentum_col": "rszscore",
+}
+
+
+def rank_and_filter_candidates(
+    candidates: pd.DataFrame,
+    params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Filter and rank BUY/STRONG_BUY candidates by blended momentum + composite
+    with a beta preference for options-friendly names.
+
+    Filtering:
+      - Remove names with beta < min_beta (low market sensitivity = bad for options)
+      - Remove names with RS z-score < min_rs (underperforming benchmark)
+
+    Ranking:
+      - composite_rank: percentile rank by composite score (higher = better)
+      - momentum_rank:  percentile rank by RS z-score (higher = better)
+      - beta_bonus:     percentile rank by beta (higher beta = bonus)
+      - blended_rank = tilt * momentum_rank + (1-tilt) * composite_rank + vol_pref * beta_bonus
+
+    Returns filtered + sorted DataFrame (best first).
+    """
+    p = {**DEFAULT_RANKING_PARAMS, **(params or {})}
+
+    if candidates.empty:
+        return candidates
+
+    tilt = float(p["tilt"])
+    vol_pref = float(p["vol_pref"])
+    min_beta = float(p["min_beta"])
+    min_rs = float(p["min_rs"])
+    beta_col = str(p["beta_col"])
+    rs_col = str(p["rs_col"])
+    score_col = str(p["score_col"])
+    momentum_col = str(p["momentum_col"])
+
+    df = candidates.copy()
+    n_start = len(df)
+
+    # ── Resolve columns with fallbacks ────────────────────────────────────
+    if score_col not in df.columns:
+        score_col = "scorecomposite_v2" if "scorecomposite_v2" in df.columns else None
+    if momentum_col not in df.columns:
+        momentum_col = rs_col if rs_col in df.columns else None
+
+    # ── Get beta values ───────────────────────────────────────────────────
+    has_beta = beta_col in df.columns
+    if has_beta:
+        df["_beta"] = pd.to_numeric(df[beta_col], errors="coerce").fillna(0.0)
+    else:
+        # Fallback: estimate beta from realized vol vs SPY's typical vol (~0.16)
+        # This is crude but better than nothing
+        vol_col = "realizedvol20d"
+        if vol_col in df.columns:
+            df["_beta"] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0.16) / 0.16
+            logger.warning(
+                "ranking_v2: beta_col '%s' not found, estimating from %s / 0.16",
+                beta_col, vol_col,
+            )
+        else:
+            df["_beta"] = 1.0
+            logger.warning("ranking_v2: no beta or vol column found, assuming beta=1.0")
+
+    # ── Get RS values ─────────────────────────────────────────────────────
+    if rs_col in df.columns:
+        df["_rs"] = pd.to_numeric(df[rs_col], errors="coerce").fillna(0.0)
+    else:
+        df["_rs"] = 0.0
+
+    # ── FILTER: beta gate ─────────────────────────────────────────────────
+    beta_mask = df["_beta"] >= min_beta
+    filtered_beta = df[~beta_mask]
+    if not filtered_beta.empty and logger.isEnabledFor(logging.DEBUG):
+        for _, row in filtered_beta.iterrows():
+            ticker = row.get("ticker", "?")
+            logger.debug(
+                "  FILTER %-10s: beta=%.3f < min_beta=%.3f",
+                ticker, float(row["_beta"]), min_beta,
+            )
+
+    # ── FILTER: RS gate ───────────────────────────────────────────────────
+    rs_mask = df["_rs"] >= min_rs
+    filtered_rs = df[beta_mask & ~rs_mask]
+    if not filtered_rs.empty and logger.isEnabledFor(logging.DEBUG):
+        for _, row in filtered_rs.iterrows():
+            ticker = row.get("ticker", "?")
+            logger.debug(
+                "  FILTER %-10s: %s=%.3f < min_rs=%.3f",
+                ticker, rs_col, float(row["_rs"]), min_rs,
+            )
+
+    # ── Apply filters ─────────────────────────────────────────────────────
+    combined_mask = beta_mask & rs_mask
+    df_filtered = df[combined_mask].copy()
+
+    n_filtered = len(df_filtered)
+    n_removed = n_start - n_filtered
+
+    # ── Fallback: if everything filtered, relax to top-beta names ─────────
+    if df_filtered.empty:
+        logger.warning(
+            "RANKING: all %d candidates filtered out (min_beta=%.2f, min_rs=%.2f). "
+            "Relaxing to top %d by beta.",
+            n_start, min_beta, min_rs, min(5, n_start),
+        )
+        # Take top 5 by beta regardless of threshold
+        df_filtered = df.nlargest(min(5, n_start), "_beta").copy()
+        n_filtered = len(df_filtered)
+
+    # ── Compute ranks ─────────────────────────────────────────────────────
+    if score_col and score_col in df_filtered.columns:
+        scores = pd.to_numeric(df_filtered[score_col], errors="coerce").fillna(0.0)
+        df_filtered["_composite_rank"] = scores.rank(pct=True, method="average")
+    else:
+        df_filtered["_composite_rank"] = 0.5
+
+    if momentum_col and momentum_col in df_filtered.columns:
+        mom = pd.to_numeric(df_filtered[momentum_col], errors="coerce").fillna(0.0)
+        df_filtered["_momentum_rank"] = mom.rank(pct=True, method="average")
+    else:
+        df_filtered["_momentum_rank"] = df_filtered["_composite_rank"]
+
+    # Beta bonus: higher beta = higher rank (good for options leverage)
+    df_filtered["_beta_rank"] = df_filtered["_beta"].rank(pct=True, method="average")
+
+    # ── Blended rank ──────────────────────────────────────────────────────
+    df_filtered["blended_rank"] = (
+        tilt * df_filtered["_momentum_rank"]
+        + (1.0 - tilt) * df_filtered["_composite_rank"]
+        + vol_pref * df_filtered["_beta_rank"]
+    )
+
+    # ── Sort by blended rank descending (best first) ──────────────────────
+    df_filtered = df_filtered.sort_values("blended_rank", ascending=False).reset_index(drop=True)
+
+    # ── Log ranking table ─────────────────────────────────────────────────
+    logger.info(
+        "  RANKING (tilt=%.2f, vol_pref=%.2f, min_beta=%.3f, min_rs=%.1f):",
+        tilt, vol_pref, min_beta, min_rs,
+    )
+    for _, row in df_filtered.head(10).iterrows():
+        ticker = row.get("ticker", "?")
+        score_val = float(row.get(score_col, 0)) if score_col else 0.0
+        rs_val = float(row["_rs"])
+        beta_val = float(row["_beta"])
+        logger.info(
+            "    %-14s composite_rank=%.2f  mom_rank=%.2f  beta_rank=%.2f  "
+            "blended=%.3f  score=%.3f  rs=%.2f  beta=%.2f",
+            ticker,
+            float(row["_composite_rank"]),
+            float(row["_momentum_rank"]),
+            float(row["_beta_rank"]),
+            float(row["blended_rank"]),
+            score_val,
+            rs_val,
+            beta_val,
+        )
+    logger.info("    (filtered %d → %d candidates)", n_start, n_filtered)
+
+    # ── Clean up internal columns ─────────────────────────────────────────
+    drop_cols = ["_beta", "_rs", "_composite_rank", "_momentum_rank", "_beta_rank"]
+    df_filtered = df_filtered.drop(columns=[c for c in drop_cols if c in df_filtered.columns])
+
+    return df_filtered
+    
+#################################
 """refactor/strategy/regime_v2.py"""
 from __future__ import annotations
 
@@ -2731,8 +2915,7 @@ def compute_sector_rotation(
         "etf_ranking":    etf_ranking,
     }
     
-    
-###################
+########################################################
 """
 refactor/strategy/rs_v2.py
 
@@ -2768,6 +2951,19 @@ RS_MIN_HISTORY = 30         # minimum rows for a symbol to enter the panel
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 1 – cross-sectional z-scores
 # ═══════════════════════════════════════════════════════════════════════════════
+# Add to refactor/strategy/rs_v2.py
+
+def _compute_rolling_beta(
+    stock_returns: pd.Series,
+    bench_returns: pd.Series,
+    window: int = 60,
+) -> pd.Series:
+    """Rolling beta = cov(stock, bench) / var(bench) over `window` days."""
+    cov = stock_returns.rolling(window, min_periods=30).cov(bench_returns)
+    var = bench_returns.rolling(window, min_periods=30).var()
+    beta = cov / var.replace(0, float("nan"))
+    return beta
+
 
 def compute_rs_zscores(
     symbol_frames: dict[str, pd.DataFrame],
@@ -2786,10 +2982,11 @@ def compute_rs_zscores(
       4. Z-score relative returns across the symbol cross-section.
       5. rsaccel20 = diff(rszscore, ``accel_diff``) — short-term RS momentum.
       6. If ≥ 2 real sectors exist, compute sector-level z-scores.
+      7. Compute rolling 60-day beta vs benchmark for each symbol.
 
     Returns a new dict with the same keys.  Each frame is a copy of the
-    original with ``rszscore``, ``rsaccel20``, and ``sectrszscore``
-    columns added or overwritten.
+    original with ``rszscore``, ``rsaccel20``, ``sectrszscore``, and
+    ``beta_60d`` columns added or overwritten.
     """
     if not symbol_frames:
         logger.warning("compute_rs_zscores: no symbol frames provided; returning unchanged")
@@ -2802,6 +2999,9 @@ def compute_rs_zscores(
         "compute_rs_zscores: bench_rows=%d lookback=%d bench_ret_valid=%d",
         len(bench_df), lookback, int(bench_ret.notna().sum()),
     )
+
+    # ── 1b. benchmark daily returns for beta calculation ──────────────────────
+    bench_daily_ret = bench_close.pct_change()
 
     # ── 2. build close-price panel and sector map ─────────────────────────────
     close_dict: dict[str, pd.Series] = {}
@@ -2850,7 +3050,36 @@ def compute_rs_zscores(
     # ── 6. sector-level z-scores ──────────────────────────────────────────────
     sector_zscore_panel = _compute_sector_zscores(relative_ret, sector_dict)
 
-    # ── 7. write back into per-symbol frames ──────────────────────────────────
+    # ── 7. rolling beta vs benchmark ──────────────────────────────────────────
+    beta_dict: dict[str, pd.Series] = {}
+    for ticker, close_s in close_dict.items():
+        stock_daily_ret = close_s.pct_change()
+        aligned_bench = bench_daily_ret.reindex(close_s.index)
+        beta_dict[ticker] = _compute_rolling_beta(stock_daily_ret, aligned_bench, window=60)
+
+    beta_panel = pd.DataFrame(beta_dict)
+
+    # Beta diagnostics
+    if not beta_panel.empty:
+        last_betas = beta_panel.iloc[-1].dropna()
+        if not last_betas.empty:
+            logger.info(
+                "compute_rs_zscores last-date beta_60d: "
+                "min=%.3f p25=%.3f median=%.3f p75=%.3f max=%.3f  "
+                "(n=%d symbols)",
+                float(last_betas.min()),
+                float(last_betas.quantile(0.25)),
+                float(last_betas.median()),
+                float(last_betas.quantile(0.75)),
+                float(last_betas.max()),
+                len(last_betas),
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                ranked_beta = last_betas.sort_values(ascending=False)
+                logger.debug("compute_rs_zscores top-10 beta:\n%s", ranked_beta.head(10).to_string())
+                logger.debug("compute_rs_zscores bottom-10 beta:\n%s", ranked_beta.tail(10).to_string())
+
+    # ── 8. write back into per-symbol frames ──────────────────────────────────
     enriched: dict[str, pd.DataFrame] = {}
     for ticker, df in symbol_frames.items():
         out = df.copy()
@@ -2867,6 +3096,12 @@ def compute_rs_zscores(
             out["sectrszscore"] = sector_zscore_panel[ticker].reindex(out.index)
         elif "sectrszscore" not in out.columns:
             out["sectrszscore"] = np.nan
+
+        # ── Beta column ───────────────────────────────────────────────────
+        if ticker in beta_panel.columns:
+            out["beta_60d"] = beta_panel[ticker].reindex(out.index)
+        else:
+            out["beta_60d"] = np.nan
 
         enriched[ticker] = out
 
@@ -2916,7 +3151,6 @@ def compute_rs_zscores(
         )
 
     return enriched
-
 
 def _compute_sector_zscores(
     relative_ret: pd.DataFrame,
@@ -3072,7 +3306,8 @@ def enrich_rs_regimes(
     logger.info("enrich_rs_regimes: last-row sectrsregime=%s", sect_counts)
     return enriched
     
-################
+    
+##########################################
 """
 refactor/strategy/scoring_v2.py
 
@@ -3703,7 +3938,7 @@ def compute_composite_v2(
 
     return out
     
-##################
+#######################################
 """refactor/strategy/signals_v2.py"""
 from __future__ import annotations
 
@@ -4302,3 +4537,5 @@ def apply_convergence_v2(df: pd.DataFrame, params=None) -> pd.DataFrame:
         logger.debug("Lowest adjusted scores:\n%s", out.sort_values("scoreadjusted_v2", ascending=True)[cols].head(50).to_string(index=False))
 
     return out.sort_values(["convergence_tier_v2", "scoreadjusted_v2"], ascending=[False, False])
+    
+#####################################################
