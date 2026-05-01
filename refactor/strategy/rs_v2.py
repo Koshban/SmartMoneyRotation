@@ -33,6 +33,19 @@ RS_MIN_HISTORY = 30         # minimum rows for a symbol to enter the panel
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 1 – cross-sectional z-scores
 # ═══════════════════════════════════════════════════════════════════════════════
+# Add to refactor/strategy/rs_v2.py
+
+def _compute_rolling_beta(
+    stock_returns: pd.Series,
+    bench_returns: pd.Series,
+    window: int = 60,
+) -> pd.Series:
+    """Rolling beta = cov(stock, bench) / var(bench) over `window` days."""
+    cov = stock_returns.rolling(window, min_periods=30).cov(bench_returns)
+    var = bench_returns.rolling(window, min_periods=30).var()
+    beta = cov / var.replace(0, float("nan"))
+    return beta
+
 
 def compute_rs_zscores(
     symbol_frames: dict[str, pd.DataFrame],
@@ -51,10 +64,11 @@ def compute_rs_zscores(
       4. Z-score relative returns across the symbol cross-section.
       5. rsaccel20 = diff(rszscore, ``accel_diff``) — short-term RS momentum.
       6. If ≥ 2 real sectors exist, compute sector-level z-scores.
+      7. Compute rolling 60-day beta vs benchmark for each symbol.
 
     Returns a new dict with the same keys.  Each frame is a copy of the
-    original with ``rszscore``, ``rsaccel20``, and ``sectrszscore``
-    columns added or overwritten.
+    original with ``rszscore``, ``rsaccel20``, ``sectrszscore``, and
+    ``beta_60d`` columns added or overwritten.
     """
     if not symbol_frames:
         logger.warning("compute_rs_zscores: no symbol frames provided; returning unchanged")
@@ -67,6 +81,9 @@ def compute_rs_zscores(
         "compute_rs_zscores: bench_rows=%d lookback=%d bench_ret_valid=%d",
         len(bench_df), lookback, int(bench_ret.notna().sum()),
     )
+
+    # ── 1b. benchmark daily returns for beta calculation ──────────────────────
+    bench_daily_ret = bench_close.pct_change()
 
     # ── 2. build close-price panel and sector map ─────────────────────────────
     close_dict: dict[str, pd.Series] = {}
@@ -115,7 +132,36 @@ def compute_rs_zscores(
     # ── 6. sector-level z-scores ──────────────────────────────────────────────
     sector_zscore_panel = _compute_sector_zscores(relative_ret, sector_dict)
 
-    # ── 7. write back into per-symbol frames ──────────────────────────────────
+    # ── 7. rolling beta vs benchmark ──────────────────────────────────────────
+    beta_dict: dict[str, pd.Series] = {}
+    for ticker, close_s in close_dict.items():
+        stock_daily_ret = close_s.pct_change()
+        aligned_bench = bench_daily_ret.reindex(close_s.index)
+        beta_dict[ticker] = _compute_rolling_beta(stock_daily_ret, aligned_bench, window=60)
+
+    beta_panel = pd.DataFrame(beta_dict)
+
+    # Beta diagnostics
+    if not beta_panel.empty:
+        last_betas = beta_panel.iloc[-1].dropna()
+        if not last_betas.empty:
+            logger.info(
+                "compute_rs_zscores last-date beta_60d: "
+                "min=%.3f p25=%.3f median=%.3f p75=%.3f max=%.3f  "
+                "(n=%d symbols)",
+                float(last_betas.min()),
+                float(last_betas.quantile(0.25)),
+                float(last_betas.median()),
+                float(last_betas.quantile(0.75)),
+                float(last_betas.max()),
+                len(last_betas),
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                ranked_beta = last_betas.sort_values(ascending=False)
+                logger.debug("compute_rs_zscores top-10 beta:\n%s", ranked_beta.head(10).to_string())
+                logger.debug("compute_rs_zscores bottom-10 beta:\n%s", ranked_beta.tail(10).to_string())
+
+    # ── 8. write back into per-symbol frames ──────────────────────────────────
     enriched: dict[str, pd.DataFrame] = {}
     for ticker, df in symbol_frames.items():
         out = df.copy()
@@ -132,6 +178,12 @@ def compute_rs_zscores(
             out["sectrszscore"] = sector_zscore_panel[ticker].reindex(out.index)
         elif "sectrszscore" not in out.columns:
             out["sectrszscore"] = np.nan
+
+        # ── Beta column ───────────────────────────────────────────────────
+        if ticker in beta_panel.columns:
+            out["beta_60d"] = beta_panel[ticker].reindex(out.index)
+        else:
+            out["beta_60d"] = np.nan
 
         enriched[ticker] = out
 
@@ -181,7 +233,6 @@ def compute_rs_zscores(
         )
 
     return enriched
-
 
 def _compute_sector_zscores(
     relative_ret: pd.DataFrame,

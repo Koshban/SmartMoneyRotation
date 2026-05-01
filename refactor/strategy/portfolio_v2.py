@@ -216,6 +216,12 @@ def build_portfolio_v2(
     # - Remove negative RS names that are underperforming benchmark
     # - Re-rank by blended momentum_rank + composite_rank with vol preference
     #
+    score_col = (
+        "scoreadjusted_v2"
+        if "scoreadjusted_v2" in candidates.columns
+        else "scorecomposite_v2"
+    )
+
     ranking_params = {
         "tilt": 0.50,
         "vol_pref": 0.30,
@@ -223,7 +229,7 @@ def build_portfolio_v2(
         "min_rs": -0.5,
         "vol_col": "realizedvol20d",
         "rs_col": "rszscore",
-        "score_col": "scoreadjusted_v2" if "scoreadjusted_v2" in candidates.columns else "scorecomposite_v2",
+        "score_col": score_col,
         "momentum_col": "rszscore",
     }
     candidates = rank_and_filter_candidates(candidates, ranking_params)
@@ -235,8 +241,16 @@ def build_portfolio_v2(
         )
         return _empty_portfolio(breadth_regime, vol_regime)
 
-    # candidates are now sorted by blended_rank descending — 
-    # greedy selection will pick from the top
+    # Candidates are now sorted by blended_rank descending.
+    # Add back the _tier column for the greedy selector's convenience.
+    tier_map = {"STRONG_BUY": 1, "BUY": 2}
+    candidates["_tier"] = candidates["action_v2"].map(tier_map).fillna(3).astype(int)
+    candidates["_sort_score"] = (
+        pd.to_numeric(candidates.get(score_col, 0.0), errors="coerce")
+        .fillna(0.0)
+    )
+    # Keep the ranking_v2 sort order (blended_rank desc) — don't re-sort
+    candidates = candidates.reset_index(drop=True)
 
     # ── 3. greedy selection with constraints ──────────────────────────────────
     selected_indices: list[int] = []
