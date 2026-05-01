@@ -43,6 +43,7 @@ import logging
 
 import numpy as np
 import pandas as pd
+from refactor.strategy.ranking_v2 import rank_and_filter_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -208,24 +209,34 @@ def build_portfolio_v2(
         len(candidates), len(action_table),
     )
 
-    # ── 2. rank candidates ────────────────────────────────────────────────────
-    # Primary sort: action tier (STRONG_BUY first), then adjusted score
-    tier_map = {"STRONG_BUY": 1, "BUY": 2}
-    candidates["_tier"] = candidates["action_v2"].map(tier_map).fillna(3).astype(int)
+    # ── 2. FILTER + RANK with momentum tilt (NEW) ────────────────────────────
+    #
+    # This applies the same logic as the backtest phase2 tracker:
+    # - Remove low-vol (< min_vol) names that drag performance for options
+    # - Remove negative RS names that are underperforming benchmark
+    # - Re-rank by blended momentum_rank + composite_rank with vol preference
+    #
+    ranking_params = {
+        "tilt": 0.50,
+        "vol_pref": 0.30,
+        "min_vol": 0.25,
+        "min_rs": -0.5,
+        "vol_col": "realizedvol20d",
+        "rs_col": "rszscore",
+        "score_col": "scoreadjusted_v2" if "scoreadjusted_v2" in candidates.columns else "scorecomposite_v2",
+        "momentum_col": "rszscore",
+    }
+    candidates = rank_and_filter_candidates(candidates, ranking_params)
 
-    score_col = (
-        "scoreadjusted_v2"
-        if "scoreadjusted_v2" in candidates.columns
-        else "scorecomposite_v2"
-    )
-    candidates["_sort_score"] = (
-        pd.to_numeric(candidates.get(score_col, 0.0), errors="coerce")
-        .fillna(0.0)
-    )
-    candidates = candidates.sort_values(
-        ["_tier", "_sort_score"],
-        ascending=[True, False],
-    ).reset_index(drop=True)
+    if candidates.empty:
+        logger.info(
+            "build_portfolio_v2: all candidates filtered by ranking "
+            "(vol/RS thresholds too strict for current universe)",
+        )
+        return _empty_portfolio(breadth_regime, vol_regime)
+
+    # candidates are now sorted by blended_rank descending — 
+    # greedy selection will pick from the top
 
     # ── 3. greedy selection with constraints ──────────────────────────────────
     selected_indices: list[int] = []

@@ -1,3 +1,4 @@
+""" runner_v2.py → run_strategy_v2() → run_pipeline_v2() → build_portfolio_v2()"""
 """
 refactor/strategy/adapters_v2.py
 
