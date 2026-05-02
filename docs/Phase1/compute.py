@@ -3507,7 +3507,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from output.signals import (
+from cash.output.signals import (
     SignalConfig,
     BUY, HOLD, SELL, NEUTRAL,
     latest_signals,
@@ -3517,7 +3517,7 @@ from output.signals import (
     compute_turnover,
     _count_gates,
 )
-from output.rankings import (
+from cash.output.rankings import (
     latest_rankings,
     rankings_summary,
 )
@@ -5188,14 +5188,14 @@ import numpy as np
 import pandas as pd
 
 # ── Convergence ───────────────────────────────────────────────
-from strategy_phase1.convergence import (
+from cash.strategy_phase1.convergence import (
     run_convergence,
     build_price_matrix,
     enrich_snapshots,
     convergence_report,
     MarketSignalResult,
 )
-from strategy_phase1.rotation import (
+from cash.strategy_phase1.rotation import (
     run_rotation,
     RotationConfig,
     RotationResult,
@@ -5213,17 +5213,17 @@ from common.config import (
 )
 
 # ── Compute ───────────────────────────────────────────────────
-from compute.breadth import (
+from cash.compute.breadth import (
     breadth_to_pillar_scores,
     compute_all_breadth,
 )
-from compute.sector_rs import compute_all_sector_rs
+from cash.compute.sector_rs import compute_all_sector_rs
 
 # ── Data loading ──────────────────────────────────────────────
-from src.db.loader import load_ohlcv, load_universe_ohlcv
+from ingest.db.loader import load_ohlcv, load_universe_ohlcv
 
 # ── Pipeline ──────────────────────────────────────────────────
-from pipeline.runner import (
+from cash.pipeline.runner import (
     TickerResult,
     results_errors,
     results_to_scored_universe,
@@ -5233,17 +5233,17 @@ from pipeline.runner import (
 )
 
 # ── Output ────────────────────────────────────────────────────
-from output.rankings import compute_all_rankings
-from output.signals import compute_all_signals
+from cash.output.rankings import compute_all_rankings
+from cash.output.signals import compute_all_signals
 
 # ── Strategy ──────────────────────────────────────────────────
-from strategy_phase1.portfolio import build_portfolio
+from cash.strategy_phase1.portfolio import build_portfolio
 
 # ── Portfolio ─────────────────────────────────────────────────
-from portfolio.backtest import run_backtest, BacktestConfig
+from cash.portfolio.backtest import run_backtest, BacktestConfig
 
 # ── Reports ───────────────────────────────────────────────────
-from reports.recommendations import build_report
+from cash.reports.recommendations import build_report
 
 
 logger = logging.getLogger(__name__)

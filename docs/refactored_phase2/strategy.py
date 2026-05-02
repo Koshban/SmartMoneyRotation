@@ -1,5 +1,5 @@
 """
-refactor/strategy/adapters_v2.py
+phase2/strategy/adapters_v2.py
 
 Column contract and default-value guarantees for the v2 pipeline.
 
@@ -374,7 +374,7 @@ def validate_frame(
     
 ##################################
 """
-refactor/strategy/breadth_v2.py
+phase2/strategy/breadth_v2.py
 
 Cross-sectional market-breadth computation and regime classification.
 
@@ -609,7 +609,7 @@ def compute_breadth(
     
 ################################
 
-"""refactor/strategy/enrich_v2.py – Enrich scored tickers with blended rotation data.
+"""phase2/strategy/enrich_v2.py – Enrich scored tickers with blended rotation data.
 
 Revision notes
 --------------
@@ -918,7 +918,7 @@ def _incremental_composite_update(
     
 #######################################
 """
-refactor/strategy/portfolio_v2.py
+phase2/strategy/portfolio_v2.py
 
 Portfolio construction for the v2 pipeline.
 
@@ -948,7 +948,7 @@ import logging
 
 import numpy as np
 import pandas as pd
-from refactor.strategy.ranking_v2 import rank_and_filter_candidates
+from cash.phase2.strategy.ranking_v2 import rank_and_filter_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -1480,7 +1480,7 @@ def _empty_portfolio(breadth_regime: str, vol_regime: str) -> dict:
     }
     
 #########################################
-"""refactor/strategy/ranking_v2.py"""
+"""phase2/strategy/ranking_v2.py"""
 from __future__ import annotations
 
 import logging
@@ -1666,13 +1666,13 @@ def rank_and_filter_candidates(
     return df_filtered
     
 #################################
-"""refactor/strategy/regime_v2.py"""
+"""phase2/strategy/regime_v2.py"""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from refactor.common.config_refactor import VOLREGIMEPARAMS
+from common.config_refactor import VOLREGIMEPARAMS
 
 
 def _clip01(x):
@@ -1737,7 +1737,7 @@ def classify_volatility_regime(
     )
     
 ###############################
-"""refactor/strategy/rotation_v2.py – Sector rotation with ETF composite scoring.
+"""phase2/strategy/rotation_v2.py – Sector rotation with ETF composite scoring.
 
 US markets:     Uses sector SPDR ETFs + thematic ETFs for RRG + composite blend.
 Non-US markets: Computes sector rotation from constituent stocks grouped by
@@ -1754,7 +1754,7 @@ import pandas as pd
 
 from common.sector_map import get_sector_or_class
 
-from refactor.common.config_refactor import ROTATIONPARAMS
+from common.config_refactor import ROTATIONPARAMS
 
 logger = logging.getLogger(__name__)
 
@@ -2917,7 +2917,7 @@ def compute_sector_rotation(
     
 ########################################################
 """
-refactor/strategy/rs_v2.py
+phase2/strategy/rs_v2.py
 
 Cross-sectional relative-strength z-score computation and RRG-style regime classification.
 
@@ -2951,7 +2951,7 @@ RS_MIN_HISTORY = 30         # minimum rows for a symbol to enter the panel
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 1 – cross-sectional z-scores
 # ═══════════════════════════════════════════════════════════════════════════════
-# Add to refactor/strategy/rs_v2.py
+# Add to phase2/strategy/rs_v2.py
 
 def _compute_rolling_beta(
     stock_returns: pd.Series,
@@ -3309,7 +3309,7 @@ def enrich_rs_regimes(
     
 ##########################################
 """
-refactor/strategy/scoring_v2.py
+phase2/strategy/scoring_v2.py
 
 Composite scoring for the V2 pipeline.
 
@@ -3332,7 +3332,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from refactor.common.config_refactor import SCORINGWEIGHTS_V2, SCORINGPARAMS_V2
+from common.config_refactor import SCORINGWEIGHTS_V2, SCORINGPARAMS_V2
 
 logger = logging.getLogger(__name__)
 
@@ -3939,14 +3939,14 @@ def compute_composite_v2(
     return out
     
 #######################################
-"""refactor/strategy/signals_v2.py"""
+"""phase2/strategy/signals_v2.py"""
 from __future__ import annotations
 
 import logging
 import numpy as np
 import pandas as pd
 
-from refactor.common.config_refactor import CONVERGENCEPARAMS_V2, SIGNALPARAMS_V2
+from common.config_refactor import CONVERGENCEPARAMS_V2, SIGNALPARAMS_V2
 from .adapters_v2 import ensure_columns
 
 logger = logging.getLogger(__name__)

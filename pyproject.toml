@@ -7,4 +7,4 @@ name = "smartmoneyrotation"
 version = "0.1.0"
 
 [tool.setuptools.packages.find]
-include = ["common*", "src*"]
+include = ["cash*", "common*", "utils*", "ingest*", "options*",]

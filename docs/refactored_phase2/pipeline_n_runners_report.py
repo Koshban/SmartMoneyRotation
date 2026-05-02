@@ -1,4 +1,4 @@
-"""refactor/pipeline_v2.py"""
+"""phase2/pipeline_v2.py"""
 from __future__ import annotations
 """
 D1. SCORING
@@ -40,13 +40,13 @@ import math
 import numpy as np
 import pandas as pd
 
-from compute.indicators import compute_all_indicators
+from cash.compute.indicators import compute_all_indicators
 
 from common.sector_map import get_sector_or_class, get_theme
-from refactor.strategy.enrich_v2 import enrich_with_rotation
-from refactor.strategy.adapters_v2 import ensure_columns
-from refactor.strategy.breadth_v2 import compute_breadth
-from refactor.strategy.portfolio_v2 import (
+from cash.phase2.strategy.enrich_v2 import enrich_with_rotation
+from cash.phase2.strategy.adapters_v2 import ensure_columns
+from cash.phase2.strategy.breadth_v2 import compute_breadth
+from cash.phase2.strategy.portfolio_v2 import (
     build_portfolio_v2,
     DEFAULT_MAX_POSITIONS,
     DEFAULT_MAX_SECTOR_WEIGHT,
@@ -54,12 +54,12 @@ from refactor.strategy.portfolio_v2 import (
     DEFAULT_MAX_SINGLE_WEIGHT,
     DEFAULT_MIN_WEIGHT,
 )
-from refactor.strategy.regime_v2 import classify_volatility_regime
-from refactor.strategy.rotation_v2 import compute_sector_rotation
-from refactor.strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
-from refactor.strategy.scoring_v2 import compute_composite_v2
-from refactor.strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
-from refactor.common.config_refactor import (
+from cash.phase2.strategy.regime_v2 import classify_volatility_regime
+from cash.phase2.strategy.rotation_v2 import compute_sector_rotation
+from cash.phase2.strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
+from cash.phase2.strategy.scoring_v2 import compute_composite_v2
+from cash.phase2.strategy.signals_v2 import apply_convergence_v2, apply_signals_v2
+from common.config_refactor import (
     VOLREGIMEPARAMS,
     SCORINGWEIGHTS_V2,
     SCORINGPARAMS_V2,
@@ -1352,7 +1352,7 @@ def run_pipeline_v2(
     }
     
 #####################################
-"""refactor/runner_v2.py"""
+"""phase2/runner_v2.py"""
 from __future__ import annotations
 
 from utils.run_logger import RunLogger
@@ -1370,9 +1370,9 @@ import pandas as pd
 
 
 from common.config import DATA_DIR, LOGS_DIR
-from refactor.common.market_config_v2 import get_market_config_v2
-from refactor.pipeline_v2 import run_pipeline_v2
-from refactor.report_v2 import build_report_v2, to_text_v2
+from common.market_config_v2 import get_market_config_v2
+from cash.phase2.pipeline_v2 import run_pipeline_v2
+from cash.phase2.report_v2 import build_report_v2, to_text_v2
 
 
 # ── SIGNAL WRITER: optional import ────────────────────────────
@@ -2782,7 +2782,7 @@ if __name__ == "__main__":
     
 ###########################################
 """
-refactor/report_v2.py
+phase2/report_v2.py
 
 Report builder for the v2 pipeline.
 

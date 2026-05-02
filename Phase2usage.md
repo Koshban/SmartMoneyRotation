@@ -25,39 +25,39 @@
 # ── Basics ────────────────────────────────────────────────────────
 
 # Default: US market, auto dates, minimal output
-python refactor.runner_v2.py
+python cash/phase2/runner_v2.py
 
 # US market with explicit date range
-python refactor.runner_v2.py --market US --start-date 2024-01-02 --end-date 2025-04-25
+python cash/phase2/runner_v2.py --market US --start-date 2024-01-02 --end-date 2025-04-25
 
 # ── Reports & Logging ────────────────────────────────────────────
 
 # Print the plain-text report to terminal
-python refactor.runner_v2.py --market US --print-report
+python cash/phase2/runner_v2.py --market US --print-report
 
 # Verbose logging + report (recommended first smoke test)
-python refactor.runner_v2.py --market US --print-report -v
+python cash/phase2/runner_v2.py --market US --print-report -v
 
 # Full flags: date range + verbose + report
-python refactor/runner_v2.py --market US --start-date 2024-06-01 --end-date 2025-04-25 --print-report -v
+python cash/phase2/runner_v2.py --market US --start-date 2024-06-01 --end-date 2025-04-25 --print-report -v
 
 # ── Custom Data Path ─────────────────────────────────────────────
 
 # Point to a specific parquet file
-python refactor/runner_v2.py --market US --parquet-path data/us_cash.parquet
+python cash/phase2/runner_v2.py --market US --parquet-path data/us_cash.parquet
 
 # ── Other Markets ────────────────────────────────────────────────
 
 # Hong Kong
-python refactor.runner_v2.py --market HK --print-report -v
+python cash/phase2/runner_v2.py --market HK --print-report -v
 
 # India with date range
-python refactor/runner_v2.py --market IN --parquet-path data/in_cash.parquet --print-report -v
+python cash/phase2/runner_v2.py --market IN --parquet-path data/in_cash.parquet --print-report -v
 
 # ── Single Day Run ───────────────────────────────────────────────
 
 # Run for a single trading day
-python refactor.runner_v2.py --market US --start 2025-04-25 --end 2025-04-25 --print-report -v
+python cash/phase2/runner_v2.py --market US --start 2025-04-25 --end 2025-04-25 --print-report -v
 
 # ── Full run: both models ───────────────────────────────────
 python run_combined.py --market US
@@ -78,4 +78,4 @@ python run_combined.py --market US --combine-only
 # ── Custom model commands ───────────────────────────────────
 python run_combined.py --market US \
     --p1-cmd "python -m scripts.run_strategy full" \
-    --p2-cmd "python refactor/runner_v2.py"
+    --p2-cmd "python cash/phase2/runner_v2.py"

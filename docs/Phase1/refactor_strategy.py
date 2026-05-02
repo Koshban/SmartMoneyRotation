@@ -1,4 +1,4 @@
-"""refactor/strategy/scoring_v2.py """
+"""phase2/strategy/scoring_v2.py """
 
 from __future__ import annotations
 import numpy as np, pandas as pd
@@ -26,10 +26,10 @@ def compute_composite_v2(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-""" refactor/strategy/signals_v2.py """
+""" phase2/strategy/signals_v2.py """
 from __future__ import annotations
 import numpy as np, pandas as pd
-from refactor.common.config_refactor import SIGNALPARAMS_V2, CONVERGENCEPARAMS_V2
+from common.config_refactor import SIGNALPARAMS_V2, CONVERGENCEPARAMS_V2
 
 def apply_signals_v2(df: pd.DataFrame) -> pd.DataFrame:
     p = SIGNALPARAMS_V2; out = df.copy()
@@ -59,7 +59,7 @@ def apply_convergence_v2(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-""" refactor/strategy/portfolio_v2.py """
+""" phase2/strategy/portfolio_v2.py """
 from __future__ import annotations
 import numpy as np
 import pandas as pd
@@ -139,7 +139,7 @@ def build_portfolio_v2(latest: pd.DataFrame, max_positions: int = 8, max_sector_
     return {'selected': selected.sort_values('target_weight', ascending=False), 'meta': meta}
 
 
-""" refactor/strategy/regime_v2.py """
+""" phase2/strategy/regime_v2.py """
 from __future__ import annotations
 import numpy as np, pandas as pd
 from common.config_refactor import VOLREGIMEPARAMS
@@ -161,7 +161,7 @@ def classify_volatility_regime(bench: pd.DataFrame, dispersion: pd.Series | None
     label = np.select([score >= 0.75, score >= 0.35], ['chaotic', 'volatile'], default='calm')
     return pd.DataFrame({'volregime': label, 'volregimescore': score.clip(0,1), 'atrp_bench': atrp, 'realizedvol_bench': rv, 'gaprate_bench': gap, 'dispersion_bench': dispersion}, index=df.index)
 
-""" refactor/strategy/adapters_v2.py """
+""" phase2/strategy/adapters_v2.py """
 from __future__ import annotations
 import numpy as np
 import pandas as pd

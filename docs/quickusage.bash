@@ -22,19 +22,19 @@
 
 ingest_cash.py [-h] [--market {us,hk,in,all}] [--period PERIOD] [--days DAYS] [--source {yfinance,ibkr}] [--full] [--backfill]
 
-python src/ingest_cash.py --market all --period 20y 
-python src/ingest_cash.py --market all --period 2d --source ibkr
-python src/db/load_db.py --market all --type cash
+python ingest/ingest_cash.py --market all --period 20y 
+python ingest/ingest_cash.py --market all --period 2d --source ibkr
+python ingestdb/load_db.py --market all --type cash
 
-python src/ingest_options.py --market us      
-python src/ingest_options.py --market us    --consolidate                                                                                                                                                 
-python src/db/load_db.py --market all --type options 
+python ingest/ingest_options.py --market us      
+python ingest/ingest_options.py --market us    --consolidate                                                                                                                                                 
+python ingestdb/load_db.py --market all --type options 
 
-python src/db/load_db.py --market all --type all
-python src/db/load_db.py --market us  --type cash
-python src/db/load_db.py --market us  --type options
-python src/db/load_db.py --market hk  --type options
-python src/db/load_db.py --status
+python ingestdb/load_db.py --market all --type all
+python ingestdb/load_db.py --market us  --type cash
+python ingestdb/load_db.py --market us  --type options
+python ingestdb/load_db.py --market hk  --type options
+python ingestdb/load_db.py --status
 
 # Quickest way — sector rotation with quality filter + your holdings
 python -m scripts.run_strategy top-down --market US \
@@ -71,10 +71,6 @@ python -m scripts.run_strategy full --market US \
 
 # Backtesting The backtest/ module enables testing any strategy variant over up to 20 years of historical data.
 
-bash
-# Download 20 years of data
-python -m backtest.data_loader --years 20
-
 Usage:
     python run_bounce_scan.py                    # default market (US)
     python run_bounce_scan.py --market IN        # Indian market
@@ -86,8 +82,8 @@ Usage:
 python scripts/run_bounce_scan.py --market US --csv
 
 Usage:
-    python src/db/schema.py create          # Create all tables
-    python src/db/schema.py drop --yes      # Drop all tables (confirm required)
-    python src/db/schema.py recreate --yes  # Drop + Create
-    python src/db/schema.py status          # Show which tables exist
-    python src/db/schema.py drop-options --yes  # Drop only options tables
+    python ingestdb/schema.py create          # Create all tables
+    python ingestdb/schema.py drop --yes      # Drop all tables (confirm required)
+    python ingestdb/schema.py recreate --yes  # Drop + Create
+    python ingestdb/schema.py status          # Show which tables exist
+    python ingestdb/schema.py drop-options --yes  # Drop only options tables

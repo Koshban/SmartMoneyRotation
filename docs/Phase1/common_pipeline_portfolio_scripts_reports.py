@@ -2434,7 +2434,7 @@ import pandas as pd
 
 # ── Convergence ───────────────────────────────────────────────
 # ── Convergence ───────────────────────────────────────────────
-from strategy_phase1.convergence import (
+from cash.strategy_phase1.convergence import (
     run_convergence,
     build_price_matrix,
     enrich_snapshots,
@@ -2442,7 +2442,7 @@ from strategy_phase1.convergence import (
     convergence_report,
     MarketSignalResult,
 )
-from strategy_phase1.rotation import (
+from cash.strategy_phase1.rotation import (
     run_rotation,
     RotationConfig,
     RotationResult,
@@ -2460,17 +2460,17 @@ from common.config import (
 )
 
 # ── Compute ───────────────────────────────────────────────────
-from compute.breadth import (
+from cash.compute.breadth import (
     breadth_to_pillar_scores,
     compute_all_breadth,
 )
-from compute.sector_rs import compute_all_sector_rs
+from cash.compute.sector_rs import compute_all_sector_rs
 
 # ── Data loading ──────────────────────────────────────────────
-from src.db.loader import load_ohlcv, load_universe_ohlcv
+from ingest.db.loader import load_ohlcv, load_universe_ohlcv
 
 # ── Pipeline ──────────────────────────────────────────────────
-from pipeline.runner import (
+from cash.pipeline.runner import (
     TickerResult,
     results_errors,
     results_to_scored_universe,
@@ -2480,17 +2480,17 @@ from pipeline.runner import (
 )
 
 # ── Output ────────────────────────────────────────────────────
-from output.rankings import compute_all_rankings
-from output.signals import compute_all_signals
+from cash.output.rankings import compute_all_rankings
+from cash.output.signals import compute_all_signals
 
 # ── Strategy ──────────────────────────────────────────────────
-from strategy_phase1.portfolio import build_portfolio
+from cash.strategy_phase1.portfolio import build_portfolio
 
 # ── Portfolio ─────────────────────────────────────────────────
-from portfolio.backtest import run_backtest, BacktestConfig
+from cash.portfolio.backtest import run_backtest, BacktestConfig
 
 # ── Reports ───────────────────────────────────────────────────
-from reports.recommendations import build_report
+from cash.reports.recommendations import build_report
 
 
 logger = logging.getLogger(__name__)
@@ -3920,11 +3920,11 @@ from common.config import (
     INDICATOR_PARAMS,
     TICKER_SECTOR_MAP,
 )
-from compute.indicators import compute_all_indicators
-from compute.relative_strength import compute_all_rs
-from compute.scoring import compute_composite_score
-from compute.sector_rs import merge_sector_context
-from strategy_phase1.signals import generate_signals
+from cash.compute.indicators import compute_all_indicators
+from cash.compute.relative_strength import compute_all_rs
+from cash.compute.scoring import compute_composite_score
+from cash.compute.sector_rs import merge_sector_context
+from cash.strategy_phase1.signals import generate_signals
 
 logger = logging.getLogger(__name__)
 
@@ -4623,22 +4623,22 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from portfolio.sizing import (
+from cash.portfolio.sizing import (
     SizingConfig,
     compute_target_weights,
 )
-from portfolio.rebalance import (
+from cash.portfolio.rebalance import (
     RebalanceConfig,
     Trade,
     compute_drift,
     needs_rebalance,
     generate_trades,
 )
-from portfolio.risk import (
+from cash.portfolio.risk import (
     compute_portfolio_risk,
     drawdown_stats,
 )
-from output.signals import BUY, HOLD, SELL, NEUTRAL
+from cash.output.signals import BUY, HOLD, SELL, NEUTRAL
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -5869,7 +5869,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── Project imports ───────────────────────────────────────────
-from strategy_phase1.bounce import (
+from cash.strategy_phase1.bounce import (
     scan_bounce_candidates,
     bounce_report,
     BounceScanResult,
@@ -5886,7 +5886,7 @@ try:
     from orchestrator import MomentumPipeline as Pipeline
 except ImportError:
     try:
-        from pipeline import Pipeline
+        from cash.pipeline import Pipeline
     except ImportError:
         print(
             "ERROR: Cannot import your pipeline class.\n"
@@ -6182,25 +6182,25 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from pipeline.orchestrator import (
+from cash.pipeline.orchestrator import (
     Orchestrator,
     PipelineResult,
     run_full_pipeline,
     run_multi_market_pipeline,
 )
-from strategy_phase1.rotation import (
+from cash.strategy_phase1.rotation import (
     RotationConfig,
     RotationResult,
     composite_rs_all,
     run_rotation,
     print_result as print_rotation_result,
 )
-from strategy_phase1.rotation_filters import QualityConfig
+from cash.strategy_phase1.rotation_filters import QualityConfig
 from common.config import MARKET_CONFIG, ACTIVE_MARKETS
 
 # Optional: convergence module for price matrix building
 try:
-    from strategy_phase1.convergence import build_price_matrix as _conv_build_prices
+    from cash.strategy_phase1.convergence import build_price_matrix as _conv_build_prices
 except ImportError:
     _conv_build_prices = None
 
@@ -6267,7 +6267,7 @@ def _compute_indicators_inline(
     obv_slope_10d, relative_volume, and atr_14_pct.
     """
     try:
-        from compute.indicators import compute_all_indicators
+        from cash.compute.indicators import compute_all_indicators
     except ImportError:
         log.warning(
             "compute.indicators not importable — "
@@ -7135,9 +7135,9 @@ for _p in (str(_ROOT), str(_SRC)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from pipeline.orchestrator import run_full_pipeline
-from strategy_phase1.convergence import convergence_report
-from reports.html_report import generate_html_report
+from cash.pipeline.orchestrator import run_full_pipeline
+from cash.strategy_phase1.convergence import convergence_report
+from cash.reports.html_report import generate_html_report
 from common.config import MARKET_CONFIG
 
 
@@ -7398,7 +7398,7 @@ import html as _html
 from datetime import datetime
 from typing import Any
 
-from strategy_phase1.convergence import (
+from cash.strategy_phase1.convergence import (
     MarketSignalResult,
     ConvergedSignal,
     STRONG_BUY,
@@ -10440,8 +10440,8 @@ from pathlib import Path
 from typing import Any
 
 from common.config import LOGS_DIR, UNIVERSE, PORTFOLIO_PARAMS
-from pipeline.orchestrator import run_full_pipeline
-from reports.recommendations import (
+from cash.pipeline.orchestrator import run_full_pipeline
+from cash.reports.recommendations import (
     build_report,
     save_text,
     save_html,

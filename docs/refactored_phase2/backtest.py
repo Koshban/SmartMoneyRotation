@@ -65,9 +65,9 @@ from typing import Any, Dict, Tuple
 from rich.console import Console
 from rich.table import Table
 
-from backtest.phase2.engine import BacktestEngine
-from backtest.phase2.data_source import BacktestDataSource
-from backtest.phase2.metrics import compute_metrics
+from cash.backtest.phase2.engine import BacktestEngine
+from cash.backtest.phase2.data_source import BacktestDataSource
+from cash.backtest.phase2.metrics import compute_metrics
 
 
 # ------------------------------------------------------------------
@@ -821,8 +821,8 @@ import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Set
 
-from backtest.phase2.data_source import BacktestDataSource
-from backtest.phase2.tracker import PortfolioTracker
+from cash.backtest.phase2.data_source import BacktestDataSource
+from cash.backtest.phase2.tracker import PortfolioTracker
 
 log = logging.getLogger(__name__)
 
@@ -1281,15 +1281,15 @@ class BacktestEngine:
     # ==================================================================
     def _precompute_all(self):
         """Pre-compute per-ticker indicators, RS z-scores, and benchmark regime."""
-        from refactor.pipeline_v2 import (
+        from cash.phase2.pipeline_v2 import (
             _canonicalize_indicator_columns,
             _fill_missing_indicators,
             annotate_scoreability,
         )
-        from refactor.strategy.adapters_v2 import ensure_columns
-        from refactor.strategy.regime_v2 import classify_volatility_regime
-        from refactor.strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
-        from compute.indicators import compute_all_indicators
+        from cash.phase2.strategy.adapters_v2 import ensure_columns
+        from cash.phase2.strategy.regime_v2 import classify_volatility_regime
+        from cash.phase2.strategy.rs_v2 import compute_rs_zscores, enrich_rs_regimes
+        from cash.compute.indicators import compute_all_indicators
 
         t0 = time.time()
 
@@ -1722,7 +1722,7 @@ class BacktestEngine:
     #  FAST PIPELINE
     # ==================================================================
     def _run_pipeline_fast(self, day, tickers) -> Dict:
-        from refactor.pipeline_v2 import run_pipeline_v2
+        from cash.phase2.pipeline_v2 import run_pipeline_v2
 
         cutoff = pd.Timestamp(day)
         lookback = self.data_source.lookback_bars
@@ -2140,11 +2140,11 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 
-from backtest.phase2.data_source import BacktestDataSource
-from backtest.phase2.engine import BacktestEngine
-from backtest.phase2.metrics import compute_metrics
+from cash.backtest.phase2.data_source import BacktestDataSource
+from cash.backtest.phase2.engine import BacktestEngine
+from cash.backtest.phase2.metrics import compute_metrics
 from common.universe import get_universe_for_market
-from refactor.common.config_refactor import (
+from common.config_refactor import (
     VOLREGIMEPARAMS,
     SCORINGWEIGHTS_V2,
     SCORINGPARAMS_V2,

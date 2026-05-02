@@ -29,8 +29,8 @@ CLI
     python -m backtest.runner --market IN              # India
 """
 
-from backtest.phase1.engine import run_backtest_period, BacktestRun, StrategyConfig
-from backtest.phase1.metrics import (
+from cash.backtest.phase1.engine import run_backtest_period, BacktestRun, StrategyConfig
+from cash.backtest.phase1.metrics import (
     compute_cagr,
     compute_full_metrics,
     cagr_from_equity,
@@ -38,8 +38,8 @@ from backtest.phase1.metrics import (
     compute_monthly_returns_heatmap,
     compute_regime_metrics,
 )
-from backtest.phase1.comparison import compare_strategies
-from backtest.phase1.data_loader import ensure_history, load_cached_history
+from cash.backtest.phase1.comparison import compare_strategies
+from cash.backtest.phase1.data_loader import ensure_history, load_cached_history
 
 __all__ = [
     "run_backtest_period",
@@ -73,9 +73,9 @@ from typing import Any
 
 import pandas as pd
 
-from backtest.phase1.engine import BacktestRun, StrategyConfig, run_backtest_period
-from backtest.phase1.strategies import ALL_STRATEGIES, US_STRATEGIES
-from backtest.phase1.metrics import metrics_report
+from cash.backtest.phase1.engine import BacktestRun, StrategyConfig, run_backtest_period
+from cash.backtest.phase1.strategies import ALL_STRATEGIES, US_STRATEGIES
+from cash.backtest.phase1.metrics import metrics_report
 
 logger = logging.getLogger(__name__)
 
@@ -959,19 +959,19 @@ from common.config import (
     BREADTH_PORTFOLIO,
     MARKET_CONFIG,
 )
-from pipeline.orchestrator import Orchestrator, PipelineResult
-from portfolio.backtest import (
+from cash.pipeline.orchestrator import Orchestrator, PipelineResult
+from cash.portfolio.backtest import (
     BacktestConfig,
     BacktestResult,
     run_backtest as run_portfolio_backtest,
     compute_performance_metrics,
 )
-from portfolio.sizing import SizingConfig
-from portfolio.rebalance import RebalanceConfig
-from output.signals import SignalConfig
+from cash.portfolio.sizing import SizingConfig
+from cash.portfolio.rebalance import RebalanceConfig
+from cash.output.signals import SignalConfig
 
-from backtest.phase1.data_loader import slice_period, data_summary
-from backtest.phase1.metrics import compute_full_metrics
+from cash.backtest.phase1.data_loader import slice_period, data_summary
+from cash.backtest.phase1.metrics import compute_full_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -1800,7 +1800,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from portfolio.rebalance import Trade
+from cash.portfolio.rebalance import Trade
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2453,7 +2453,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from backtest.phase1.data_loader import (
+from cash.backtest.phase1.data_loader import (
     ensure_history,
     data_summary,
     get_universe_tickers,
@@ -2461,14 +2461,14 @@ from backtest.phase1.data_loader import (
     build_full_universe,
     BACKTEST_CORE_UNIVERSE,
 )
-from backtest.phase1.engine import run_backtest_period, StrategyConfig
-from backtest.phase1.strategies import (
+from cash.backtest.phase1.engine import run_backtest_period, StrategyConfig
+from cash.backtest.phase1.strategies import (
     ALL_STRATEGIES,
     get_strategy,
     list_strategies,
 )
-from backtest.phase1.comparison import compare_strategies
-from backtest.phase1.metrics import metrics_report
+from cash.backtest.phase1.comparison import compare_strategies
+from cash.backtest.phase1.metrics import metrics_report
 
 logger = logging.getLogger(__name__)
 
@@ -2793,7 +2793,7 @@ Diagnosis from baseline (2022-2026):
 
 from __future__ import annotations
 
-from backtest.phase1.engine import StrategyConfig
+from cash.backtest.phase1.engine import StrategyConfig
 from common.universe import SECTORS, BROAD_MARKET, FIXED_INCOME, COMMODITIES
 
 

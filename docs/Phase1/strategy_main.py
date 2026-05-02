@@ -2396,7 +2396,7 @@ from common.sector_map import (
     get_sector_or_class,
     get_us_tickers_for_sector,
 )
-from strategy_phase1.rotation_filters import (
+from cash.strategy_phase1.rotation_filters import (
     QualityConfig,
     GateResult,
     quality_gate,
@@ -4520,13 +4520,13 @@ from common.config import (
     PORTFOLIO_PARAMS,
     LOGS_DIR,
 )
-from pipeline.orchestrator import (
+from cash.pipeline.orchestrator import (
     Orchestrator,
     PipelineResult,
     run_full_pipeline,
 )
-from pipeline.runner import results_errors
-from reports.recommendations import (
+from cash.pipeline.runner import results_errors
+from cash.reports.recommendations import (
     build_report,
     to_text,
     to_html,
@@ -4537,7 +4537,7 @@ from reports.recommendations import (
 
 # Optional: portfolio rebalance view
 try:
-    from reports.portfolio_view import (
+    from cash.reports.portfolio_view import (
         build_rebalance_plan,
         save_rebalance_text,
         save_rebalance_html,

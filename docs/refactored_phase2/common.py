@@ -1,4 +1,4 @@
-# refactor/common/config_refactor.py
+# phase2/common/config_refactor.py
 """
 Unified simplified config.
 Built from the original Loose config, with structural simplifications:
@@ -365,7 +365,7 @@ CORRELATION_LIMITS = {
 
 
 ##############################
-""" refactor/common/market_config_v2.py"""
+""" phase2/common/market_config_v2.py"""
 from __future__ import annotations
 
 from common.universe import (
@@ -446,7 +446,7 @@ def get_market_config_v2(market: str) -> dict:
     return cfg
     
 ######################
-""" refactor/common/universe_loader_v2.py """
+""" phase2/common/universe_loader_v2.py """
 from __future__ import annotations
 
 
