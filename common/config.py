@@ -38,7 +38,7 @@ except ImportError:
 # names from Tier 2 themes (~130 additional stocks) to give the
 # scoring and rotation engines a richer universe to rank.
 #
-# Requires data: python src/ingest_cash.py --market us --period 2y
+# Requires data: python ingest/ingest_cash.py --market us --period 2y
 from common.universe import get_all_single_names as _get_singles
 _us_singles = [s for s in _get_singles()
                if not s.endswith(".HK") and not s.endswith(".NS")]

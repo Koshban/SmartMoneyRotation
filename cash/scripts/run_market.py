@@ -79,7 +79,7 @@ examples:
   python -m scripts.run_market -m US --days 365 --holdings NVDA,CRWD --open
 
 NOTE: Data must already exist in parquet/DB.  To download first:
-  python src/ingest_cash.py --market us --days 365
+  python ingest/ingest_cash.py --market us --days 365
         """,
     )
 

@@ -1,14 +1,14 @@
 """
-src/db/schema.py
+ingest/db/schema.py
 
 Single source of truth for all DB table definitions.
 
 Usage:
-    python src/db/schema.py create          # Create all tables
-    python src/db/schema.py drop --yes      # Drop all tables (confirm required)
-    python src/db/schema.py recreate --yes  # Drop + Create
-    python src/db/schema.py status          # Show which tables exist
-    python src/db/schema.py drop-options --yes  # Drop only options tables
+    python ingest/db/schema.py create          # Create all tables
+    python ingest/db/schema.py drop --yes      # Drop all tables (confirm required)
+    python ingest/db/schema.py recreate --yes  # Drop + Create
+    python ingest/db/schema.py status          # Show which tables exist
+    python ingest/db/schema.py drop-options --yes  # Drop only options tables
 """
 
 import argparse
@@ -406,7 +406,7 @@ def main():
             LOG.error("Pass --yes to confirm dropping options tables")
             return
         drop_options()
-        LOG.info("Now run: python src/db/schema.py create")
+        LOG.info("Now run: python ingest/db/schema.py create")
 
     elif args.action == "status":
         print_status()

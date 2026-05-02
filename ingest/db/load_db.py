@@ -1,18 +1,18 @@
 """
-src/db/load_db.py — Load parquet/CSV data into PostgreSQL (upsert).
+ingest/db/load_db.py — Load parquet/CSV data into PostgreSQL (upsert).
 
 Uses INSERT ... ON CONFLICT DO UPDATE so the script is safe to
 re-run at any time.  Duplicate rows (by the table's unique key)
 are updated in place rather than rejected.
 
 Usage:
-    python src/db/load_db.py                            # all markets, all types
-    python src/db/load_db.py --market us                 # US only
-    python src/db/load_db.py --type cash                 # cash tables only
-    python src/db/load_db.py --type options              # options tables only
-    python src/db/load_db.py --market us --type cash     # US cash only
-    python src/db/load_db.py --dry-run                   # preview, no DB writes
-    python src/db/load_db.py --status                    # show row counts only
+    python ingest/db/load_db.py                            # all markets, all types
+    python ingest/db/load_db.py --market us                 # US only
+    python ingest/db/load_db.py --type cash                 # cash tables only
+    python ingest/db/load_db.py --type options              # options tables only
+    python ingest/db/load_db.py --market us --type cash     # US cash only
+    python ingest/db/load_db.py --dry-run                   # preview, no DB writes
+    python ingest/db/load_db.py --status                    # show row counts only
 """
 
 import sys

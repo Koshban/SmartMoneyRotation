@@ -64,29 +64,29 @@
 ;; ── Option A: Full Backfill (first time / weekly) ─────────────────────────
 ;;
 ;;   # 1. Download 2 years of OHLCV for all markets
-;;   python src/ingest_cash.py --market all --period 20y
+;;   python ingest/ingest_cash.py --market all --period 20y
 ;;
 ;;   # 2. Download options chains (optional — needed for options analysis)
-;;   python src/ingest_options.py --market all --consolidate
+;;   python ingest/ingest_options.py --market all --consolidate
 ;;
 ;;   # 3. Load into PostgreSQL
-;;   python src/db/load_db.py --market all --type cash
-;;   python src/db/load_db.py --market all --type options
+;;   python ingest/db/load_db.py --market all --type cash
+;;   python ingest/db/load_db.py --market all --type options
 ;;
 ;;
 ;; ── Option B: Daily Refresh (cron / morning routine) ──────────────────────
 ;;
 ;;   # Refresh last 5 days (auto-selects IBKR for fresh data)
-;;   python src/ingest_cash.py --market all --period 5d
+;;   python ingest/ingest_cash.py --market all --period 5d
 ;;
 ;;   # Reload into DB
-;;   python src/db/load_db.py --market all --type cash
+;;   python ingest/db/load_db.py --market all --type cash
 ;;
 ;;
 ;; ── Option C: Single Market Only ──────────────────────────────────────────
 ;;
-;;   python src/ingest_cash.py --market us --period 2y
-;;   python src/db/load_db.py --market us --type cash
+;;   python ingest/ingest_cash.py --market us --period 2y
+;;   python ingest/db/load_db.py --market us --type cash
 ;;
 ;;
 ;; ── Verify Data Is Available ──────────────────────────────────────────────
@@ -406,8 +406,8 @@
 ;; ── Workflow A: Morning Scan (Daily, ~2 min) ──────────────────────────────
 ;;
 ;;   # 1. Refresh data (5d window → IBKR source)
-;;   python src/ingest_cash.py --market all --period 5d
-;;   python src/db/load_db.py --market all --type cash
+;;   python ingest/ingest_cash.py --market all --period 5d
+;;   python ingest/db/load_db.py --market all --type cash
 ;;
 ;;   # 2. Quick top-down sector check
 ;;   python -m scripts.run_strategy top-down --market US
@@ -420,8 +420,8 @@
 ;; ── Workflow B: Weekly Portfolio Review (Weekly, ~5 min) ──────────────────
 ;;
 ;;   # 1. Full data refresh
-;;   python src/ingest_cash.py --market all --period 2y
-;;   python src/db/load_db.py --market all --type cash
+;;   python ingest/ingest_cash.py --market all --period 2y
+;;   python ingest/db/load_db.py --market all --type cash
 ;;
 ;;   # 2. Complete analysis across all markets
 ;;   python -m scripts.run_strategy full --market ALL \
@@ -691,8 +691,8 @@
 ;;   Data has not been loaded for the benchmark ticker.
 ;;   Fix: run ingest + load_db for the relevant market.
 ;;
-;;     python src/ingest_cash.py --market us --period 2y
-;;     python src/db/load_db.py --market us --type cash
+;;     python ingest/ingest_cash.py --market us --period 2y
+;;     python ingest/db/load_db.py --market us --type cash
 ;;
 ;;
 ;; ── "Phase 'load_data' has not been run yet" ──────────────────────────────
@@ -744,8 +744,8 @@
 ;; ── Daily (weekdays, 6:30 AM ET — after premarket data available) ─────────
 ;;
 ;;   30 6 * * 1-5  cd /opt/cash && \
-;;     python src/ingest_cash.py --market all --period 5d && \
-;;     python src/db/load_db.py --market all --type cash && \
+;;     python ingest/ingest_cash.py --market all --period 5d && \
+;;     python ingest/db/load_db.py --market all --type cash && \
 ;;     python -m scripts.run_strategy full --market ALL \
 ;;       --holdings NVDA,CRWD,CEG \
 ;;       -o results/daily_$(date +\%Y\%m\%d).json \
@@ -755,8 +755,8 @@
 ;; ── Weekly (Sunday 8 PM ET — full backfill for clean data) ────────────────
 ;;
 ;;   0 20 * * 0  cd /opt/cash && \
-;;     python src/ingest_cash.py --market all --period 2y && \
-;;     python src/db/load_db.py --market all --type cash && \
+;;     python ingest/ingest_cash.py --market all --period 2y && \
+;;     python ingest/db/load_db.py --market all --type cash && \
 ;;     python -m scripts.run_strategy full --market ALL \
 ;;       --lookback 365 \
 ;;       -o results/weekly_$(date +\%Y\%m\%d).json
@@ -767,11 +767,11 @@
 ;; ═══════════════════════════════════════════════════════════════════════════
 ;;
 ;;   # ── Data Loading ─────────────────────────────────────────────────────
-;;   python src/ingest_cash.py --market all --period 2y
-;;   python src/ingest_cash.py --market us --period 5d
-;;   python src/ingest_options.py --market all --consolidate
-;;   python src/db/load_db.py --market all --type cash
-;;   python src/db/load_db.py --market all --type options
+;;   python ingest/ingest_cash.py --market all --period 2y
+;;   python ingest/ingest_cash.py --market us --period 5d
+;;   python ingest/ingest_options.py --market all --consolidate
+;;   python ingest/db/load_db.py --market all --type cash
+;;   python ingest/db/load_db.py --market all --type options
 ;;
 ;;   # ── Top-Down ─────────────────────────────────────────────────────────
 ;;   python -m scripts.run_strategy top-down --market US
@@ -870,18 +870,18 @@
   {:prerequisite "Strategy scripts cannot run without data"
    :full-backfill
    {:when     "First time / weekly"
-    :commands ["python src/ingest_cash.py --market all --period 2y"
-               "python src/ingest_options.py --market all --consolidate"
-               "python src/db/load_db.py --market all --type cash"
-               "python src/db/load_db.py --market all --type options"]}
+    :commands ["python ingest/ingest_cash.py --market all --period 2y"
+               "python ingest/ingest_options.py --market all --consolidate"
+               "python ingest/db/load_db.py --market all --type cash"
+               "python ingest/db/load_db.py --market all --type options"]}
    :daily-refresh
    {:when     "Weekday mornings"
-    :commands ["python src/ingest_cash.py --market all --period 5d"
-               "python src/db/load_db.py --market all --type cash"]}
+    :commands ["python ingest/ingest_cash.py --market all --period 5d"
+               "python ingest/db/load_db.py --market all --type cash"]}
    :single-market
    {:when     "Testing / targeted analysis"
-    :commands ["python src/ingest_cash.py --market us --period 2y"
-               "python src/db/load_db.py --market us --type cash"]}})
+    :commands ["python ingest/ingest_cash.py --market us --period 2y"
+               "python ingest/db/load_db.py --market us --type cash"]}})
 
 
 (def workflows
@@ -889,7 +889,7 @@
    {:frequency "daily"
     :duration  "~2 minutes"
     :steps     [{:action "Refresh data"
-                 :cmd    "python src/ingest_cash.py --market all --period 5d && python src/db/load_db.py --market all --type cash"}
+                 :cmd    "python ingest/ingest_cash.py --market all --period 5d && python ingest/db/load_db.py --market all --type cash"}
                 {:action "Quick sector check"
                  :cmd    "python -m scripts.run_strategy top-down --market US"}
                 {:action "Full analysis if needed"
@@ -899,7 +899,7 @@
    {:frequency "weekly"
     :duration  "~5 minutes"
     :steps     [{:action "Full backfill"
-                 :cmd    "python src/ingest_cash.py --market all --period 2y && python src/db/load_db.py --market all --type cash"}
+                 :cmd    "python ingest/ingest_cash.py --market all --period 2y && python ingest/db/load_db.py --market all --type cash"}
                 {:action "All-market full pipeline"
                  :cmd    "python -m scripts.run_strategy full --market ALL --holdings ... -o results/weekly.json"}]}
 

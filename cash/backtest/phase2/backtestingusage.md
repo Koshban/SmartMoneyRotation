@@ -192,24 +192,24 @@ The `BacktestEngine` compensates for some pipeline issues:
 
 ```bash
 # Minimum: 2 years (enough for most backtests)
-python src/ingest_cash.py --market HK --period 2y
-python src/ingest_cash.py --market US --period 2y
-python src/ingest_cash.py --market IN --period 2y
+python ingest/ingest_cash.py --market HK --period 2y
+python ingest/ingest_cash.py --market US --period 2y
+python ingest/ingest_cash.py --market IN --period 2y
 
 # All markets at once
-python src/ingest_cash.py --market all --period 2y
+python ingest/ingest_cash.py --market all --period 2y
 
 # Maximum history (~20 years for US, varies by market)
-python src/ingest_cash.py --market US --period max
+python ingest/ingest_cash.py --market US --period max
 
 # Recent refresh only (daily use)
-python src/ingest_cash.py --market all --period 5d
+python ingest/ingest_cash.py --market all --period 5d
 ```
 
 ### Optional: Load to PostgreSQL
 
 ```bash
-python src/db/load_db.py --market all --type cash
+python ingest/db/load_db.py --market all --type cash
 ```
 
 ### Verify Data
@@ -447,7 +447,7 @@ def build_config_b(args):
 
 ```bash
 # 1. Get data
-python src/ingest_cash.py --market HK --period 2y
+python ingest/ingest_cash.py --market HK --period 2y
 
 # 2. Run with defaults
 python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
@@ -806,9 +806,9 @@ WARNING  trailing stops triggered for 25 positions (market-wide drawdown?)
 
 | Problem | Symptom | Fix |
 |---------|---------|-----|
-| Parquet file missing | "Parquet file not found" error | `python src/ingest_cash.py --market {X} --period 2y` |
+| Parquet file missing | "Parquet file not found" error | `python ingest/ingest_cash.py --market {X} --period 2y` |
 | Start date before data | "Loaded 0 tickers" or very few trading days | Adjust `--start` to after data begins |
-| Stale data | Results differ from expected | Re-ingest: `python src/ingest_cash.py --market {X} --period 2y` |
+| Stale data | Results differ from expected | Re-ingest: `python ingest/ingest_cash.py --market {X} --period 2y` |
 | Missing tickers | "Missing N tickers" warning | Normal for newer listings; check universe.py |
 
 ### Signal Issues
@@ -921,12 +921,12 @@ The benchmark is used for:
 ```bash
 # ─── DAILY ─────────────────────────────────────────────────────
 # Refresh data + quick backtest validation
-python src/ingest_cash.py --market all --period 5d
+python ingest/ingest_cash.py --market all --period 5d
 python -m backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2026-04-20
 
 # ─── WEEKLY ────────────────────────────────────────────────────
 # Full data refresh + comprehensive backtest
-python src/ingest_cash.py --market all --period 2y
+python ingest/ingest_cash.py --market all --period 2y
 python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
 python -m backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20
 python -m backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20

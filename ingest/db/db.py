@@ -1,5 +1,5 @@
 """
-src/db/db.py
+ingest/db/db.py
 
 Database connection utilities.
 All table definitions live in schema.py — this file only provides

@@ -1,5 +1,5 @@
 """
-src/ingest_options.py
+ingest/ingest_options.py
 Fetch option chains and save to parquet + CSV.
 
 Sources:
@@ -21,12 +21,12 @@ HK Options Notes:
     (e.g. 0700.HK → "700", 9988.HK → "9988").
 
 Usage:
-    python src/ingest_options.py --market us                    # yfinance
-    python src/ingest_options.py --market us --source ibkr      # IBKR
-    python src/ingest_options.py --market hk                    # IBKR (auto)
-    python src/ingest_options.py --market hk --tickers 9988.HK  # single HK
-    python src/ingest_options.py --market us --rungs 7
-    python src/ingest_options.py --market us --consolidate
+    python ingest/ingest_options.py --market us                    # yfinance
+    python ingest/ingest_options.py --market us --source ibkr      # IBKR
+    python ingest/ingest_options.py --market hk                    # IBKR (auto)
+    python ingest/ingest_options.py --market hk --tickers 9988.HK  # single HK
+    python ingest/ingest_options.py --market us --rungs 7
+    python ingest/ingest_options.py --market us --consolidate
 """
 import sys
 from pathlib import Path

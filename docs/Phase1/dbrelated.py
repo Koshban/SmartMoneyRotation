@@ -1,5 +1,5 @@
 """
-src/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
+ingest/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
 
 Auto-selects data source:
   Period ≤ 5 days   → IBKR TWS  (must be running)
@@ -12,12 +12,12 @@ Outputs:
   data/universe_ohlcv.parquet  — combined file   (for loader.py)
 
 Usage:
-    python src/ingest_cash.py --market all --period 2y
-    python src/ingest_cash.py --market all --days 180
-    python src/ingest_cash.py --market us  --days 365
-    python src/ingest_cash.py --market all --period 3d
-    python src/ingest_cash.py --market us --period 5d --source ibkr
-    python src/ingest_cash.py --full --backfill
+    python ingest/ingest_cash.py --market all --period 2y
+    python ingest/ingest_cash.py --market all --days 180
+    python ingest/ingest_cash.py --market us  --days 365
+    python ingest/ingest_cash.py --market all --period 3d
+    python ingest/ingest_cash.py --market us --period 5d --source ibkr
+    python ingest/ingest_cash.py --full --backfill
 """
 
 import sys
@@ -633,11 +633,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python src/ingest_cash.py --market all --period 2y        # 2-year backfill
-  python src/ingest_cash.py --market us  --days 365         # US, exactly 365 days
-  python src/ingest_cash.py --market all --days 180         # all markets, 180 days
-  python src/ingest_cash.py --market us  --period 5d --source ibkr
-  python src/ingest_cash.py --full --backfill
+  python ingest/ingest_cash.py --market all --period 2y        # 2-year backfill
+  python ingest/ingest_cash.py --market us  --days 365         # US, exactly 365 days
+  python ingest/ingest_cash.py --market all --days 180         # all markets, 180 days
+  python ingest/ingest_cash.py --market us  --period 5d --source ibkr
+  python ingest/ingest_cash.py --full --backfill
         """,
     )
     parser.add_argument(
@@ -723,7 +723,7 @@ if __name__ == "__main__":
 
 #####################################
 """
-src/ingest_options.py
+ingest/ingest_options.py
 Fetch option chains and save to parquet + CSV.
 
 Sources:
@@ -745,12 +745,12 @@ HK Options Notes:
     (e.g. 0700.HK → "700", 9988.HK → "9988").
 
 Usage:
-    python src/ingest_options.py --market us                    # yfinance
-    python src/ingest_options.py --market us --source ibkr      # IBKR
-    python src/ingest_options.py --market hk                    # IBKR (auto)
-    python src/ingest_options.py --market hk --tickers 9988.HK  # single HK
-    python src/ingest_options.py --market us --rungs 7
-    python src/ingest_options.py --market us --consolidate
+    python ingest/ingest_options.py --market us                    # yfinance
+    python ingest/ingest_options.py --market us --source ibkr      # IBKR
+    python ingest/ingest_options.py --market hk                    # IBKR (auto)
+    python ingest/ingest_options.py --market hk --tickers 9988.HK  # single HK
+    python ingest/ingest_options.py --market us --rungs 7
+    python ingest/ingest_options.py --market us --consolidate
 """
 import sys
 from pathlib import Path
@@ -1526,7 +1526,7 @@ if __name__ == "__main__":
 
 ###########################################
 """
-src/db/loader.py
+ingest/db/loader.py
 --------------
 Unified OHLCV data loader for the CASH compute pipeline.
 
@@ -1695,8 +1695,8 @@ def check_minimum_history(
         raise ValueError(
             f"Insufficient history: median ticker has {median_len} bars, "
             f"need at least {min_bars} for indicators to compute. "
-            f"Run: python src/ingest_cash.py --market <mkt> --period 2y  "
-            f"to backfill, then: python src/db/load_db.py --type cash"
+            f"Run: python ingest/ingest_cash.py --market <mkt> --period 2y  "
+            f"to backfill, then: python ingest/db/load_db.py --type cash"
         )
 
     if median_len < warn_bars:
@@ -2233,20 +2233,20 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
 ####################################
 """
-src/db/load_db.py — Load parquet/CSV data into PostgreSQL (upsert).
+ingest/db/load_db.py — Load parquet/CSV data into PostgreSQL (upsert).
 
 Uses INSERT ... ON CONFLICT DO UPDATE so the script is safe to
 re-run at any time.  Duplicate rows (by the table's unique key)
 are updated in place rather than rejected.
 
 Usage:
-    python src/db/load_db.py                            # all markets, all types
-    python src/db/load_db.py --market us                 # US only
-    python src/db/load_db.py --type cash                 # cash tables only
-    python src/db/load_db.py --type options              # options tables only
-    python src/db/load_db.py --market us --type cash     # US cash only
-    python src/db/load_db.py --dry-run                   # preview, no DB writes
-    python src/db/load_db.py --status                    # show row counts only
+    python ingest/db/load_db.py                            # all markets, all types
+    python ingest/db/load_db.py --market us                 # US only
+    python ingest/db/load_db.py --type cash                 # cash tables only
+    python ingest/db/load_db.py --type options              # options tables only
+    python ingest/db/load_db.py --market us --type cash     # US cash only
+    python ingest/db/load_db.py --dry-run                   # preview, no DB writes
+    python ingest/db/load_db.py --status                    # show row counts only
 """
 
 import sys
@@ -2705,7 +2705,7 @@ if __name__ == "__main__":
 
 ####################################################
 """
-src/db/db.py
+ingest/db/db.py
 
 Database connection utilities.
 All table definitions live in schema.py — this file only provides

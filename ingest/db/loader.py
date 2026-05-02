@@ -1,5 +1,5 @@
 """
-src/db/loader.py
+ingest/db/loader.py
 --------------
 Unified OHLCV data loader for the CASH compute pipeline.
 
@@ -168,8 +168,8 @@ def check_minimum_history(
         raise ValueError(
             f"Insufficient history: median ticker has {median_len} bars, "
             f"need at least {min_bars} for indicators to compute. "
-            f"Run: python src/ingest_cash.py --market <mkt> --period 2y  "
-            f"to backfill, then: python src/db/load_db.py --type cash"
+            f"Run: python ingest/ingest_cash.py --market <mkt> --period 2y  "
+            f"to backfill, then: python ingest/db/load_db.py --type cash"
         )
 
     if median_len < warn_bars:

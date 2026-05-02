@@ -1,5 +1,5 @@
 """
-src/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
+ingest/ingest_cash.py – Download OHLCV universe data (yfinance + IBKR).
 
 Auto-selects data source:
   Period ≤ 5 days   → IBKR TWS  (must be running)
@@ -16,14 +16,14 @@ Incremental mode:
   is NEVER deleted unless you explicitly pass --trim-days N.
 
 Usage:
-    python src/ingest_cash.py --market all --period 2y
-    python src/ingest_cash.py --market all --days 180
-    python src/ingest_cash.py --market us  --days 365
-    python src/ingest_cash.py --market all --period 3d
-    python src/ingest_cash.py --market us --period 5d --source ibkr
-    python src/ingest_cash.py --full --backfill
-    python src/ingest_cash.py --market us --days 5          # daily incremental
-    python src/ingest_cash.py --market us --trim-days 900   # keep only last 900 cal days
+    python ingest/ingest_cash.py --market all --period 2y
+    python ingest/ingest_cash.py --market all --days 180
+    python ingest/ingest_cash.py --market us  --days 365
+    python ingest/ingest_cash.py --market all --period 3d
+    python ingest/ingest_cash.py --market us --period 5d --source ibkr
+    python ingest/ingest_cash.py --full --backfill
+    python ingest/ingest_cash.py --market us --days 5          # daily incremental
+    python ingest/ingest_cash.py --market us --trim-days 900   # keep only last 900 cal days
 """
 
 import sys
@@ -661,19 +661,19 @@ def main():
         epilog="""
 examples:
   # ── Initial backfill (run once) ──────────────────────────────
-  python src/ingest_cash.py --market all --period 2y        # 2-year backfill
-  python src/ingest_cash.py --market us  --period 5y        # 5-year deep history
-  python src/ingest_cash.py --full --backfill               # max available history
+  python ingest/ingest_cash.py --market all --period 2y        # 2-year backfill
+  python ingest/ingest_cash.py --market us  --period 5y        # 5-year deep history
+  python ingest/ingest_cash.py --full --backfill               # max available history
 
   # ── Daily incremental (cron / scheduled) ─────────────────────
-  python src/ingest_cash.py --market all --days 7           # last week (safe overlap)
-  python src/ingest_cash.py --market us  --days 5           # last 5 calendar days
+  python ingest/ingest_cash.py --market all --days 7           # last week (safe overlap)
+  python ingest/ingest_cash.py --market us  --days 5           # last 5 calendar days
 
   # ── Explicit trim (rarely needed) ────────────────────────────
-  python src/ingest_cash.py --market us --days 5 --trim-days 900
+  python ingest/ingest_cash.py --market us --days 5 --trim-days 900
 
   # ── Source override ──────────────────────────────────────────
-  python src/ingest_cash.py --market us --period 5d --source ibkr
+  python ingest/ingest_cash.py --market us --period 5d --source ibkr
         """,
     )
     parser.add_argument(

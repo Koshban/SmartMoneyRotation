@@ -54,7 +54,7 @@ Dependencies
   strategy/portfolio.py           — position sizing & allocation
   portfolio/backtest.py           — historical backtest
   reports/recommendations.py      — ticker recommendations
-  src/db/loader.py                — OHLCV data loading
+  ingest/db/loader.py                — OHLCV data loading
   common/config.py                — all parameters
 """
 

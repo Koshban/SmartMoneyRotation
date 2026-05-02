@@ -184,13 +184,13 @@ Data flows through three layers: ingestion, storage, and reading.
 
 Full backfill (first time / weekly)
 -----
-python src/ingest_cash.py --market all --period 2y
-python src/db/load_db.py --market all --type cash
+python ingest/ingest_cash.py --market all --period 2y
+python ingest/db/load_db.py --market all --type cash
 
 Daily refresh
 -----
-python src/ingest_cash.py --market all --period 5d
-python src/db/load_db.py --market all --type cash
+python ingest/ingest_cash.py --market all --period 5d
+python ingest/db/load_db.py --market all --type cash
 
 ---
 
@@ -289,7 +289,7 @@ run_strategy.py — Unified CLI for all three strategy modes (top-down, bottom-u
 
 run_market.py — Single-market runner that produces an HTML convergence report. Simpler interface than run_strategy.py for the common case of running one market and opening the result in a browser.
 
-src/ — Data Ingestion & Storage
+ingest/ — Data Ingestion & Storage
 ingest_cash.py — Downloads OHLCV data for all markets. Auto-selects yfinance (>5 days) or IBKR (≤5 days) based on the requested period. Saves per-market parquet files plus a combined universe parquet. Supports --market, --period, --days, --source, --full, and --backfill flags.
 
 ingest_options.py — Downloads options chain data (not shown in full above). Produces per-ticker CSV files in data/options/{market}/, with a --consolidate flag to merge into market-level parquet files.
@@ -328,10 +328,10 @@ Usage.clj — Living documentation describing system usage, execution modes, CLI
 pip install -r requirements.txt
 
 # 2. Download 2 years of data
-python src/ingest_cash.py --market all --period 2y
+python ingest/ingest_cash.py --market all --period 2y
 
 # 3. Load into PostgreSQL (optional — parquet works standalone)
-python src/db/load_db.py --market all --type cash
+python ingest/db/load_db.py --market all --type cash
 
 # 4. Run the full pipeline for US
 python -m scripts.run_strategy full --market US
@@ -342,15 +342,15 @@ python -m scripts.run_market -m US --days 365 --open
 Daily & Weekly Workflows
 Morning Scan (~2 minutes)
 bash
-python src/ingest_cash.py --market all --period 5d
-python src/db/load_db.py --market all --type cash
+python ingest/ingest_cash.py --market all --period 5d
+python ingest/db/load_db.py --market all --type cash
 python -m scripts.run_strategy top-down --market US
 python -m scripts.run_strategy full --market US --holdings NVDA,CRWD,CEG
 
 Weekly Portfolio Review (~5 minutes)
 bash
-python src/ingest_cash.py --market all --period 2y
-python src/db/load_db.py --market all --type cash
+python ingest/ingest_cash.py --market all --period 2y
+python ingest/db/load_db.py --market all --type cash
 python -m scripts.run_strategy full --market ALL \
     --holdings NVDA,CRWD,CEG,LMT,VST,HDFCBANK.NS \
     -o results/weekly_$(date +%Y%m%d).json

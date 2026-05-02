@@ -108,7 +108,7 @@
 ;;
 ;; ── STEP 1 : Download Cash Data → Parquet (cumulative) ────────────────────
 ;;
-;;   python src/ingest_cash.py --market all --period 2y
+;;   python ingest/ingest_cash.py --market all --period 2y
 ;;
 ;;   Creates / accumulates:
 ;;     data/us_cash.parquet
@@ -117,26 +117,26 @@
 ;;     data/universe_ohlcv.parquet          (combined superset)
 ;;
 ;;   Per-market variant:
-;;     python src/ingest_cash.py --market us --period 2y
-;;     python src/ingest_cash.py --market hk --period 2y
-;;     python src/ingest_cash.py --market in --period 2y
+;;     python ingest/ingest_cash.py --market us --period 2y
+;;     python ingest/ingest_cash.py --market hk --period 2y
+;;     python ingest/ingest_cash.py --market in --period 2y
 ;;
 ;;   Days-based variant (exact calendar day count):
-;;     python src/ingest_cash.py --market all --days 365
+;;     python ingest/ingest_cash.py --market all --days 365
 ;;
 ;;
 ;; ── STEP 2 : Download Options Data → CSV → Parquet ────────────────────────
 ;;
-;;   python src/ingest_options.py --market us
-;;   python src/ingest_options.py --market hk
+;;   python ingest/ingest_options.py --market us
+;;   python ingest/ingest_options.py --market hk
 ;;
 ;;   Creates (raw per-ticker):
 ;;     data/options/us/*.csv
 ;;     data/options/hk/*.csv
 ;;
 ;;   Consolidate into parquet:
-;;     python src/ingest_options.py --market us --consolidate
-;;     python src/ingest_options.py --market hk --consolidate
+;;     python ingest/ingest_options.py --market us --consolidate
+;;     python ingest/ingest_options.py --market hk --consolidate
 ;;
 ;;   Creates:
 ;;     data/us_options.parquet
@@ -145,14 +145,14 @@
 ;;
 ;; ── STEP 3 : Load Parquet → PostgreSQL (upsert, idempotent) ──────────────
 ;;
-;;   python src/db/load_db.py --market all --type cash
+;;   python ingest/db/load_db.py --market all --type cash
 ;;
 ;;   Reads:
 ;;     data/us_cash.parquet       →  us_cash       table
 ;;     data/hk_cash.parquet       →  hk_cash       table
 ;;     data/in_cash.parquet       →  in_cash        table
 ;;
-;;   python src/db/load_db.py --market all --type options
+;;   python ingest/db/load_db.py --market all --type options
 ;;
 ;;   Reads:
 ;;     data/options/us/*.csv      →  us_options     table
@@ -161,11 +161,11 @@
 ;;   All loads use INSERT ... ON CONFLICT DO UPDATE (safe to re-run).
 ;;
 ;;   Per-market variant:
-;;     python src/db/load_db.py --market us --type cash
-;;     python src/db/load_db.py --market us --type options
+;;     python ingest/db/load_db.py --market us --type cash
+;;     python ingest/db/load_db.py --market us --type options
 ;;
 ;;   Check status:
-;;     python src/db/load_db.py --status
+;;     python ingest/db/load_db.py --status
 ;;
 ;;
 ;; ── STEP 4 : Compute Pipeline Reads via loader.py ─────────────────────────
@@ -192,20 +192,20 @@
 ;; ═══════════════════════════════════════════════════════════════════════════
 ;;
 ;;   # 1. Cash equities — 2-year backfill populates cumulative parquet
-;;   python src/ingest_cash.py --market all --period 2y
+;;   python ingest/ingest_cash.py --market all --period 2y
 ;;
 ;;   # 2. Options chains
-;;   python src/ingest_options.py --market us
-;;   python src/ingest_options.py --market hk
-;;   python src/ingest_options.py --market us --consolidate
-;;   python src/ingest_options.py --market hk --consolidate
+;;   python ingest/ingest_options.py --market us
+;;   python ingest/ingest_options.py --market hk
+;;   python ingest/ingest_options.py --market us --consolidate
+;;   python ingest/ingest_options.py --market hk --consolidate
 ;;
 ;;   # 3. Load everything into PostgreSQL (canonical store)
-;;   python src/db/load_db.py --market all --type cash
-;;   python src/db/load_db.py --market all --type options
+;;   python ingest/db/load_db.py --market all --type cash
+;;   python ingest/db/load_db.py --market all --type options
 ;;
 ;;   # 4. Run the pipeline (reads from loader.py → DB → parquet → yfinance)
-;;   python src/run_pipeline.py
+;;   python ingest/run_pipeline.py
 ;;
 ;;
 ;; ═══════════════════════════════════════════════════════════════════════════
@@ -214,15 +214,15 @@
 ;;
 ;;   # 1. Fetch last 2 days of cash (IBKR for US/HK, yfinance for India)
 ;;   #    Appends to existing parquet → cumulative store grows
-;;   python src/ingest_cash.py --market all --days 2
+;;   python ingest/ingest_cash.py --market all --days 2
 ;;
 ;;   # 2. Refresh today's options chains (appends to per-ticker CSVs)
-;;   python src/ingest_options.py --market us
-;;   python src/ingest_options.py --market hk
+;;   python ingest/ingest_options.py --market us
+;;   python ingest/ingest_options.py --market hk
 ;;
 ;;   # 3. Upsert into DB (ON CONFLICT DO UPDATE — safe to re-run)
-;;   python src/db/load_db.py --market all --type cash
-;;   python src/db/load_db.py --market all --type options
+;;   python ingest/db/load_db.py --market all --type cash
+;;   python ingest/db/load_db.py --market all --type options
 ;;
 ;;   # The parquet files now have N+2 days of data.
 ;;   # The DB now has the full accumulated history.
@@ -282,8 +282,8 @@
 ;;     loader.py falls back to yfinance (live download)
 ;;     check_minimum_history() will likely FAIL (< 60 bars)
 ;;     Fix: run initial backfill first
-;;       python src/ingest_cash.py --market all --period 2y
-;;       python src/db/load_db.py --market all --type cash
+;;       python ingest/ingest_cash.py --market all --period 2y
+;;       python ingest/db/load_db.py --market all --type cash
 ;;
 ;;   Scenario: DB has full history, parquet was overwritten with 5d
 ;;     loader.py reads from DB first — no data loss
@@ -398,7 +398,7 @@
                :read-order  3}}
 
    :ingest-layer
-   {:cash    {:script "src/ingest_cash.py"
+   {:cash    {:script "ingest/ingest_cash.py"
               :sources {:yfinance "bulk historical (> 5 days)"
                         :ibkr     "recent refresh (<= 5 days)"}
               :save-mode "cumulative upsert (not overwrite)"
@@ -406,7 +406,7 @@
                         "data/hk_cash.parquet"
                         "data/in_cash.parquet"
                         "data/universe_ohlcv.parquet"]}
-    :options {:script "src/ingest_options.py"
+    :options {:script "ingest/ingest_options.py"
               :sources {:yfinance "US options"
                         :ibkr     "US + HK options"}
               :markets-supported ["us" "hk"]
@@ -417,11 +417,11 @@
    :storage-layer
    {:parquet   {:location "data/"
                 :role     "cumulative rolling cache + input for load_db.py"}
-    :postgres  {:loader   "src/db/load_db.py"
+    :postgres  {:loader   "ingest/db/load_db.py"
                 :role     "canonical read store (DB-first in loader.py)"}}
 
    :read-layer
-   {:loader {:script "src/db/loader.py"
+   {:loader {:script "ingest/db/loader.py"
              :role   "single read interface for the compute pipeline"
              :fallback-chain ["PostgreSQL" "Parquet" "yfinance"]
              :history-guard {:hard-min  60
@@ -430,25 +430,25 @@
 
    :steps
    [{:step 1 :name "Download cash → parquet (cumulative)"
-     :cmd  "python src/ingest_cash.py --market all --period 2y"}
+     :cmd  "python ingest/ingest_cash.py --market all --period 2y"}
     {:step 2 :name "Download options → csv"
-     :cmd  ["python src/ingest_options.py --market us"
-            "python src/ingest_options.py --market hk"]}
+     :cmd  ["python ingest/ingest_options.py --market us"
+            "python ingest/ingest_options.py --market hk"]}
     {:step 3 :name "Load parquet/csv → PostgreSQL (upsert)"
-     :cmd  ["python src/db/load_db.py --market all --type cash"
-            "python src/db/load_db.py --market all --type options"]}
+     :cmd  ["python ingest/db/load_db.py --market all --type cash"
+            "python ingest/db/load_db.py --market all --type options"]}
     {:step 4 :name "Pipeline reads via loader.py (DB → parquet → yfinance)"
-     :cmd  "python src/run_pipeline.py"}]
+     :cmd  "python ingest/run_pipeline.py"}]
 
    :daily-refresh
    [{:step 1 :name "Incremental cash (appends to cumulative parquet)"
-     :cmd  "python src/ingest_cash.py --market all --days 2"}
+     :cmd  "python ingest/ingest_cash.py --market all --days 2"}
     {:step 2 :name "Today's options"
-     :cmd  ["python src/ingest_options.py --market us"
-            "python src/ingest_options.py --market hk"]}
+     :cmd  ["python ingest/ingest_options.py --market us"
+            "python ingest/ingest_options.py --market hk"]}
     {:step 3 :name "Upsert into DB"
-     :cmd  ["python src/db/load_db.py --market all --type cash"
-            "python src/db/load_db.py --market all --type options"]}]
+     :cmd  ["python ingest/db/load_db.py --market all --type cash"
+            "python ingest/db/load_db.py --market all --type options"]}]
 
    :db-tables
    {:cash    {:tables ["us_cash" "hk_cash" "in_cash"]

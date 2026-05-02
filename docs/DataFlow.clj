@@ -1,6 +1,6 @@
 ingest_cash.py → data/universe_ohlcv.parquet
                           ↓
-src/db/loader.py  →  {ticker: OHLCV DataFrame}
+ingest/db/loader.py  →  {ticker: OHLCV DataFrame}
                           ↓
 orchestrator.py Phase 0 (load_data)
          ↓
@@ -616,7 +616,7 @@ apache
 | `run_strategy.py` | Unified CLI for top-down, bottom-up, and full strategy modes across all markets. Parses arguments, dispatches to the appropriate engine, prints results, exports JSON. |
 | `run_market.py` | Single-market runner producing an HTML convergence report. Simplified interface for the common case. Optionally opens result in browser. |
 
-### `src/`
+### `ingest/`
 
 | File | What It Does |
 |------|-------------|
@@ -624,7 +624,7 @@ apache
 | `ingest_cash.py` | Downloads OHLCV data for all markets. Auto-selects yfinance or IBKR based on period. Saves per-market and combined parquet files. |
 | `ingest_options.py` | Downloads options chain data. Per-ticker CSV files with consolidation to parquet. |
 
-### `src/db/`
+### `ingest/db/`
 
 | File | What It Does |
 |------|-------------|
