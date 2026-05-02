@@ -141,14 +141,14 @@ SINGLE_NAMES = {
         "etf_proxy": "DTCR",
         "tickers": [
             "CRWV", "NBIS", "VRT", "ANET", "DLR", "EQIX", "AMT", "CLS", "NVT", "SMCI",
-            "MSFT", "GOOGL", "META", "SNPS", "CDNS",
+            "MSFT", "GOOGL", "META", "SNPS", "CDNS", "DOCN", "APPS"
         ],
     },
     "ai_platform": {
         "name": "AI Platform / Software",
         "etf_proxy": "AIQ",
         "tickers": [
-            "MSFT", "GOOGL", "META", "NOW", "SNOW", "DDOG", "PATH", "TWLO", "PLTR", "APP",
+            "MSFT", "GOOGL", "META", "NOW", "SNOW", "DDOG", "TWLO", "PLTR", "APP",
         ],
     },
     "chips": {
@@ -156,7 +156,7 @@ SINGLE_NAMES = {
         "etf_proxy": "SOXX",
         "tickers": [
             "NVDA", "AMD", "AVGO", "MRVL", "QCOM", "INTC", "MU", "LRCX",
-            "KLAC", "AMAT", "TSM", "ASML", "ARM", "SMCI", "MBLY", "SIMO", "SNDK",
+            "KLAC", "AMAT", "TSM", "ASML", "ARM", "SMCI", "MBLY", "SIMO", "SNDK", "SMTC"
         ],
     },
     "quantum": {
@@ -197,7 +197,8 @@ SINGLE_NAMES = {
         "etf_proxy": "MTUM",
         "tickers": [
             "APP", "CRWD", "PANW", "CEG", "VST", "AXON", "DECK", "ANET", "NOW", "UBER",
-            "ROKU", "TTD", "HOOD", "SOUN", "UPST", "SOFI", "TOST", "GLBE", "GENI", "VRT",
+            "ROKU", "TTD", "HOOD", "SOUN", "UPST", "SOFI", "TOST", "GLBE", "GENI", "VRT","TEAM", "PGY", "AEHR",
+
         ],
     },
     "defense": {
@@ -218,7 +219,7 @@ SINGLE_NAMES = {
     "fintech": {
         "name": "Fintech / Payments",
         "etf_proxy": "FINX",
-        "tickers": ["SOFI", "UPST", "HOOD", "TOST", "PGY", "GLBE", "MELI"],
+        "tickers": ["SOFI", "UPST", "HOOD", "TOST", "PGY", "GLBE", "MELI", "NU"],
     },
     "power_infra": {
         "name": "Power / Energy Infrastructure",
@@ -253,7 +254,7 @@ SINGLE_NAMES = {
     "software": {
         "name": "software",
         "etf_proxy": "IGV",
-        "tickers": ["HUBS", "CRM", "ADBE", "NOW",],
+        "tickers": ["HUBS", "CRM", "ADBE", "NOW", "PATH", 'DUOL', "TTD"],
     },
     "healthcare_core": {
         "name": "Healthcare Core",

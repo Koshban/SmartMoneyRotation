@@ -1,4 +1,4 @@
-# phase2/common/config_refactor.py
+# common/config_refactor.py
 """
 Unified simplified config.
 Built from the original Loose config, with structural simplifications:
@@ -193,6 +193,7 @@ ACTIONPARAMS_V2 = {
         "score_above_entry": 0.06,
         "require_confirmed": True,
         "allowed_regimes": ["leading", "improving"],
+        "max_rsi": 70.0, 
     },
     "max_strong_buy": 15,
     "buy": {

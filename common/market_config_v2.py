@@ -1,4 +1,4 @@
-""" phase2/common/market_config_v2.py"""
+""" common/market_config_v2.py"""
 from __future__ import annotations
 
 from common.universe import (

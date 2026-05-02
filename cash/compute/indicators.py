@@ -75,7 +75,7 @@ def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
 def add_returns(df: pd.DataFrame) -> pd.DataFrame:
     """N-day percentage returns for each window in config."""
     for w in INDICATOR_PARAMS["return_windows"]:
-        df[f"ret_{w}d"] = df["close"].pct_change(w)
+        df[f"ret_{w}d"] = df["close"].pct_change(w, fill_method=None)
     return df
 
 
@@ -326,7 +326,7 @@ def add_amihud(df: pd.DataFrame) -> pd.DataFrame:
         df["dollar_volume"] = df["close"] * df["volume"]
 
     daily_illiq = (
-        df["close"].pct_change().abs()
+        df["close"].pct_change(fill_method=None).abs()
         / df["dollar_volume"].replace(0.0, np.nan)
     )
     df[f"amihud_{w}d"] = daily_illiq.rolling(w).mean() * 1e6

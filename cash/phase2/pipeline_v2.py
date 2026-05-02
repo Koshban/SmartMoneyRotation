@@ -96,6 +96,30 @@ _VOL_REGIME_RISK_MAP: dict[str, float] = {
     "chaotic":  1.00,
 }
 
+# ── Vol favorability label thresholds ────────────────────────────────────
+_VOL_FAV_LABELS = [
+    (0.70, "very favorable"),
+    (0.55, "favorable"),
+    (0.40, "neutral"),
+    (0.25, "unfavorable"),
+    (0.00, "very unfavorable"),
+]
+
+
+def _vol_fav_label(value: float, quartile: int) -> str:
+    """
+    Produce a human-readable vol favorability label combining absolute
+    quality and relative quartile position within the universe.
+
+    quartile: 1=lowest vol (best), 4=highest vol (worst)
+    """
+    abs_label = "very unfavorable"
+    for threshold, label in _VOL_FAV_LABELS:
+        if value >= threshold:
+            abs_label = label
+            break
+    return f"{abs_label} ({value:.2f}) [Q{quartile}]"
+
 
 def _is_missing_value(value) -> bool:
     if value is None:
@@ -286,7 +310,7 @@ def _fill_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if close is None or int(close.notna().sum()) < 20:
         return out
 
-    if "realizedvol20d" not in out.columns:
+    if "realizedvol20d" not in out.columns or out["realizedvol20d"].isna().all():
         log_ret = np.log(close / close.shift(1))
         out["realizedvol20d"] = (
             log_ret.rolling(20, min_periods=15).std() * np.sqrt(252)
@@ -510,6 +534,7 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     bu = ap.get("buy", {})
     ho = ap.get("hold", {})
     se = ap.get("sell", {})
+    oe = ap.get("overextended", {})
     cv = ap.get("conviction", {"high_pct": 0.85, "high_score": 0.75,
                                 "medium_pct": 0.55, "medium_score": 0.60})
 
@@ -532,6 +557,16 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         .fillna("unknown").astype(str).str.lower().str.strip()
     )
 
+    # ── RSI overextension gate (from config) ─────────────────────────
+    rsi_series = pd.to_numeric(
+        out.get("rsi14", pd.Series(50.0, index=out.index)),
+        errors="coerce",
+    ).fillna(50.0)
+
+    sb_max_rsi = sb.get("max_rsi", 75.0)          # from strong_buy config
+    bu_max_rsi = oe.get("max_rsi", 80.0)          # from overextended config
+    # ─────────────────────────────────────────────────────────────────
+
     sb_require_confirmed = sb.get("require_confirmed", True)
     sb_allowed_regimes = set(
         sb.get("allowed_regimes", ["leading", "improving"]),
@@ -552,12 +587,13 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
 
     logger.info(
         "Action thresholds: sell_floor=%.3f sell_pct=%.3f "
-        "sb_pct=%.2f sb_score=%.3f sb_confirmed=%s sb_regimes=%s "
-        "max_sb=%d bu_pct=%.2f bu_score=%.3f ho_pct=%.2f ho_score=%.3f",
+        "sb_pct=%.2f sb_score=%.3f sb_confirmed=%s sb_regimes=%s sb_max_rsi=%.1f "
+        "max_sb=%d bu_pct=%.2f bu_score=%.3f bu_max_rsi=%.1f "
+        "ho_pct=%.2f ho_score=%.3f",
         sell_floor, sell_pct_floor,
         sb_min_pct, sb_min_score,
-        sb_require_confirmed, sb_allowed_regimes, max_strong_buy,
-        bu_min_pct, bu_min_score,
+        sb_require_confirmed, sb_allowed_regimes, sb_max_rsi, max_strong_buy,
+        bu_min_pct, bu_min_score, bu_max_rsi,
         ho_min_pct, ho_min_score,
     )
 
@@ -573,6 +609,7 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         e = float(entry.loc[i])
         confirmed_i = bool(sig_confirmed.loc[i])
         regime_i = str(sect_regime.loc[i])
+        rsi_i = float(rsi_series.loc[i])
 
         if s < sell_floor or pv <= sell_pct_floor:
             action = "SELL"
@@ -582,15 +619,23 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
             and s >= max(sb_min_score, e + sb_above)
             and (not sb_require_confirmed or confirmed_i)
             and (not sb_allowed_regimes or regime_i in sb_allowed_regimes)
+            and rsi_i <= sb_max_rsi
         ):
             action = "STRONG_BUY"
             reason = (
                 f"Top-tier: score={s:.3f} pct={pv:.0%} "
-                f"confirmed={confirmed_i} regime={regime_i}"
+                f"confirmed={confirmed_i} regime={regime_i} rsi={rsi_i:.1f}"
             )
         elif pv >= bu_min_pct and s >= max(bu_min_score, e + bu_above):
-            action = "BUY"
-            reason = "Above buy threshold"
+            if rsi_i > bu_max_rsi:
+                action = "HOLD"
+                reason = (
+                    f"BUY-qualified but RSI={rsi_i:.1f} > {bu_max_rsi:.0f} "
+                    f"— too extended for new entry"
+                )
+            else:
+                action = "BUY"
+                reason = "Above buy threshold"
         elif pv >= ho_min_pct and s >= max(ho_min_score, e - ho_below):
             action = "HOLD"
             reason = "In hold band"
@@ -622,7 +667,7 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
         for idx, _ in sb_items[max_strong_buy:]:
             actions[idx] = "BUY"
             reasons[idx] = "Demoted from STRONG_BUY: cap exceeded"
-            sort_keys[idx] -= 10  # shift from SB tier (40+) to BUY tier (30+)
+            sort_keys[idx] -= 10
             demoted += 1
         logger.info(
             "STRONG_BUY cap applied: %d → %d (demoted %d to BUY)",
@@ -638,25 +683,40 @@ def _generate_actions(df: pd.DataFrame, params=None) -> pd.DataFrame:
     _sb_before_cap = sb_count
     _sb_blocked_confirmed = 0
     _sb_blocked_regime = 0
+    _sb_blocked_rsi = 0
     for i_idx, i_val in enumerate(out.index):
         s = float(score.loc[i_val])
         pv = float(pct.loc[i_val])
         e = float(entry.loc[i_val])
         if pv >= sb_min_pct and s >= max(sb_min_score, e + sb_above):
+            rsi_i = float(rsi_series.loc[i_val])
             if sb_require_confirmed and not bool(sig_confirmed.loc[i_val]):
                 _sb_blocked_confirmed += 1
             elif sb_allowed_regimes and str(sect_regime.loc[i_val]) not in sb_allowed_regimes:
                 _sb_blocked_regime += 1
+            elif rsi_i > sb_max_rsi:
+                _sb_blocked_rsi += 1
     logger.info(
         "STRONG_BUY gate impact: score+pct qualified=%d "
-        "blocked_by_confirmation=%d blocked_by_regime=%d "
+        "blocked_by_confirmation=%d blocked_by_regime=%d blocked_by_rsi=%d "
         "passed_all_gates=%d after_cap=%d",
-        _sb_before_cap + _sb_blocked_confirmed + _sb_blocked_regime,
+        _sb_before_cap + _sb_blocked_confirmed + _sb_blocked_regime + _sb_blocked_rsi,
         _sb_blocked_confirmed,
         _sb_blocked_regime,
+        _sb_blocked_rsi,
         _sb_before_cap,
         sum(1 for a in actions if a == "STRONG_BUY"),
     )
+
+    # Log BUY→HOLD RSI demotions
+    _bu_blocked_rsi = sum(
+        1 for a, r in zip(actions, reasons) if a == "HOLD" and "too extended" in r
+    )
+    if _bu_blocked_rsi > 0:
+        logger.info(
+            "BUY→HOLD RSI demotion: %d names blocked (RSI > %.0f)",
+            _bu_blocked_rsi, bu_max_rsi,
+        )
 
     out["action_v2"] = actions
     out["conviction_v2"] = convictions
@@ -1290,87 +1350,117 @@ def run_pipeline_v2(
             + _lead_w * scored.get("leadership_strength", 0.0)
         ).clip(0, 1)
 
-        # ── Per-ticker volfavorability (vol-rank based differentiation) ───────
-        # Uses realized vol PERCENTILE within the universe to guarantee
-        # differentiation: low-vol stocks → higher favorability, high-vol → lower.
-        if "realizedvol20d" in scored.columns:
-            _rv = pd.to_numeric(scored["realizedvol20d"], errors="coerce")
-            _rv_valid = _rv.dropna()
+        # ══════════════════════════════════════════════════════════════════════
+        # ── Per-ticker volfavorability (rank-based with atr14pct fallback) ───
+        # ══════════════════════════════════════════════════════════════════════
+        # Build the vol proxy: prefer realizedvol20d, fall back to atr14pct
+        # (annualized approximation: atr14pct × sqrt(252) ≈ atr14pct × 15.87)
+        _rv = pd.to_numeric(
+            scored.get("realizedvol20d", pd.Series(dtype=float, index=scored.index)),
+            errors="coerce",
+        )
+        _rv_nan_before = int(_rv.isna().sum())
 
-            if len(_rv_valid) >= 5 and _rv_valid.std() > 1e-6:
-                # Percentile rank: 0.0 = lowest vol, 1.0 = highest vol
-                _rv_pctile = _rv.rank(pct=True, method="average").fillna(0.5)
+        if "atr14pct" in scored.columns:
+            _atr_proxy = pd.to_numeric(scored["atr14pct"], errors="coerce") * 15.87
+            _rv = _rv.fillna(_atr_proxy)
 
-                # Base adjustment: low vol → boost, high vol → penalty
-                # Range: +0.12 (lowest vol) to -0.12 (highest vol)
-                _vol_rank_adj = 0.12 * (1.0 - 2.0 * _rv_pctile)
+        _rv_nan_after = int(_rv.isna().sum())
+        _rv_valid = _rv.dropna()
 
-                # Directional quality bonus: high-vol + strong trend → extra boost
-                # This adds ±0.06 on top for stocks with clear direction
-                _direction_adj = pd.Series(0.0, index=scored.index)
+        logger.info(
+            "Volfavorability vol proxy: realizedvol20d NaN=%d/%d, "
+            "after atr14pct fallback NaN=%d/%d, valid=%d std=%.6f",
+            _rv_nan_before, len(scored),
+            _rv_nan_after, len(scored),
+            len(_rv_valid),
+            float(_rv_valid.std()) if len(_rv_valid) > 1 else 0.0,
+        )
 
-                # Try to get a directional signal
-                _has_direction = False
-                if "scoretrend" in scored.columns:
-                    _st = pd.to_numeric(scored["scoretrend"], errors="coerce")
-                    if _st.notna().sum() > 0 and _st.std() > 0.03:
-                        # scoretrend > 0.6 = good direction, < 0.4 = bad
-                        _dir_signal = ((_st - 0.5) * 2.0).fillna(0.0).clip(-1.0, 1.0)
-                        _has_direction = True
+        if len(_rv_valid) >= 5 and _rv_valid.std() > 1e-6:
+            # Percentile rank: 0.0 = lowest vol (best), 1.0 = highest vol (worst)
+            _rv_pctile = _rv.rank(pct=True, method="average").fillna(0.5)
 
-                if not _has_direction:
-                    # Fallback: RSI deviation from 50 + ADX strength
-                    _rsi = pd.to_numeric(
-                        scored.get("rsi14", pd.Series(50.0, index=scored.index)),
-                        errors="coerce",
-                    ).fillna(50.0)
-                    _adx = pd.to_numeric(
-                        scored.get("adx14", pd.Series(20.0, index=scored.index)),
-                        errors="coerce",
-                    ).fillna(20.0)
+            # ── WIDER SPREAD: ±0.20 from base ────────────────────────────────
+            # Low-vol stocks get up to +0.20, high-vol get up to -0.20
+            _vol_rank_adj = 0.20 * (1.0 - 2.0 * _rv_pctile)
 
-                    # RSI > 55 with ADX > 20 = trending up = positive direction
-                    # RSI < 45 with ADX > 20 = trending down = negative
-                    _rsi_dev = ((_rsi - 50.0) / 25.0).clip(-1.0, 1.0)
-                    _adx_weight = ((_adx - 15.0) / 25.0).clip(0.0, 1.0)
-                    _dir_signal = (_rsi_dev * _adx_weight).clip(-1.0, 1.0)
+            # ── Direction bonus for high-vol stocks: ±0.10 ───────────────────
+            # High-vol + strong trend → partial rescue (+0.10 max)
+            # High-vol + no trend → no rescue
+            _has_direction = False
+            if "scoretrend" in scored.columns:
+                _st = pd.to_numeric(scored["scoretrend"], errors="coerce")
+                if _st.notna().sum() > 0 and _st.std() > 0.03:
+                    _dir_signal = ((_st - 0.5) * 2.0).fillna(0.0).clip(-1.0, 1.0)
+                    _has_direction = True
 
-                # For high-vol stocks: direction matters more
-                # vol_excess = how much above median (0 at median, positive above)
-                _rv_excess = (_rv_pctile - 0.5).clip(0.0, 0.5)  # only above-median vol
-                _direction_adj = 0.12 * _rv_excess * _dir_signal
+            if not _has_direction:
+                # Fallback: RSI deviation from 50 + ADX strength
+                _rsi = pd.to_numeric(
+                    scored.get("rsi14", pd.Series(50.0, index=scored.index)),
+                    errors="coerce",
+                ).fillna(50.0)
+                _adx = pd.to_numeric(
+                    scored.get("adx14", pd.Series(20.0, index=scored.index)),
+                    errors="coerce",
+                ).fillna(20.0)
+                _rsi_dev = ((_rsi - 50.0) / 25.0).clip(-1.0, 1.0)
+                _adx_weight = ((_adx - 15.0) / 25.0).clip(0.0, 1.0)
+                _dir_signal = (_rsi_dev * _adx_weight).clip(-1.0, 1.0)
 
-                _base_vf = vol_info["vol_favorability"]
-                scored["volfavorability"] = (
-                    _base_vf + _vol_rank_adj + _direction_adj
-                ).clip(0.10, 0.95)
+            # Only above-median vol stocks get direction adjustment
+            _rv_excess = (_rv_pctile - 0.5).clip(0.0, 0.5)
+            _direction_adj = 0.20 * _rv_excess * _dir_signal
 
-                logger.info(
-                    "Per-ticker volfavorability (rank-based): base=%.4f "
-                    "vol_rank_adj range=[%.4f, %.4f] "
-                    "direction_adj range=[%.4f, %.4f] "
-                    "final range=[%.4f, %.4f] std=%.4f",
-                    _base_vf,
-                    float(_vol_rank_adj.min()), float(_vol_rank_adj.max()),
-                    float(_direction_adj.min()), float(_direction_adj.max()),
-                    float(scored["volfavorability"].min()),
-                    float(scored["volfavorability"].max()),
-                    float(scored["volfavorability"].std()),
-                )
-            else:
-                scored["volfavorability"] = vol_info["vol_favorability"]
-                logger.warning(
-                    "Per-ticker volfavorability: insufficient vol data "
-                    "(valid=%d std=%.6f) — using uniform base=%.4f",
-                    len(_rv_valid),
-                    float(_rv_valid.std()) if len(_rv_valid) > 1 else 0.0,
-                    vol_info["vol_favorability"],
-                )
+            _base_vf = vol_info["vol_favorability"]
+            scored["volfavorability"] = (
+                _base_vf + _vol_rank_adj + _direction_adj
+            ).clip(0.10, 0.95)
+
+            # ── RELATIVE LABELS (quartile-based) ─────────────────────────────
+            # Quartile assignment: Q1=lowest vol (best), Q4=highest vol (worst)
+            _quartiles = pd.cut(
+                _rv_pctile,
+                bins=[-0.01, 0.25, 0.50, 0.75, 1.01],
+                labels=[1, 2, 3, 4],
+            ).astype(int).fillna(2)
+
+            scored["volfavorability_quartile"] = _quartiles.values
+            scored["volfavorability_label"] = [
+                _vol_fav_label(float(v), int(q))
+                for v, q in zip(scored["volfavorability"], scored["volfavorability_quartile"])
+            ]
+
+            logger.info(
+                "Per-ticker volfavorability (rank+fallback): base=%.4f "
+                "vol_rank_adj range=[%.4f, %.4f] "
+                "direction_adj range=[%.4f, %.4f] "
+                "final range=[%.4f, %.4f] std=%.4f "
+                "quartile distribution: Q1=%d Q2=%d Q3=%d Q4=%d",
+                _base_vf,
+                float(_vol_rank_adj.min()), float(_vol_rank_adj.max()),
+                float(_direction_adj.min()), float(_direction_adj.max()),
+                float(scored["volfavorability"].min()),
+                float(scored["volfavorability"].max()),
+                float(scored["volfavorability"].std()),
+                int((_quartiles == 1).sum()),
+                int((_quartiles == 2).sum()),
+                int((_quartiles == 3).sum()),
+                int((_quartiles == 4).sum()),
+            )
         else:
+            # Degenerate case: not enough data to differentiate
             scored["volfavorability"] = vol_info["vol_favorability"]
+            scored["volfavorability_quartile"] = 2
+            scored["volfavorability_label"] = _vol_fav_label(
+                vol_info["vol_favorability"], 2
+            )
             logger.warning(
-                "Per-ticker volfavorability: realizedvol20d column missing — "
-                "using uniform base=%.4f",
+                "Per-ticker volfavorability: insufficient vol data "
+                "(valid=%d std=%.6f) — using uniform base=%.4f",
+                len(_rv_valid),
+                float(_rv_valid.std()) if len(_rv_valid) > 1 else 0.0,
                 vol_info["vol_favorability"],
             )
 
@@ -1383,6 +1473,28 @@ def run_pipeline_v2(
             float(scored["volfavorability"].std()),
             int(scored["volfavorability"].nunique()),
         )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # ── Modulate scorerisk by per-ticker volfavorability ─────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # Stocks with higher volfavorability → less risk penalty (higher scorerisk)
+        # Stocks with lower volfavorability → more risk penalty (lower scorerisk)
+        # The deviation from base determines the adjustment magnitude.
+        _vf_base = vol_info["vol_favorability"]
+        _vf_deviation = scored["volfavorability"] - _vf_base
+        # Scale: ±0.20 volfav deviation → ±0.10 scorerisk adjustment
+        _scorerisk_adj = _vf_deviation * 0.50
+        _scorerisk_before = scored["scorerisk"].copy()
+        scored["scorerisk"] = (scored["scorerisk"] + _scorerisk_adj).clip(0.0, 1.0)
+
+        logger.info(
+            "scorerisk modulation by volfav: adj range=[%.4f, %.4f] "
+            "scorerisk before=[%.4f, %.4f] after=[%.4f, %.4f]",
+            float(_scorerisk_adj.min()), float(_scorerisk_adj.max()),
+            float(_scorerisk_before.min()), float(_scorerisk_before.max()),
+            float(scored["scorerisk"].min()), float(scored["scorerisk"].max()),
+        )
+        # ══════════════════════════════════════════════════════════════════════
 
         # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────
         enrich_params = {
@@ -1434,7 +1546,7 @@ def run_pipeline_v2(
                 "scoreregime", "scorerotation", "scorepenalty",
                 "scorecomposite_v2",
                 "breadthscore", "volregimescore",
-                "volfavorability",
+                "volfavorability", "volfavorability_label",
                 "rsi14", "adx14", "relativevolume", "rszscore",
             ] if c in scored.columns]
         ].copy()
@@ -1455,7 +1567,7 @@ def run_pipeline_v2(
                         "ticker", "scoretrend", "scoreparticipation",
                         "scorerisk", "scoreregime", "scorerotation",
                         "scorecomposite_v2", "sectrsregime",
-                        "volfavorability",
+                        "volfavorability", "volfavorability_label",
                     ] if c in _border.columns]
                 ].to_string(index=False, float_format="%.4f"),
             )
