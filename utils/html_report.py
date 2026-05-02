@@ -32,6 +32,12 @@ REGIME_STYLES: dict[str, tuple[str, str]] = {
     "unknown":   ("#9e9e9e", "⚪"),
 }
 
+VOLFAV_THRESHOLDS = {
+    "favorable":   0.55,
+    "neutral":     0.35,
+    # below 0.35 → unfavorable
+}
+
 VOLFAV_STYLES: dict[str, tuple[str, str]] = {
     "favorable":    ("#2e7d32", "#e8f5e9"),
     "neutral":      ("#616161", "#f5f5f5"),
@@ -136,13 +142,34 @@ def _badge_regime(reg: str) -> str:
     )
 
 
-def _badge_volfav(val: str) -> str:
-    """Coloured badge for volfavorability column."""
+def _classify_volfav(val) -> tuple[str, float | None]:
+    """Return (label, numeric_value) from either a number or a string."""
+    # Try numeric first
+    try:
+        fv = float(val)
+        if fv >= VOLFAV_THRESHOLDS["favorable"]:
+            return "favorable", fv
+        elif fv >= VOLFAV_THRESHOLDS["neutral"]:
+            return "neutral", fv
+        else:
+            return "unfavorable", fv
+    except (TypeError, ValueError):
+        pass
+    # Fallback: it's already a string label
     v = str(val).lower().strip()
-    c, bg = VOLFAV_STYLES.get(v, ("#616161", "#f5f5f5"))
+    if v in VOLFAV_STYLES:
+        return v, None
+    return "neutral", None
+
+
+def _badge_volfav(val) -> str:
+    """Coloured badge for volfavorability — handles both numeric and string values."""
+    label, numeric = _classify_volfav(val)
+    c, bg = VOLFAV_STYLES.get(label, ("#616161", "#f5f5f5"))
+    display = f"{label} ({numeric:.2f})" if numeric is not None else label
     return (
         f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;'
-        f'font-size:11px;font-weight:500;color:{c};background:{bg}">{_e(v)}</span>'
+        f'font-size:11px;font-weight:500;color:{c};background:{bg}">{_e(display)}</span>'
     )
 
 
@@ -218,12 +245,31 @@ def _find_vol_regime(result: dict) -> str:
     ))
 
 
+def _find_vol_favorability(result: dict) -> float | None:
+    """Retrieve market-level vol favorability from result dict."""
+    raw = _resolve(
+        result,
+        ("vol_info", "vol_favorability"),
+        ("report_v2", "header", "vol_favorability"),
+        ("regime_info", "vol_favorability"),
+        "vol_favorability",
+        default=None,
+    )
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _find_breadth_score(result: dict):
     return _resolve(
         result,
         ("report_v2", "header", "breadth_score"),
         ("breadth_info", "score"),
         ("breadth_info", "breadth_score"),
+        ("breadth_info", "breadthscore"),
         ("regime_info", "breadth_score"),
         "breadth_score",
         default=None,
@@ -236,6 +282,7 @@ def _find_dispersion(result: dict):
         ("report_v2", "header", "dispersion"),
         ("report_v2", "header", "dispersion_20d"),
         ("breadth_info", "dispersion"),
+        ("breadth_info", "dispersion20"),
         ("regime_info", "dispersion"),
         "dispersion",
         "dispersion_20d",
@@ -258,18 +305,27 @@ def _sec_overview(result: dict) -> str:
     vol_regime     = _find_vol_regime(result)
     breadth_score  = _find_breadth_score(result)
     dispersion     = _find_dispersion(result)
+    vol_fav        = _find_vol_favorability(result)
 
     sb = act.get("STRONG_BUY", 0)
     bu = act.get("BUY", 0)
     ho = act.get("HOLD", 0)
     se = act.get("SELL", 0)
 
-    # optional breadth-score / dispersion cards
+    # optional breadth-score / dispersion / vol-fav cards
     extra_cards = ""
     if breadth_score is not None:
         extra_cards += f'<div class="oc"><div class="v">{_ff(breadth_score, 3)}</div><div class="l">Breadth Score</div></div>'
     if dispersion is not None:
         extra_cards += f'<div class="oc"><div class="v">{_ff(dispersion, 4)}</div><div class="l">Dispersion 20d</div></div>'
+    if vol_fav is not None:
+        vf_label, _ = _classify_volfav(vol_fav)
+        vf_c, vf_bg = VOLFAV_STYLES.get(vf_label, ("#616161", "#f5f5f5"))
+        extra_cards += (
+            f'<div class="oc" style="border-left-color:{vf_c}">'
+            f'<div class="v" style="color:{vf_c}">{_ff(vol_fav, 3)}</div>'
+            f'<div class="l">Vol Favorability ({vf_label})</div></div>'
+        )
 
     return f"""
     <div class="sec" id="overview">
@@ -396,38 +452,46 @@ def _names_table(df: pd.DataFrame, tid: str = "") -> str:
     pa  = _col(df, "scoreparticipation")
     wc  = _col(df, "weight", "alloc_weight")
     hw  = wc is not None and not df[wc].isna().all()
+
+    # Only show volfavorability column if it actually varies across rows
+    show_vf = False
+    if vf and not df[vf].isna().all():
+        _vf_vals = pd.to_numeric(df[vf], errors="coerce").dropna()
+        if not _vf_vals.empty:
+            show_vf = (_vf_vals.max() - _vf_vals.min()) > 0.005
+
     mx  = max(0.6, df[sc].max() * 1.05) if sc and not df[sc].isna().all() else 0.9
 
     h = "<tr><th>#</th>"
-    if tc:  h += "<th>Ticker</th>"
-    if sc:  h += "<th>Score</th>"
-    if ac:  h += "<th>Action</th>"
-    if sec: h += "<th>Sector</th>"
-    if rc:  h += "<th>RS Regime</th>"
-    if ri:  h += "<th>RSI</th>"
-    if ad:  h += "<th>ADX</th>"
-    if rv:  h += "<th>RVol</th>"
-    if vf:  h += "<th>Vol Fav</th>"
-    if tr:  h += "<th>Trend</th>"
-    if pa:  h += "<th>Partic.</th>"
-    if hw:  h += "<th>Weight</th>"
+    if tc:      h += "<th>Ticker</th>"
+    if sc:      h += "<th>Score</th>"
+    if ac:      h += "<th>Action</th>"
+    if sec:     h += "<th>Sector</th>"
+    if rc:      h += "<th>RS Regime</th>"
+    if ri:      h += "<th>RSI</th>"
+    if ad:      h += "<th>ADX</th>"
+    if rv:      h += "<th>RVol</th>"
+    if show_vf: h += "<th>Vol Fav</th>"
+    if tr:      h += "<th>Trend</th>"
+    if pa:      h += "<th>Partic.</th>"
+    if hw:      h += "<th>Weight</th>"
     h += "</tr>"
 
     rows = ""
     for i, (_, r) in enumerate(df.iterrows(), 1):
         rows += f'<tr><td class="n">{i}</td>'
-        if tc:  rows += f'<td class="tk">{_e(r.get(tc,"?"))}</td>'
-        if sc:  rows += f"<td>{_bar(float(r.get(sc,0)), mx)}</td>"
-        if ac:  rows += f"<td>{_badge_action(str(r.get(ac,'')))}</td>"
-        if sec: rows += f"<td>{_e(r.get(sec,''))}</td>"
-        if rc:  rows += f"<td>{_badge_regime(str(r.get(rc,'')))}</td>"
-        if ri:  rows += f'<td class="n">{_ff(r.get(ri),1)}</td>'
-        if ad:  rows += f'<td class="n">{_ff(r.get(ad),1)}</td>'
-        if rv:  rows += f'<td class="n">{_ff(r.get(rv),2)}</td>'
-        if vf:  rows += f"<td>{_badge_volfav(str(r.get(vf,'')))}</td>"
-        if tr:  rows += f'<td class="n">{_ff(r.get(tr),3)}</td>'
-        if pa:  rows += f'<td class="n">{_ff(r.get(pa),3)}</td>'
-        if hw:  rows += f'<td class="n">{_fp(r.get(wc),1)}</td>'
+        if tc:      rows += f'<td class="tk">{_e(r.get(tc,"?"))}</td>'
+        if sc:      rows += f"<td>{_bar(float(r.get(sc,0)), mx)}</td>"
+        if ac:      rows += f"<td>{_badge_action(str(r.get(ac,'')))}</td>"
+        if sec:     rows += f"<td>{_e(r.get(sec,''))}</td>"
+        if rc:      rows += f"<td>{_badge_regime(str(r.get(rc,'')))}</td>"
+        if ri:      rows += f'<td class="n">{_ff(r.get(ri),1)}</td>'
+        if ad:      rows += f'<td class="n">{_ff(r.get(ad),1)}</td>'
+        if rv:      rows += f'<td class="n">{_ff(r.get(rv),2)}</td>'
+        if show_vf: rows += f"<td>{_badge_volfav(r.get(vf,''))}</td>"
+        if tr:      rows += f'<td class="n">{_ff(r.get(tr),3)}</td>'
+        if pa:      rows += f'<td class="n">{_ff(r.get(pa),3)}</td>'
+        if hw:      rows += f'<td class="n">{_fp(r.get(wc),1)}</td>'
         rows += "</tr>"
     return f'<table class="dt" id="{tid}"><thead>{h}</thead><tbody>{rows}</tbody></table>'
 

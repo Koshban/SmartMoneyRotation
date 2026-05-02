@@ -5,6 +5,11 @@ Composite scoring for the V2 pipeline.
 
 Revision notes
 --------------
+- **UP-VOLUME RATIO**: `compute_up_volume_ratio` and `enrich_volume_quality`
+  are now housed here. The function accepts an optional `price_frames` kwarg
+  and computes the per-stock accumulation signal before the participation
+  component consumes it. This keeps the feature engineering co-located with
+  its only consumer.
 - **UNIT FIX**: closevsema30pct and closevssma50pct are in PERCENTAGE-POINT
   units (e.g., 5.0 = "5% above the moving average"). Scaling ranges corrected.
 - **Risk differentiation**: adaptive proxies for missing columns.
@@ -94,6 +99,108 @@ def _adaptive_fwd(x: pd.Series, lo: float, hi: float, *, label: str = ""):
     return fixed
 
 
+# ── Up-volume ratio computation ──────────────────────────────────────────
+
+def compute_up_volume_ratio(
+    close: pd.Series,
+    volume: pd.Series,
+    window: int = 20,
+) -> pd.Series:
+    """
+    Fraction of rolling volume that occurred on up-close days.
+
+    Returns a value between 0 and 1 per row:
+      0.70+ = strong accumulation (most volume on green candles)
+      0.50  = neutral
+      0.30- = distribution (most volume on red candles)
+
+    Parameters
+    ----------
+    close : Series
+        Close prices for a single ticker (time-indexed).
+    volume : Series
+        Volume for a single ticker (same index as close).
+    window : int
+        Rolling lookback in trading days.
+    """
+    is_up = (close > close.shift(1)).astype(float)
+    up_vol = (volume * is_up).rolling(window, min_periods=10).sum()
+    total_vol = volume.rolling(window, min_periods=10).sum()
+    return (up_vol / total_vol.replace(0, np.nan)).fillna(0.5)
+
+
+def _enrich_up_volume_ratio(
+    df: pd.DataFrame,
+    price_frames: dict[str, pd.DataFrame] | None,
+    window: int = 20,
+) -> None:
+    """
+    Compute and attach ``up_volume_ratio`` to *df* in-place.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Universe DataFrame with a 'ticker' or 'symbol' column.
+    price_frames : dict or None
+        {ticker: DataFrame} where each DataFrame has 'close' and 'volume'
+        columns with a date index.  If None or empty, falls back to
+        checking whether the column already exists.
+    window : int
+        Rolling lookback for the up-volume calculation.
+    """
+    # If column already has variance, skip recomputation
+    if "up_volume_ratio" in df.columns:
+        existing = df["up_volume_ratio"].fillna(0.5)
+        if float(existing.std()) > 1e-8:
+            logger.info(
+                "_enrich_up_volume_ratio: column already present with "
+                "std=%.4f — skipping recomputation",
+                float(existing.std()),
+            )
+            return
+
+    # Identify ticker column
+    ticker_col = None
+    for col in ("ticker", "symbol"):
+        if col in df.columns:
+            ticker_col = col
+            break
+
+    if ticker_col is None or price_frames is None or len(price_frames) == 0:
+        if "up_volume_ratio" not in df.columns:
+            df["up_volume_ratio"] = 0.5
+            logger.warning(
+                "_enrich_up_volume_ratio: no price_frames provided — "
+                "defaulting up_volume_ratio=0.5 (no differentiation)"
+            )
+        return
+
+    # Compute from price history per ticker
+    ratios: dict[str, float] = {}
+    for ticker, pf in price_frames.items():
+        if pf is None or pf.empty:
+            ratios[ticker] = 0.5
+            continue
+        if "close" not in pf.columns or "volume" not in pf.columns:
+            ratios[ticker] = 0.5
+            continue
+
+        uvr = compute_up_volume_ratio(pf["close"], pf["volume"], window=window)
+        latest = uvr.iloc[-1] if len(uvr) > 0 else 0.5
+        ratios[ticker] = float(latest) if not np.isnan(latest) else 0.5
+
+    df["up_volume_ratio"] = df[ticker_col].map(ratios).fillna(0.5)
+
+    uvr_series = df["up_volume_ratio"]
+    logger.info(
+        "_enrich_up_volume_ratio: computed from price_frames (%d tickers)  "
+        "min=%.3f med=%.3f max=%.3f std=%.4f",
+        len(ratios),
+        uvr_series.min(), uvr_series.median(),
+        uvr_series.max(), float(uvr_series.std()),
+    )
+
+
 # ── Main scoring function ────────────────────────────────────────────────
 
 def compute_composite_v2(
@@ -103,6 +210,7 @@ def compute_composite_v2(
     *,
     market_breadth_score: float | None = None,
     market_vol_regime_score: float | None = None,
+    price_frames: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """
     Compute the V2 composite score for every row (stock) in *df*.
@@ -122,10 +230,23 @@ def compute_composite_v2(
     market_vol_regime_score : float, optional
         Market-wide volatility-regime score (0–1, higher = more volatile).
         If None, falls back to the per-row ``volregimescore`` column.
+    price_frames : dict, optional
+        {ticker: DataFrame} with 'close' and 'volume' columns.  Used to
+        compute ``up_volume_ratio`` (per-stock accumulation signal) for the
+        participation component.  If None, the function checks whether the
+        column already exists on *df*; if not, defaults to 0.5 (neutral).
     """
     p = params if params is not None else SCORINGPARAMS_V2
     w = weights if weights is not None else SCORINGWEIGHTS_V2
     out = df.copy()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  PRE-SCORING FEATURE ENRICHMENT
+    # ══════════════════════════════════════════════════════════════════════
+    #  Compute derived features that sub-components need but that don't
+    #  arrive pre-computed from upstream.  Currently: up_volume_ratio.
+
+    _enrich_up_volume_ratio(out, price_frames, window=20)
 
     # ══════════════════════════════════════════════════════════════════════
     #  TREND COMPONENT
@@ -197,8 +318,8 @@ def compute_composite_v2(
     # dvol, producing the 0.297-cluster seen in diagnostics.
     #
     # Fix: detect dead components, redistribute their weight proportionally
-    # to the live components (rvol, dvol), and use _adaptive_fwd for the
-    # live components so rank-based fallback is available if needed.
+    # to the live components (rvol, dvol, upvol), and use _adaptive_fwd for
+    # the live components so rank-based fallback is available if needed.
 
     rvol_raw = out.get(
         "relativevolume", pd.Series(1, index=out.index),
@@ -212,6 +333,11 @@ def compute_composite_v2(
     ).fillna(0)
     dvol_raw = pd.Series(np.log1p(dvol_raw_input), index=out.index)
 
+    # ── Up-volume ratio (per-stock accumulation signal) ───────────────
+    # Already computed in the pre-scoring enrichment step above.
+    upvol_raw, upvol_ok = _col_or_default(out, "up_volume_ratio", 0.5)
+    upvol_has_variance = upvol_ok and float(upvol_raw.std()) > 1e-8
+
     # Check if OBV and ADL have meaningful variance
     obv_has_variance = obv_col_ok and float(obv_raw.std()) > 1e-8
     adl_has_variance = adl_col_ok and float(adl_raw.std()) > 1e-8
@@ -221,6 +347,7 @@ def compute_composite_v2(
     w_obv = p["participation"]["w_obv"]
     w_adl = p["participation"]["w_adline"]
     w_dvol = p["participation"]["w_dollar_volume"]
+    w_upvol = p["participation"].get("w_up_volume", 0.25)
 
     # Redistribute dead weights to live components
     dead_weight = 0.0
@@ -238,26 +365,37 @@ def compute_composite_v2(
         dead_weight += w_adl
         w_adl = 0.0
 
+    if upvol_has_variance:
+        _part_sources.append("up_volume_ratio")
+    else:
+        dead_weight += w_upvol
+        w_upvol = 0.0
+
     _part_sources.extend(["relativevolume", "dollarvolume20d"])
 
     if dead_weight > 0:
-        live_total = w_rvol + w_dvol
+        live_total = w_rvol + w_dvol + w_upvol
         if live_total > 0:
-            w_rvol += dead_weight * (w_rvol / live_total)
-            w_dvol += dead_weight * (w_dvol / live_total)
+            ratio_rvol = w_rvol / live_total
+            ratio_dvol = w_dvol / live_total
+            ratio_upvol = w_upvol / live_total
+            w_rvol += dead_weight * ratio_rvol
+            w_dvol += dead_weight * ratio_dvol
+            w_upvol += dead_weight * ratio_upvol
         else:
-            # Edge case: all components dead — split evenly
-            w_rvol = 0.5
-            w_dvol = 0.5
+            w_rvol = 0.34
+            w_dvol = 0.33
+            w_upvol = 0.33
         logger.info(
             "scoreparticipation: redistributed %.3f dead weight "
-            "(obv_ok=%s adl_ok=%s) → w_rvol=%.3f w_obv=%.3f "
-            "w_adl=%.3f w_dvol=%.3f",
+            "(obv_ok=%s adl_ok=%s upvol_ok=%s) → w_rvol=%.3f w_obv=%.3f "
+            "w_adl=%.3f w_dvol=%.3f w_upvol=%.3f",
             dead_weight, obv_has_variance, adl_has_variance,
-            w_rvol, w_obv, w_adl, w_dvol,
+            upvol_has_variance,
+            w_rvol, w_obv, w_adl, w_dvol, w_upvol,
         )
 
-    # Scale live components (adaptive for rvol/dvol, fixed for obv/adl)
+    # Scale live components
     rvol = _adaptive_fwd(rvol_raw, 0.8, 2.2, label="rvol")
     dvol = _adaptive_fwd(dvol_raw, 10, 18, label="dvol")
     obv = (
@@ -270,23 +408,31 @@ def compute_composite_v2(
         if adl_has_variance
         else pd.Series(0.0, index=out.index)
     )
+    # Up-volume ratio: 0.35 (distribution) → 0, 0.70 (strong accumulation) → 1
+    upvol = (
+        _adaptive_fwd(upvol_raw, 0.35, 0.70, label="up_volume_ratio")
+        if upvol_has_variance
+        else pd.Series(0.0, index=out.index)
+    )
 
     out["scoreparticipation"] = (
         w_rvol * rvol
         + w_obv * obv
         + w_adl * adl
         + w_dvol * dvol
+        + w_upvol * upvol
     ).clip(0, 1)
 
     # Participation diagnostics
     _sp = out["scoreparticipation"]
     logger.info(
         "scoreparticipation: sources=%s  min=%.4f med=%.4f max=%.4f "
-        "std=%.4f uniq=%d  weights=[rvol=%.3f obv=%.3f adl=%.3f dvol=%.3f]",
+        "std=%.4f uniq=%d  weights=[rvol=%.3f obv=%.3f adl=%.3f "
+        "dvol=%.3f upvol=%.3f]",
         _part_sources,
         _sp.min(), _sp.median(), _sp.max(),
         float(_sp.std()), int(_sp.nunique()),
-        w_rvol, w_obv, w_adl, w_dvol,
+        w_rvol, w_obv, w_adl, w_dvol, w_upvol,
     )
 
     # ══════════════════════════════════════════════════════════════════════

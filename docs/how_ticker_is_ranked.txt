@@ -2,7 +2,7 @@
 ## The Composite Score: Five Pillars (scoring.py)
 
 The `score_composite` that drives everything is a weighted average of five pillar scores, each on a [0, 1] scale. The pillar weights come from `SCORING_WEIGHTS` in your 
-config (I don't have the actual numbers, but the structure is explicit). When breadth data is unavailable, the four remaining pillar weights are renormalized to sum to 1.0.
+config . When breadth data is unavailable, the four remaining pillar weights are renormalized to sum to 1.0.
 
 **Pillar 1 — Rotation** (`score_rotation`): "Is smart money rotating in?" Built from four sub-components, each with its own sub-weight from config: the RS z-score 
 (sigmoid-mapped, so z=+2 → 0.88), the RS regime label (leading=1.0, improving=0.75, weakening=0.25, lagging=0.0), RS momentum (acceleration of the rotation, sigmoid-scaled), 

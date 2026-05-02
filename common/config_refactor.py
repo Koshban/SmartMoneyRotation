@@ -62,11 +62,12 @@ SCORINGPARAMS_V2 = {
         "w_trend_confirm": 0.15,
     },
     "participation": {
-        "w_rvol": 0.35,
-        "w_obv": 0.30,
-        "w_adline": 0.20,
-        "w_dollar_volume": 0.15,
-    },
+    "w_rvol": 0.25,          # was ~0.35
+    "w_obv": 0.15,           # usually dead → redistributed
+    "w_adline": 0.10,        # usually dead → redistributed
+    "w_dollar_volume": 0.25, # was ~0.30
+    "w_up_volume": 0.25,     # NEW — accumulation quality
+        },
     "risk": {
         "w_vol_penalty": 0.35,
         "w_liquidity_penalty": 0.25,

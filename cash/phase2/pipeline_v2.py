@@ -87,7 +87,7 @@ OPTIONAL_SCORE_COLUMNS_V2 = (
     "dispersion",
 )
 
-# ── Vol regime: string label → numeric risk score (0=calm … 1=chaotic) ──  # ← NEW
+# ── Vol regime: string label → numeric risk score (0=calm … 1=chaotic) ──
 _VOL_REGIME_RISK_MAP: dict[str, float] = {
     "calm":     0.10,
     "moderate": 0.35,
@@ -106,7 +106,7 @@ def _is_missing_value(value) -> bool:
         return False
 
 
-def _safe_float_or_none(val) -> float | None:                               # ← NEW helper
+def _safe_float_or_none(val) -> float | None:
     """Convert to float; return None on failure or NaN."""
     if val is None:
         return None
@@ -118,40 +118,40 @@ def _safe_float_or_none(val) -> float | None:                               # �
 
 
 def _classify_breadth_regime(breadth_df: pd.DataFrame | None) -> dict:
-    """Extract breadth context from the last row of the breadth DataFrame."""  # ← FIXED: enriched
+    """Extract breadth context from the last row of the breadth DataFrame."""
     if breadth_df is None or breadth_df.empty:
         return {
             "breadth_regime": "unknown",
             "breadthscore": None,
             "dispersion20": None,
             "dispersion": None,
-            "above_sma50_pct": None,                                         # ← NEW
-            "above_sma200_pct": None,                                        # ← NEW
-            "advancing_pct": None,                                           # ← NEW
-            "net_highs_pct": None,                                           # ← NEW
+            "above_sma50_pct": None,
+            "above_sma200_pct": None,
+            "advancing_pct": None,
+            "net_highs_pct": None,
         }
     row = breadth_df.iloc[-1]
     regime = row.get("breadthregime", row.get("breadth_regime", "unknown"))
     score = row.get("breadthscore", row.get("breadth_score", None))
     disp20 = row.get("dispersion20", None)
     disp = row.get("dispersion_daily", row.get("dispersion", None))
-    above_sma50 = row.get("above_sma50_pct", row.get("pct_above_sma50",     # ← NEW
+    above_sma50 = row.get("above_sma50_pct", row.get("pct_above_sma50",
                   row.get("above_sma50", None)))
-    above_sma200 = row.get("above_sma200_pct", row.get("pct_above_sma200",  # ← NEW
+    above_sma200 = row.get("above_sma200_pct", row.get("pct_above_sma200",
                    row.get("above_sma200", None)))
-    advancing = row.get("advancing_pct", row.get("pct_advancing",            # ← NEW
+    advancing = row.get("advancing_pct", row.get("pct_advancing",
                 row.get("advancing", None)))
-    net_highs = row.get("net_highs_pct", row.get("net_new_highs_pct",       # ← NEW
+    net_highs = row.get("net_highs_pct", row.get("net_new_highs_pct",
                 row.get("net_highs", None)))
     return {
         "breadth_regime": regime,
         "breadthscore": score,
         "dispersion20": disp20,
         "dispersion": disp,
-        "above_sma50_pct": _safe_float_or_none(above_sma50),                # ← NEW
-        "above_sma200_pct": _safe_float_or_none(above_sma200),              # ← NEW
-        "advancing_pct": _safe_float_or_none(advancing),                     # ← NEW
-        "net_highs_pct": _safe_float_or_none(net_highs),                     # ← NEW
+        "above_sma50_pct": _safe_float_or_none(above_sma50),
+        "above_sma200_pct": _safe_float_or_none(above_sma200),
+        "advancing_pct": _safe_float_or_none(advancing),
+        "net_highs_pct": _safe_float_or_none(net_highs),
     }
 
 
@@ -925,7 +925,7 @@ def run_pipeline_v2(
 
     logger.info(
         "Breadth context (source=%s): regime=%s score=%s dispersion20=%s "
-        "above_sma50=%s above_sma200=%s advancing=%s net_highs=%s",           # ← FIXED: richer log
+        "above_sma50=%s above_sma200=%s advancing=%s net_highs=%s",
         breadth_source,
         breadth_info.get("breadth_regime", "unknown"),
         breadth_info.get("breadthscore"),
@@ -966,6 +966,24 @@ def run_pipeline_v2(
     sector_summary = rotation_result["sector_summary"]
     etf_ranking    = rotation_result.get("etf_ranking", pd.DataFrame())
 
+    # ── FIX: Clean up etf_ranking NaN composites for display ─────────────────
+    _etf_has_composite = (
+        not etf_ranking.empty
+        and "etf_composite" in etf_ranking.columns
+        and etf_ranking["etf_composite"].notna().any()
+    )
+    if not etf_ranking.empty and "etf_composite" in etf_ranking.columns:
+        if etf_ranking["etf_composite"].isna().all():
+            logger.warning(
+                "etf_ranking: all etf_composite values are NaN — "
+                "no sector ETF data available for market=%s. "
+                "Filling with 0.0 for display; ETF boost disabled.",
+                market,
+            )
+            etf_ranking = etf_ranking.copy()
+            etf_ranking["etf_composite"] = 0.0
+    # ── END etf_ranking fix ──────────────────────────────────────────────────
+
     # ── D2b. THEMATIC ROTATION ────────────────────────────────────────────────
     _thematic_etf_map = config.get("thematic_etf_map", {})
     thematic_rotation_result = _compute_thematic_rotation(etf_ranking, _thematic_etf_map)
@@ -993,11 +1011,7 @@ def run_pipeline_v2(
     )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ── FIXED: derive vol regime score from label if raw score is 0.0 ────── # ← NEW
-    # classify_volatility_regime may produce volregimescore=0.0 as a valid
-    # value for "calm", but this looks like "missing" in reports and collapses
-    # the vol dimension.  Derive a small positive score from the label so
-    # that the scoring formula and display both work meaningfully.
+    # ── FIXED: derive vol regime score from label if raw score is 0.0 ──────
     # ══════════════════════════════════════════════════════════════════════════
     _vol_regime_label = str(last_vol.get("volregime", "unknown")).lower().strip()
 
@@ -1143,7 +1157,7 @@ def run_pipeline_v2(
         )
         latest = ensure_columns(latest)
 
-        # ── FIXED: re-stamp breadth context after ensure_columns ──────────  # ← NEW
+        # ── FIXED: re-stamp breadth context after ensure_columns ──────────
         # ensure_columns may add dispersion20/dispersion as NaN defaults,
         # overwriting the values we stamped in the per-symbol loop.
         _bi_d20 = breadth_info.get("dispersion20")
@@ -1217,7 +1231,7 @@ def run_pipeline_v2(
         except (TypeError, ValueError):
             _market_vol_score = None
 
-    # ── FIXED: derive vol score from label when raw score is 0.0 or None ──  # ← NEW
+    # ── FIXED: derive vol score from label when raw score is 0.0 or None ──
     if _market_vol_score is None or _market_vol_score == 0.0:
         _derived = _VOL_REGIME_RISK_MAP.get(_vol_regime_label)
         if _derived is not None:
@@ -1234,7 +1248,7 @@ def run_pipeline_v2(
             )
     # ── END vol score fix ─────────────────────────────────────────────────
 
-    # ── Build vol_info dict for report rendering ──────────────────────────  # ← NEW
+    # ── Build vol_info dict for report rendering ──────────────────────────
     _rv20d = last_vol.get("realizedvol20d", last_vol.get("realized_vol_20d"))
     _rv20d_f = _safe_float_or_none(_rv20d)
     vol_info = {
@@ -1253,6 +1267,7 @@ def run_pipeline_v2(
     )
     # ══════════════════════════════════════════════════════════════════════════
 
+    # ── SCORING ───────────────────────────────────────────────────────────────
     scored = (
         compute_composite_v2(
             latest,
@@ -1260,11 +1275,13 @@ def run_pipeline_v2(
             params=scoring_params,
             market_breadth_score=_market_breadth_score,
             market_vol_regime_score=_market_vol_score,
+            price_frames=tradable_enriched,
         )
         if not latest.empty
         else pd.DataFrame()
     )
     logger.info("Scored rows=%d", len(scored))
+
     if not scored.empty:
         _ap = action_params if action_params is not None else ACTIONPARAMS_V2
         _lead_w = _ap.get("leadership_boost_weight", 0.10)
@@ -1273,7 +1290,100 @@ def run_pipeline_v2(
             + _lead_w * scored.get("leadership_strength", 0.0)
         ).clip(0, 1)
 
-        # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────
+        # ── Per-ticker volfavorability (vol-rank based differentiation) ───────
+        # Uses realized vol PERCENTILE within the universe to guarantee
+        # differentiation: low-vol stocks → higher favorability, high-vol → lower.
+        if "realizedvol20d" in scored.columns:
+            _rv = pd.to_numeric(scored["realizedvol20d"], errors="coerce")
+            _rv_valid = _rv.dropna()
+
+            if len(_rv_valid) >= 5 and _rv_valid.std() > 1e-6:
+                # Percentile rank: 0.0 = lowest vol, 1.0 = highest vol
+                _rv_pctile = _rv.rank(pct=True, method="average").fillna(0.5)
+
+                # Base adjustment: low vol → boost, high vol → penalty
+                # Range: +0.12 (lowest vol) to -0.12 (highest vol)
+                _vol_rank_adj = 0.12 * (1.0 - 2.0 * _rv_pctile)
+
+                # Directional quality bonus: high-vol + strong trend → extra boost
+                # This adds ±0.06 on top for stocks with clear direction
+                _direction_adj = pd.Series(0.0, index=scored.index)
+
+                # Try to get a directional signal
+                _has_direction = False
+                if "scoretrend" in scored.columns:
+                    _st = pd.to_numeric(scored["scoretrend"], errors="coerce")
+                    if _st.notna().sum() > 0 and _st.std() > 0.03:
+                        # scoretrend > 0.6 = good direction, < 0.4 = bad
+                        _dir_signal = ((_st - 0.5) * 2.0).fillna(0.0).clip(-1.0, 1.0)
+                        _has_direction = True
+
+                if not _has_direction:
+                    # Fallback: RSI deviation from 50 + ADX strength
+                    _rsi = pd.to_numeric(
+                        scored.get("rsi14", pd.Series(50.0, index=scored.index)),
+                        errors="coerce",
+                    ).fillna(50.0)
+                    _adx = pd.to_numeric(
+                        scored.get("adx14", pd.Series(20.0, index=scored.index)),
+                        errors="coerce",
+                    ).fillna(20.0)
+
+                    # RSI > 55 with ADX > 20 = trending up = positive direction
+                    # RSI < 45 with ADX > 20 = trending down = negative
+                    _rsi_dev = ((_rsi - 50.0) / 25.0).clip(-1.0, 1.0)
+                    _adx_weight = ((_adx - 15.0) / 25.0).clip(0.0, 1.0)
+                    _dir_signal = (_rsi_dev * _adx_weight).clip(-1.0, 1.0)
+
+                # For high-vol stocks: direction matters more
+                # vol_excess = how much above median (0 at median, positive above)
+                _rv_excess = (_rv_pctile - 0.5).clip(0.0, 0.5)  # only above-median vol
+                _direction_adj = 0.12 * _rv_excess * _dir_signal
+
+                _base_vf = vol_info["vol_favorability"]
+                scored["volfavorability"] = (
+                    _base_vf + _vol_rank_adj + _direction_adj
+                ).clip(0.10, 0.95)
+
+                logger.info(
+                    "Per-ticker volfavorability (rank-based): base=%.4f "
+                    "vol_rank_adj range=[%.4f, %.4f] "
+                    "direction_adj range=[%.4f, %.4f] "
+                    "final range=[%.4f, %.4f] std=%.4f",
+                    _base_vf,
+                    float(_vol_rank_adj.min()), float(_vol_rank_adj.max()),
+                    float(_direction_adj.min()), float(_direction_adj.max()),
+                    float(scored["volfavorability"].min()),
+                    float(scored["volfavorability"].max()),
+                    float(scored["volfavorability"].std()),
+                )
+            else:
+                scored["volfavorability"] = vol_info["vol_favorability"]
+                logger.warning(
+                    "Per-ticker volfavorability: insufficient vol data "
+                    "(valid=%d std=%.6f) — using uniform base=%.4f",
+                    len(_rv_valid),
+                    float(_rv_valid.std()) if len(_rv_valid) > 1 else 0.0,
+                    vol_info["vol_favorability"],
+                )
+        else:
+            scored["volfavorability"] = vol_info["vol_favorability"]
+            logger.warning(
+                "Per-ticker volfavorability: realizedvol20d column missing — "
+                "using uniform base=%.4f",
+                vol_info["vol_favorability"],
+            )
+
+        logger.info(
+            "Per-ticker volfavorability summary: min=%.4f median=%.4f max=%.4f "
+            "std=%.4f nunique=%d",
+            float(scored["volfavorability"].min()),
+            float(scored["volfavorability"].median()),
+            float(scored["volfavorability"].max()),
+            float(scored["volfavorability"].std()),
+            int(scored["volfavorability"].nunique()),
+        )
+
         # ── D3. ENRICH SCORED TABLE WITH ROTATION ────────────────────────────
         enrich_params = {
             "regime_scores": {
@@ -1283,7 +1393,7 @@ def run_pipeline_v2(
                 "lagging":    0.00,
                 "unknown":    0.15,
             },
-            "apply_etf_boost": not etf_ranking.empty,   # ← CHANGED: was True
+            "apply_etf_boost": _etf_has_composite,
             "recompute_composite": True,
             "composite_weights": {
                 "scoretrend":         0.30,
@@ -1293,7 +1403,29 @@ def run_pipeline_v2(
                 "scorerotation":      0.20,
             },
         }
-        # ── TEMPORARY DIAGNOSTIC: score component audit for STRONG_BUY candidates ──
+
+        scored = enrich_with_rotation(
+            scored_df=scored,
+            rotation_result=rotation_result,
+            params=enrich_params,
+        )
+
+        _sp = signal_params if signal_params is not None else SIGNALPARAMS_V2
+        _diag_entry = _sp.get("base_entry_threshold", 0.55)
+        logger.info(
+            "Score diagnostics: min=%.4f median=%.4f max=%.4f >=entry(%.2f)=%d >=0.50=%d",
+            float(scored["scorecomposite_v2"].min()),
+            float(scored["scorecomposite_v2"].median()),
+            float(scored["scorecomposite_v2"].max()),
+            _diag_entry,
+            int((scored["scorecomposite_v2"] >= _diag_entry).sum()),
+            int((scored["scorecomposite_v2"] >= 0.50).sum()),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            cols = [c for c in ["ticker", "scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorerotation", "scorepenalty", "scorecomposite_v2", "rsi14", "adx14", "relativevolume", "sectrsregime"] if c in scored.columns]
+            logger.debug("Top scored names:\n%s", scored.sort_values("scorecomposite_v2", ascending=False)[cols].head(30).to_string(index=False))
+
+    # ── DIAGNOSTIC: score component audit for top candidates ─────────────────
     if not scored.empty and logger.isEnabledFor(logging.INFO):
         _diag = scored.nlargest(30, "scorecomposite_v2")[
             [c for c in [
@@ -1302,7 +1434,7 @@ def run_pipeline_v2(
                 "scoreregime", "scorerotation", "scorepenalty",
                 "scorecomposite_v2",
                 "breadthscore", "volregimescore",
-                "volfavorability",                                            # ← NEW
+                "volfavorability",
                 "rsi14", "adx14", "relativevolume", "rszscore",
             ] if c in scored.columns]
         ].copy()
@@ -1323,29 +1455,11 @@ def run_pipeline_v2(
                         "ticker", "scoretrend", "scoreparticipation",
                         "scorerisk", "scoreregime", "scorerotation",
                         "scorecomposite_v2", "sectrsregime",
+                        "volfavorability",
                     ] if c in _border.columns]
                 ].to_string(index=False, float_format="%.4f"),
             )
-    # ── END DIAGNOSTIC ──
-        scored = enrich_with_rotation(
-            scored_df=scored,
-            rotation_result=rotation_result,
-            params=enrich_params,
-        )
-        _sp = signal_params if signal_params is not None else SIGNALPARAMS_V2
-        _diag_entry = _sp.get("base_entry_threshold", 0.55)
-        logger.info(
-            "Score diagnostics: min=%.4f median=%.4f max=%.4f >=entry(%.2f)=%d >=0.50=%d",
-            float(scored["scorecomposite_v2"].min()),
-            float(scored["scorecomposite_v2"].median()),
-            float(scored["scorecomposite_v2"].max()),
-            _diag_entry,
-            int((scored["scorecomposite_v2"] >= _diag_entry).sum()),
-            int((scored["scorecomposite_v2"] >= 0.50).sum()),
-        )
-        if logger.isEnabledFor(logging.DEBUG):
-            cols = [c for c in ["ticker", "scoretrend", "scoreparticipation", "scorerisk", "scoreregime", "scorerotation", "scorepenalty", "scorecomposite_v2", "rsi14", "adx14", "relativevolume", "sectrsregime"] if c in scored.columns]
-            logger.debug("Top scored names:\n%s", scored.sort_values("scorecomposite_v2", ascending=False)[cols].head(30).to_string(index=False))
+    # ── END DIAGNOSTIC ───────────────────────────────────────────────────────
 
     signaled = apply_signals_v2(scored, params=signal_params) if not scored.empty else pd.DataFrame()
     logger.info("Signals rows=%d", len(signaled))
@@ -1440,11 +1554,11 @@ def run_pipeline_v2(
         "regime_df": regime_df,
         "breadth_info": breadth_info,
         "breadth_df": breadth_computed_df,
-        "vol_info": vol_info,                                                # ← NEW
+        "vol_info": vol_info,
         "sector_summary": sector_summary,
         "sector_regimes": sector_regimes,
         "etf_ranking": etf_ranking,
-        "thematic_summary": thematic_summary,          # ← ADD
-        "thematic_regimes": thematic_regimes,          # ← ADD
+        "thematic_summary": thematic_summary,
+        "thematic_regimes": thematic_regimes,
         "leadership_snapshot": leadership_snapshot,
     }
