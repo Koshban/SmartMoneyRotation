@@ -82,8 +82,8 @@ Usage:
 python scripts/run_bounce_scan.py --market US --csv
 
 Usage:
-    python ingestdb/schema.py create          # Create all tables
-    python ingestdb/schema.py drop --yes      # Drop all tables (confirm required)
-    python ingestdb/schema.py recreate --yes  # Drop + Create
-    python ingestdb/schema.py status          # Show which tables exist
-    python ingestdb/schema.py drop-options --yes  # Drop only options tables
+    python ingest/db/schema.py create          # Create all tables
+    python ingest/db/schema.py drop --yes      # Drop all tables (confirm required)
+    python ingest/db/schema.py recreate --yes  # Drop + Create
+    python ingest/db/schema.py status          # Show which tables exist
+    python ingest/db/schema.py drop-options --yes  # Drop only options tables

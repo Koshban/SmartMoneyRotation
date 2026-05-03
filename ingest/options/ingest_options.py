@@ -107,7 +107,7 @@ def _process_symbol(
 # ---------------------------------------------------------------------------
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Ingest options chains into DB.")
-    p.add_argument("--market", required=True, choices=["US", "HK", "IN"])
+    p.add_argument("--market", required=True, choices=["us", "hk", "in"])
     p.add_argument(
         "--provider",
         default=None,

@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Schema mirror — must stay in sync with ingest/db/schema.py::_options_ddl
 # ---------------------------------------------------------------------------
-SUPPORTED_MARKETS = {"US", "HK", "IN"}
+SUPPORTED_MARKETS = {"us", "hk", "in"}
 
 # Canonical column order written to {market}_options.
 # Excludes: id (serial), created_at / updated_at (DB defaults).
@@ -134,13 +134,15 @@ def _coerce_df(df: pd.DataFrame) -> pd.DataFrame:
         df["dte"] = [(ee - dd).days for dd, ee in zip(d, e)]
 
     # Coerce integer-ish columns: pandas can't insert NaN into INTEGER columns,
-    # so replace NaN with None for psycopg2.
+    # and Series.where(..., None) silently re-coerces None back to NaN on
+    # float dtypes — so check NaN explicitly inside the lambda.
     for c in ("volume", "oi", "dte"):
-        df[c] = df[c].where(pd.notna(df[c]), None)
-        df[c] = df[c].apply(lambda v: int(v) if v is not None else None)
+        df[c] = df[c].apply(
+            lambda v: int(v) if v is not None and pd.notna(v) else None
+        )
 
     # Replace any remaining NaN with None for safe psycopg2 binding
-    df = df.where(pd.notna(df), None)
+    df = df.astype(object).where(pd.notna(df), None)
 
     return df[OPTIONS_COLS]
 
