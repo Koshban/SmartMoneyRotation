@@ -69,6 +69,25 @@ NATURAL_KEY = ("date", "symbol", "expiry", "strike", "opt_type")
 # updated_at is bumped explicitly in the SQL.
 _UPDATE_COLS = [c for c in OPTIONS_COLS if c not in NATURAL_KEY]
 
+UNDERLYING_DAILY_COLS = [
+    "date", "symbol",
+    # OHLCV
+    "open", "high", "low", "close", "volume",
+    # Trend
+    "sma_20", "sma_50", "sma_100", "sma_200",
+    "ema_20", "rsi_14", "adx_14", "macd", "macd_signal",
+    # Volatility
+    "atr_14", "atr_20", "rv_20", "rv_60", "rv_252",
+    # S/R
+    "support_20", "resistance_20", "support_60", "resistance_60",
+    # Cash signal — left NULL by yfinance pipeline; populated by cash system
+    "cash_signal", "cash_score", "fair_buy_zone_lo", "fair_buy_zone_hi",
+    # Events — left NULL; populated by calendar pipeline
+    "earnings_in_next_n_days", "exdiv_in_next_n_days",
+    # Quality
+    "quality_rank",
+]
+
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -189,3 +208,47 @@ def upsert_options(
         return len(df)
     finally:
         conn.close()
+
+
+def upsert_underlying_daily(df: pd.DataFrame, market: str, dry_run: bool = False, page_size: int = 500) -> int:
+    if df is None or df.empty:
+        return 0
+    table = f"{market.lower()}_underlying_daily"
+
+    # Add missing columns as NULL so partial pipelines (yfinance-only)
+    # don't blow up on the column count.
+    df = df.copy()
+    for col in UNDERLYING_DAILY_COLS:
+        if col not in df.columns:
+            df[col] = None
+    df = df.where(pd.notna(df), None)
+
+    rows = [tuple(r[c] for c in UNDERLYING_DAILY_COLS) for _, r in df.iterrows()]
+    cols_sql = ", ".join(UNDERLYING_DAILY_COLS)
+
+    # Only update columns this pipeline owns. Don't clobber cash_signal / events / quality
+    # written by other pipelines just because yfinance ran second.
+    update_cols = [
+        "open", "high", "low", "close", "volume",
+        "sma_20", "sma_50", "sma_100", "sma_200",
+        "ema_20", "rsi_14", "adx_14", "macd", "macd_signal",
+        "atr_14", "atr_20", "rv_20", "rv_60", "rv_252",
+        "support_20", "resistance_20", "support_60", "resistance_60",
+    ]
+    update_sql = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+
+    sql = f"""
+        INSERT INTO {table} ({cols_sql}) VALUES %s
+        ON CONFLICT (date, symbol) DO UPDATE SET
+            {update_sql}
+    """
+
+    if dry_run:
+        log.info(f"[dry-run] would upsert {len(rows)} rows into {table}")
+        return len(rows)
+
+    with _get_conn() as conn, conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=page_size)
+        conn.commit()
+    log.info(f"upserted {len(rows)} rows into {table}")
+    return len(rows)

@@ -198,7 +198,7 @@ SINGLE_NAMES = {
         "tickers": [
             "APP", "CRWD", "PANW", "CEG", "VST", "AXON", "DECK", "ANET", "NOW", "UBER",
             "ROKU", "TTD", "HOOD", "SOUN", "UPST", "SOFI", "TOST", "GLBE", "GENI", "VRT","TEAM", "PGY", "AEHR",
-
+            "APPN", "APPD", "FIVN"
         ],
     },
     "defense": {
@@ -389,17 +389,17 @@ def get_full_universe() -> list[str]:
 
 
 def get_universe_for_market(market: str) -> list[str]:
-    if market == 'US':
+    if market in ('US','us'):
         # Full universe: ETFs + US single names (matches MARKET_CONFIG)
         us_singles = [s for s in get_all_single_names()
                       if not s.endswith(".HK") and not s.endswith(".NS") and not s.endswith(".BO")]
         return sorted(set(list(ETF_UNIVERSE) + us_singles))
-    elif market == 'HK':
+    elif market in ('hk','HK'):
         return list(HK_UNIVERSE)
-    elif market == 'IN':
+    elif market in ('IN', 'in'):
         return list(INDIA_UNIVERSE)
     else:
-        raise ValueError(f"Unknown market: {market!r}  (expected 'US', 'HK', or 'IN')")
+        raise ValueError(f"Unknown market: {market!r}  (expected 'us/US', 'hk/HK', or 'in/IN')")
 
 
 def print_universe():
