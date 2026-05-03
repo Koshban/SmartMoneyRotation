@@ -1,0 +1,41 @@
+┌─────────────┐     ┌─────────────┐
+│  yfinance   │     │    IBKR     │
+└──────┬──────┘     └──────┬──────┘
+       │                   │
+       ▼                   ▼
+┌──────────────────────────────────┐
+│  ingest/ scripts (Python)        │
+│  - fetch chain                   │
+│  - compute BS greeks if needed   │
+│  - UPSERT into raw tables        │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│  Postgres — RAW tables           │
+│  {region}_cash                   │
+│  {region}_options                │
+│  events_calendar                 │
+└──────────────┬───────────────────┘
+               │
+               ▼  (nightly feature build)
+┌──────────────────────────────────┐
+│  Postgres — DERIVED tables       │
+│  {region}_underlying_daily       │
+│  {region}_iv_history             │
+│  {region}_option_factors         │
+└──────────────┬───────────────────┘
+               │
+               ▼  (signal engine reads)
+┌──────────────────────────────────┐
+│  Postgres — OUTPUT tables        │
+│  signal_candidates               │
+│  signals (legacy summary)        │
+└──────────────┬───────────────────┘
+               │
+               ▼  (trading actions)
+┌──────────────────────────────────┐
+│  Postgres — STATE tables         │
+│  positions                       │
+│  position_legs                   │
+└──────────────────────────────────┘
