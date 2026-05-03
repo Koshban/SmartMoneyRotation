@@ -7,6 +7,7 @@ pandas==2.2.3
 pyarrow==23.0.1
 python-dotenv==1.2.2
 rich
+scipy==1.17.1
 sqlalchemy==2.0.36
 ta==0.11.0
 yfinance==1.3.0
