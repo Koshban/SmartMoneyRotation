@@ -226,7 +226,7 @@ The engine will print the date range and ticker coverage on startup.
 ## CLI Reference
 
 ```
-python -m backtest.phase2.run_backtest [OPTIONS]
+python -m cash.backtest.phase2.run_backtest [OPTIONS]
 ```
 
 ### Required Arguments
@@ -276,28 +276,28 @@ python -m backtest.phase2.run_backtest [OPTIONS]
 
 ```bash
 # Hong Kong — full defaults
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
 
 # United States
-python -m backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20
 
 # India (data starts later typically)
-python -m backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20
 ```
 
 ### With Risk Overrides
 
 ```bash
 # Tight stops, forced exit after 60 days
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 \
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 \
     --trailing-stop 0.15 --max-hold 60
 
 # Wide stops for volatile market, minimum hold to prevent whipsaws
-python -m backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20 \
+python -m cash.backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20 \
     --trailing-stop 0.25 --min-hold 10
 
 # Only override max hold (use config default for stop)
-python -m backtest.phase2.run_backtest --market US --start 2021-01-01 --end 2026-04-20 \
+python -m cash.backtest.phase2.run_backtest --market US --start 2021-01-01 --end 2026-04-20 \
     --max-hold 120
 ```
 
@@ -305,11 +305,11 @@ python -m backtest.phase2.run_backtest --market US --start 2021-01-01 --end 2026
 
 ```bash
 # Concentrated: fewer positions, more capital per position
-python -m backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20 \
+python -m cash.backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20 \
     --max-positions 8 --capital 2000000
 
 # Diversified: many positions, smaller capital
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 \
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 \
     --max-positions 40 --capital 500000
 ```
 
@@ -326,7 +326,7 @@ Use `--fresh` when:
 - You want reproducible comparison between two runs
 
 ```bash
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --fresh
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --fresh
 ```
 
 ⚠️ First run after `--fresh` will be significantly slower (computing all indicators from scratch). Subsequent runs without `--fresh` use the cache.
@@ -337,7 +337,7 @@ The `--lookback` parameter controls how many historical bars are available befor
 
 ```bash
 # More warmup for strategies using 200-day SMAs or long RS windows
-python -m backtest.phase2.run_backtest --market US --start 2020-01-01 --end 2026-04-20 \
+python -m cash.backtest.phase2.run_backtest --market US --start 2020-01-01 --end 2026-04-20 \
     --lookback 500
 ```
 
@@ -347,7 +347,7 @@ If your parquet data doesn't have enough history before `--start`, the engine wi
 
 ```bash
 # See all raw signals without capping (diagnostic only — don't use for real results)
-python -m backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2024-03-31 \
+python -m cash.backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2024-03-31 \
     --no-cap --debug
 
 # This reveals:
@@ -363,7 +363,7 @@ python -m backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2024
 ### Running a Comparison
 
 ```bash
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --compare
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --compare
 ```
 
 This runs **Baseline** (from `build_config()`) and **Variant** (from `build_config_b()`) on identical data, then prints a side-by-side comparison table with a winner column.
@@ -450,7 +450,7 @@ def build_config_b(args):
 python ingest/ingest_cash.py --market HK --period 2y
 
 # 2. Run with defaults
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
 
 # 3. Evaluate:
 #    ✅ Positive alpha?
@@ -467,21 +467,21 @@ python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026
 # Trailing stop sweep
 for stop in 0.10 0.12 0.15 0.18 0.20 0.22 0.25; do
     echo "=== Stop: $stop ==="
-    python -m backtest.phase2.run_backtest --market HK \
+    python -m cash.backtest.phase2.run_backtest --market HK \
         --start 2022-01-01 --end 2026-04-20 --trailing-stop $stop
 done
 
 # Position count sweep
 for pos in 5 10 15 20 25 30 40; do
     echo "=== Positions: $pos ==="
-    python -m backtest.phase2.run_backtest --market HK \
+    python -m cash.backtest.phase2.run_backtest --market HK \
         --start 2022-01-01 --end 2026-04-20 --max-positions $pos
 done
 
 # Capital sweep (same positions — tests sizing effects)
 for cap in 200000 500000 1000000 2000000 5000000; do
     echo "=== Capital: $cap ==="
-    python -m backtest.phase2.run_backtest --market HK \
+    python -m cash.backtest.phase2.run_backtest --market HK \
         --start 2022-01-01 --end 2026-04-20 --capital $cap
 done
 ```
@@ -490,22 +490,22 @@ done
 
 ```bash
 # Bull market (US 2023 rally)
-python -m backtest.phase2.run_backtest --market US --start 2023-01-01 --end 2024-06-30
+python -m cash.backtest.phase2.run_backtest --market US --start 2023-01-01 --end 2024-06-30
 
 # Bear market (2022 drawdown)
-python -m backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2022-12-31
+python -m cash.backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2022-12-31
 
 # High volatility (HK 2022 China crackdown)
-python -m backtest.phase2.run_backtest --market HK --start 2022-03-01 --end 2022-12-31
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-03-01 --end 2022-12-31
 
 # Recovery (HK 2023)
-python -m backtest.phase2.run_backtest --market HK --start 2023-01-01 --end 2023-12-31
+python -m cash.backtest.phase2.run_backtest --market HK --start 2023-01-01 --end 2023-12-31
 
 # COVID crash + recovery
-python -m backtest.phase2.run_backtest --market US --start 2020-01-01 --end 2020-12-31
+python -m cash.backtest.phase2.run_backtest --market US --start 2020-01-01 --end 2020-12-31
 
 # Interest rate hiking cycle
-python -m backtest.phase2.run_backtest --market US --start 2022-03-01 --end 2023-07-31
+python -m cash.backtest.phase2.run_backtest --market US --start 2022-03-01 --end 2023-07-31
 ```
 
 ### Workflow 4: Cross-Market Consistency
@@ -514,9 +514,9 @@ python -m backtest.phase2.run_backtest --market US --start 2022-03-01 --end 2023
 # Same parameters across all markets — does the strategy generalise?
 PARAMS="--trailing-stop 0.18 --max-positions 20 --capital 1000000"
 
-python -m backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20 $PARAMS
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 $PARAMS
-python -m backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20 $PARAMS
+python -m cash.backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20 $PARAMS
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 $PARAMS
+python -m cash.backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20 $PARAMS
 
 # Compare: does Sharpe hold across markets? Is drawdown consistent?
 # If US Sharpe=1.5 but HK Sharpe=0.3, the strategy is market-specific.
@@ -526,7 +526,7 @@ python -m backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026
 
 ```bash
 # Step 1: Remove all caps, enable debug
-python -m backtest.phase2.run_backtest --market HK \
+python -m cash.backtest.phase2.run_backtest --market HK \
     --start 2024-01-01 --end 2024-03-31 --no-cap --debug
 
 # Step 2: Look at output for:
@@ -546,7 +546,7 @@ python -m backtest.phase2.run_backtest --market HK \
 
 ```bash
 # Run a very short period with full debug to see exactly what happened
-python -m backtest.phase2.run_backtest --market HK \
+python -m cash.backtest.phase2.run_backtest --market HK \
     --start 2024-03-15 --end 2024-03-20 --debug --fresh
 
 # The log file will contain per-ticker scores, signals, and actions for those days
@@ -839,7 +839,7 @@ WARNING  trailing stops triggered for 25 positions (market-wide drawdown?)
 | Slow (> 10 min) | First run on large universe | Normal — building cache. Use `--fresh` only when needed |
 | Memory error | OOM crash | Reduce universe size or `--lookback` |
 | Cache corruption | Inconsistent results | Delete `.cache/backtest/` and run with `--fresh` |
-| Import error | Module not found | Check you're running from repo root: `python -m backtest.phase2.run_backtest` |
+| Import error | Module not found | Check you're running from repo root: `python -m cash.backtest.phase2.run_backtest` |
 
 ### Cache Management
 
@@ -851,7 +851,7 @@ du -sh .cache/backtest/
 rm -rf .cache/backtest/
 
 # Or use --fresh flag (equivalent but doesn't delete files)
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --fresh
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --fresh
 ```
 
 ⚠️ **Important**: `.cache/` is in `.gitignore`. Never commit cache files to git (they can be 500MB+). If you accidentally did, see the repo's git history cleanup docs.
@@ -884,7 +884,7 @@ python -m backtest.runner --start 2010-01-01 --end 2026-04-16
 | Config | `common/config.py` | `phase2/common/config_refactor.py` |
 | Signal generation | `strategy/signals.py` | `phase2/strategy/signals_v2.py` |
 | Convergence | `strategy/convergence.py` | `phase2/strategy/` (partially broken) |
-| CLI | `backtest.runner` | `backtest.phase2.run_backtest` |
+| CLI | `backtest.runner` | `cash.backtest.phase2.run_backtest` |
 | A/B testing | `--compare` (fixed variants) | `--compare` (editable `build_config_b`) |
 | Signal capping | No | Yes (buy ranking + caps) |
 | Cache support | No | Yes (`.cache/backtest/`) |
@@ -922,24 +922,24 @@ The benchmark is used for:
 # ─── DAILY ─────────────────────────────────────────────────────
 # Refresh data + quick backtest validation
 python ingest/ingest_cash.py --market all --period 5d
-python -m backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2026-04-20
 
 # ─── WEEKLY ────────────────────────────────────────────────────
 # Full data refresh + comprehensive backtest
 python ingest/ingest_cash.py --market all --period 2y
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
-python -m backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20
-python -m backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market US --start 2022-01-01 --end 2026-04-20
+python -m cash.backtest.phase2.run_backtest --market IN --start 2023-01-01 --end 2026-04-20
 
 # ─── RESEARCH ──────────────────────────────────────────────────
 # A/B test a hypothesis
 # 1. Edit build_config_b() in run_backtest.py
 # 2. Run:
-python -m backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --compare
+python -m cash.backtest.phase2.run_backtest --market HK --start 2022-01-01 --end 2026-04-20 --compare
 
 # ─── DEBUGGING ─────────────────────────────────────────────────
 # Something looks wrong
-python -m backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2024-03-31 \
+python -m cash.backtest.phase2.run_backtest --market HK --start 2024-01-01 --end 2024-03-31 \
     --debug --fresh --no-cap
 # Then check: logs/backtest/backtest_HK_*.log
 

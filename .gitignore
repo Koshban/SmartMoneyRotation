@@ -11,5 +11,6 @@ __pycache__/
 **/*.log
 **/*.parquet
 **/result*json
-.cache/backtest/indicators*
+.cache/backtest/*
+.cache/*/*
 

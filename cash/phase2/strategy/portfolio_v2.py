@@ -4,16 +4,19 @@ phase2/strategy/portfolio_v2.py
 Portfolio construction for the v2 pipeline.
 
 PURPOSE: Generate a CLEAN, LIMITED set of actionable signals.
-    - STRONG_BUY: top 15 names by blended rank (the best of the best)
-    - BUY: next 5-10 names (good but not top tier)
+    - STRONG_BUY: names that passed ALL pipeline gates (confirmation,
+      RS regime, RSI ceiling) — ranked by blended score
+    - BUY: names that passed score/percentile gates but not all
+      STRONG_BUY qualifications — ranked by blended score
     - Everything else: not signalled
 
 Design philosophy:
+    - RESPECTS the action engine's tier assignments (RSI gates, regime gates)
+    - Ranking is used for ORDERING within tiers, not for re-labeling
     - No parameter stuffing to beautify backtests
     - Equal-weight positions (operator decides sizing in real life)
     - Signal QUALITY over quantity
     - Breadth/vol regime scaling kept only as a leading indicator
-      (it reflects CURRENT market health, not hindsight)
 
 Output
 ------
@@ -45,15 +48,7 @@ DEFAULT_MAX_SINGLE_WEIGHT = 0.08  # ~equal weight for 12-25 names
 DEFAULT_MIN_WEIGHT = 0.02
 
 # ── Rotation-aware sector cap multipliers ─────────────────────────────────────
-# ROTATION_CAP_MULT: dict[str, float] = {
-#     "leading":   1.00,
-#     "improving": 1.00,
-#     "weakening": 0.80,
-#     "lagging":   0.55,
-#     "unknown":   0.85,
-# }
-
-# ── Set all rotation caps to 1.0 (no penalizing lagging sectors) ──────────────
+# Set all rotation caps to 1.0 (no penalizing lagging sectors)
 ROTATION_CAP_MULT: dict[str, float] = {
     "leading":   1.00,
     "improving": 1.00,
@@ -63,21 +58,7 @@ ROTATION_CAP_MULT: dict[str, float] = {
 }
 
 # ── Exposure scaling by market regime ─────────────────────────────────────────
-# These ARE leading indicators: breadth divergence precedes crashes by weeks.
-# When fewer stocks participate in a rally, it signals fragility BEFORE the drop.
-# We keep this simple — not trying to time perfectly, just reducing exposure
-# when the market's internal health is deteriorating.
-# BREADTH_EXPOSURE: dict[str, float] = {
-#     "strong": 1.00, "healthy": 1.00, "moderate": 0.95,
-#     "neutral": 0.90, "mixed": 0.85, "narrow": 0.75,
-#     "weak": 0.60, "critical": 0.40, "unknown": 0.90,
-# }
-# VOL_EXPOSURE: dict[str, float] = {
-#     "calm": 1.00, "low": 1.00, "normal": 1.00, "moderate": 0.95,
-#     "elevated": 0.85, "stressed": 0.70, "chaotic": 0.50,
-#     "unknown": 0.95,
-# }
-# ── Set all exposure to 1.0 (no scaling) ─────────────────────────────────────
+# Set all exposure to 1.0 (no scaling)
 BREADTH_EXPOSURE: dict[str, float] = {
     "strong": 1.00, "healthy": 1.00, "moderate": 1.00,
     "neutral": 1.00, "mixed": 1.00, "narrow": 1.00,
@@ -142,13 +123,14 @@ def build_portfolio_v2(
     """
     Build a concentrated target portfolio from the actioned universe.
 
-    The CORE job: produce at most `max_buy_signals` clean signals per day,
-    with the top `strong_buy_limit` labelled STRONG_BUY and the rest as BUY.
+    IMPORTANT: This module RESPECTS the action_v2 labels assigned by the
+    pipeline's action engine. It does NOT re-derive STRONG_BUY/BUY based
+    on ranking. The ranking is used solely for ORDERING within each tier.
 
     Parameters
     ----------
     action_table : DataFrame
-        Output of the action generator.
+        Output of the action generator (must have 'action_v2' column).
     max_positions : int
         Maximum number of names in the final portfolio.
     max_sector_weight : float
@@ -160,7 +142,7 @@ def build_portfolio_v2(
     min_weight : float
         Minimum weight for inclusion.
     strong_buy_limit : int
-        Maximum names that receive STRONG_BUY (top tier only).
+        Maximum names that receive STRONG_BUY (cap from pipeline).
     max_buy_signals : int
         Total buy signals emitted (STRONG_BUY + BUY combined).
 
@@ -200,12 +182,29 @@ def build_portfolio_v2(
         )
         return _empty_portfolio(breadth_regime, vol_regime)
 
+    # Track original action labels from pipeline
+    candidates["_pipeline_action"] = candidates["action_v2"].copy()
+
+    n_sb_from_pipeline = int((candidates["_pipeline_action"] == "STRONG_BUY").sum())
+    n_buy_from_pipeline = int((candidates["_pipeline_action"] == "BUY").sum())
+
     logger.info(
         "Portfolio candidates (raw): %d STRONG_BUY + BUY out of %d total",
         len(candidates), len(action_table),
     )
+    logger.info(
+        "Pipeline action breakdown: %d STRONG_BUY + %d BUY (preserving these labels)",
+        n_sb_from_pipeline, n_buy_from_pipeline,
+    )
 
-    # ── 2. RANK + FILTER candidates ──────────────────────────────────────────
+    # ── 2. RANK candidates for ORDERING (not re-labeling) ─────────────────────
+    #
+    # The ranking determines the ORDER in which names are considered for
+    # portfolio inclusion. It does NOT change their action tier.
+    #
+    # Key change: we use soft filters here (no hard beta/vol gate that
+    # would exclude quality defensive names the action engine approved).
+    #
     score_col = (
         "scoreadjusted_v2"
         if "scoreadjusted_v2" in candidates.columns
@@ -213,10 +212,11 @@ def build_portfolio_v2(
     )
 
     ranking_params = {
-        "tilt": 0.50,
-        "vol_pref": 0.30,
-        "min_vol": 0.25,
-        "min_rs": -0.5,
+        "tilt": 0.40,           # reduced from 0.50 — less momentum chase
+        "vol_pref": 0.20,       # reduced from 0.30 — less beta preference
+        "min_vol": 0.0,         # NO hard vol filter (was 0.25, excluded defensives)
+        "min_rs": -2.0,         # very loose (was -0.5, excluded legitimate names)
+        "min_beta": 0.0,        # NO hard beta filter (was 1.3, the main culprit)
         "vol_col": "realizedvol20d",
         "rs_col": "rszscore",
         "score_col": score_col,
@@ -230,40 +230,73 @@ def build_portfolio_v2(
         )
         return _empty_portfolio(breadth_regime, vol_regime)
 
-    # ── 3. HARD CAP: limit total signals ──────────────────────────────────────
+    # ── 3. SORT by action tier FIRST, then by rank WITHIN each tier ───────────
     #
-    # This is the MOST IMPORTANT step for real trading signal quality.
-    # After ranking, we only keep the top `max_buy_signals` names.
-    # Top `strong_buy_limit` get STRONG_BUY, the rest get BUY.
+    # This ensures:
+    #   - STRONG_BUY names (which passed RSI, confirmation, regime gates)
+    #     are ALWAYS considered before BUY names
+    #   - Within each tier, the ranking determines priority
+    #   - No BUY name can displace a STRONG_BUY name regardless of beta
     #
-    candidates = candidates.reset_index(drop=True)
+    candidates["_action_priority"] = candidates["_pipeline_action"].map(
+        {"STRONG_BUY": 2, "BUY": 1}
+    ).fillna(0).astype(int)
 
+    # The ranking module should have added a 'blended_rank' or sort column.
+    # If rank_and_filter_candidates sorted the df, use that order as tie-break.
+    # We add a position-based rank to preserve the ranking module's ordering.
+    candidates["_rank_order"] = range(len(candidates))
+
+    candidates = candidates.sort_values(
+        ["_action_priority", "_rank_order"],
+        ascending=[False, True],  # STRONG_BUY first, then lowest rank_order first
+    ).reset_index(drop=True)
+
+    # ── 4. Apply signal caps (preserve pipeline labels) ───────────────────────
+    #
+    # Cap STRONG_BUY count to strong_buy_limit (from config).
+    # Cap total signals to max_buy_signals.
+    # But do NOT promote BUY→STRONG_BUY or demote STRONG_BUY→BUY.
+    # If there are more STRONG_BUYs than the cap, keep only the top-ranked ones
+    # as STRONG_BUY and demote the rest to BUY.
+    #
+    sb_mask = candidates["_pipeline_action"] == "STRONG_BUY"
+    sb_candidates = candidates.loc[sb_mask]
+    buy_candidates = candidates.loc[~sb_mask]
+
+    if len(sb_candidates) > strong_buy_limit:
+        # Keep top strong_buy_limit as STRONG_BUY, demote the rest to BUY
+        sb_keep = sb_candidates.iloc[:strong_buy_limit].index
+        sb_demote = sb_candidates.iloc[strong_buy_limit:].index
+        candidates.loc[sb_demote, "action_v2"] = "BUY"
+        logger.info(
+            "STRONG_BUY cap applied in portfolio: %d → %d (demoted %d to BUY)",
+            len(sb_candidates), strong_buy_limit, len(sb_demote),
+        )
+    else:
+        # All STRONG_BUYs from pipeline are preserved
+        logger.info(
+            "STRONG_BUY from pipeline: %d (within cap=%d, all preserved)",
+            len(sb_candidates), strong_buy_limit,
+        )
+
+    # Cap total signals
     if len(candidates) > max_buy_signals:
         logger.info(
-            "Portfolio: capping signals from %d → %d (STRONG_BUY=%d, BUY=%d)",
+            "Portfolio: capping total signals from %d → %d",
             len(candidates), max_buy_signals,
-            strong_buy_limit, max_buy_signals - strong_buy_limit,
         )
         candidates = candidates.iloc[:max_buy_signals].copy()
 
-    # Reassign action tiers based on RANK (not original pipeline action)
-    # Top N = STRONG_BUY, rest = BUY
-    new_actions = []
-    for i in range(len(candidates)):
-        if i < strong_buy_limit:
-            new_actions.append("STRONG_BUY")
-        else:
-            new_actions.append("BUY")
-    candidates["action_v2"] = new_actions
-
+    # Log final signal breakdown AFTER caps
+    final_sb = int((candidates["action_v2"] == "STRONG_BUY").sum())
+    final_buy = int((candidates["action_v2"] == "BUY").sum())
     logger.info(
         "Portfolio signals after cap: %d STRONG_BUY + %d BUY = %d total",
-        sum(1 for a in new_actions if a == "STRONG_BUY"),
-        sum(1 for a in new_actions if a == "BUY"),
-        len(new_actions),
+        final_sb, final_buy, len(candidates),
     )
 
-    # ── 4. greedy selection with sector/theme constraints ─────────────────────
+    # ── 5. greedy selection with sector/theme constraints ─────────────────────
     selected_indices: list[int] = []
     sector_weight_used: dict[str, float] = {}
     theme_count: dict[str, int] = {}
@@ -319,15 +352,12 @@ def build_portfolio_v2(
 
     selected = candidates.loc[selected_indices].copy()
 
-    # ── 5. EQUAL WEIGHT allocation ───────────────────────────────────────────
+    # ── 6. EQUAL WEIGHT allocation ───────────────────────────────────────────
     # Simple 1/N weighting. In real life, the operator decides sizing.
     n_selected = len(selected)
     base_weight = 1.0 / n_selected
 
-    # ── 6. apply exposure scaling (leading indicator) ─────────────────────────
-    # Breadth + vol regime reflects CURRENT market health.
-    # When breadth narrows (fewer stocks participating), it's a LEADING
-    # signal of trouble — this happens BEFORE the crash, not after.
+    # ── 7. apply exposure scaling (leading indicator) ─────────────────────────
     gross_target = _target_exposure(breadth_regime, vol_regime)
 
     final_weights = pd.Series(
@@ -348,7 +378,7 @@ def build_portfolio_v2(
     selected["portfolio_weight"] = final_weights.values
     selected["portfolio_weight_pct"] = (final_weights.values * 100).round(2)
 
-    # ── 7. enrich with selection metadata ─────────────────────────────────────
+    # ── 8. enrich with selection metadata ─────────────────────────────────────
     selected["selection_rank"] = range(1, len(selected) + 1)
 
     selected["effective_sector_cap"] = selected.apply(
@@ -367,23 +397,28 @@ def build_portfolio_v2(
             f"sect={r.get('sector', 'Unknown')}({r.get('sectrsregime', 'unknown')})",
             f"w={r.get('portfolio_weight_pct', 0):.1f}%",
         ]
+        rsi_val = _safe_float(r.get("rsi14"), -1)
+        if rsi_val > 0:
+            parts.append(f"rsi={rsi_val:.1f}")
         return " | ".join(parts)
 
     selected["selection_reason"] = selected.apply(_reason, axis=1)
 
     # Clean up internal columns
     selected = selected.drop(
-        columns=["_tier", "_sort_score"], errors="ignore"
+        columns=["_tier", "_sort_score", "_action_priority",
+                 "_rank_order", "_pipeline_action"],
+        errors="ignore",
     )
     selected = selected.reset_index(drop=True)
 
-    # ── 8. build sector tilt summary ──────────────────────────────────────────
+    # ── 9. build sector tilt summary ──────────────────────────────────────────
     sector_tilt = _build_sector_tilt(selected, max_sector_weight)
 
-    # ── 9. build rotation exposure summary ────────────────────────────────────
+    # ── 10. build rotation exposure summary ───────────────────────────────────
     rotation_exposure = _build_rotation_exposure(selected)
 
-    # ── 10. meta ──────────────────────────────────────────────────────────────
+    # ── 11. meta ──────────────────────────────────────────────────────────────
     meta = {
         "selected_count": len(selected),
         "candidate_count": len(candidates),
@@ -409,7 +444,7 @@ def build_portfolio_v2(
         "rotation_exposure": rotation_exposure,
     }
 
-    # ── 11. logging ───────────────────────────────────────────────────────────
+    # ── 12. logging ───────────────────────────────────────────────────────────
     logger.info(
         "Portfolio built: %d names (%d STRONG_BUY + %d BUY)  "
         "exposure=%.1f%%  cash=%.1f%%  breadth=%s  vol=%s",
@@ -421,6 +456,24 @@ def build_portfolio_v2(
         breadth_regime,
         vol_regime,
     )
+
+    # Log which STRONG_BUY names made it in (for verification)
+    sb_in_portfolio = selected.loc[
+        selected["action_v2"] == "STRONG_BUY", "ticker"
+    ].tolist()
+    buy_in_portfolio = selected.loc[
+        selected["action_v2"] == "BUY", "ticker"
+    ].tolist()
+    if sb_in_portfolio:
+        logger.info(
+            "STRONG_BUY in portfolio (%d): %s",
+            len(sb_in_portfolio), sb_in_portfolio,
+        )
+    if buy_in_portfolio:
+        logger.info(
+            "BUY in portfolio (%d): %s",
+            len(buy_in_portfolio), buy_in_portfolio,
+        )
 
     if sector_tilt:
         logger.info("Sector tilt:")
@@ -448,7 +501,7 @@ def build_portfolio_v2(
     if logger.isEnabledFor(logging.DEBUG):
         preview_cols = [c for c in [
             "selection_rank", "ticker", "action_v2", "portfolio_weight_pct",
-            score_col, "sector", "sectrsregime",
+            score_col, "sector", "sectrsregime", "rsi14",
             "effective_sector_cap", "theme",
             "selection_reason",
         ] if c in selected.columns]
