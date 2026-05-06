@@ -69,26 +69,6 @@ NATURAL_KEY = ("date", "symbol", "expiry", "strike", "opt_type")
 # updated_at is bumped explicitly in the SQL.
 _UPDATE_COLS = [c for c in OPTIONS_COLS if c not in NATURAL_KEY]
 
-UNDERLYING_DAILY_COLS = [
-    "date", "symbol",
-    # OHLCV
-    "open", "high", "low", "close", "volume",
-    # Trend
-    "sma_20", "sma_50", "sma_100", "sma_200",
-    "ema_20", "rsi_14", "adx_14", "macd", "macd_signal",
-    # Volatility
-    "atr_14", "atr_20", "rv_20", "rv_60", "rv_252",
-    # S/R
-    "support_20", "resistance_20", "support_60", "resistance_60",
-    # Cash signal — left NULL by yfinance pipeline; populated by cash system
-    "cash_signal", "cash_score", "fair_buy_zone_lo", "fair_buy_zone_hi",
-    # Events — left NULL; populated by calendar pipeline
-    "earnings_in_next_n_days", "exdiv_in_next_n_days",
-    # Quality
-    "quality_rank",
-]
-
-
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
@@ -210,6 +190,25 @@ def upsert_options(
         conn.close()
 
 
+UNDERLYING_DAILY_COLS = [
+    "date", "symbol",
+    # OHLCV
+    "open", "high", "low", "close", "volume",
+    # Trend
+    "sma_20", "sma_50", "sma_100", "sma_200",
+    "ema_20", "rsi_14", "adx_14", "macd", "macd_signal",
+    # Volatility
+    "atr_14", "atr_20", "rv_20", "rv_60", "rv_252",
+    # S/R
+    "support_20", "resistance_20", "support_60", "resistance_60",
+    # Cash signal — left NULL by yfinance pipeline; populated by cash system
+    "cash_signal", "cash_score", "fair_buy_zone_lo", "fair_buy_zone_hi",
+    # Events — left NULL; populated by calendar pipeline
+    "earnings_in_next_n_days", "exdiv_in_next_n_days",
+    # Quality
+    "quality_rank",
+]
+
 def upsert_underlying_daily(df: pd.DataFrame, market: str, dry_run: bool = False, page_size: int = 500) -> int:
     if df is None or df.empty:
         return 0
@@ -240,6 +239,53 @@ def upsert_underlying_daily(df: pd.DataFrame, market: str, dry_run: bool = False
     sql = f"""
         INSERT INTO {table} ({cols_sql}) VALUES %s
         ON CONFLICT (date, symbol) DO UPDATE SET
+            {update_sql}
+    """
+
+    if dry_run:
+        log.info(f"[dry-run] would upsert {len(rows)} rows into {table}")
+        return len(rows)
+
+    with _get_conn() as conn, conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=page_size)
+        conn.commit()
+    log.info(f"upserted {len(rows)} rows into {table}")
+    return len(rows)
+
+
+IV_HISTORY_COLS = [
+    "date", "symbol", "tenor_bucket", "dte",
+    "atm_iv", "atm_iv_call", "atm_iv_put",
+    "skew_25d",
+    "term_slope_m1_m2",
+]
+
+def upsert_iv_history(df: pd.DataFrame, market: str,
+                      dry_run: bool = False, page_size: int = 500) -> int:
+    """Upsert into {market}_iv_history."""
+    if df is None or df.empty:
+        return 0
+    table = f"{market.lower()}_iv_history"
+
+    df = df.copy()
+    for col in IV_HISTORY_COLS:
+        if col not in df.columns:
+            df[col] = None
+    df = df.where(pd.notna(df), None)
+
+    rows = [tuple(r[c] for c in IV_HISTORY_COLS) for _, r in df.iterrows()]
+    cols_sql = ", ".join(IV_HISTORY_COLS)
+
+    update_cols = [
+        "dte",
+        "atm_iv", "atm_iv_call", "atm_iv_put",
+        "skew_25d", "term_slope_m1_m2",
+    ]
+    update_sql = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+
+    sql = f"""
+        INSERT INTO {table} ({cols_sql}) VALUES %s
+        ON CONFLICT (date, symbol, tenor_bucket) DO UPDATE SET
             {update_sql}
     """
 

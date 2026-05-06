@@ -262,30 +262,28 @@ def _iv_history_ddl(region: str) -> str:
     """
     Per-day per-symbol per-tenor ATM IV. Computed at ingest from chain.
 
-    tenor_bucket: '7d','30d','60d','90d','180d' — interpolate to nearest
-                  expiry in the bucket.
+    tenor_bucket: 'M1' or 'M2' — the two nearest 3rd-Friday expiries
+                  with 0 < DTE ≤ 70. No interpolation; `dte` records
+                  the actual DTE of the chain used.
     """
     table = f"{region}_iv_history"
     return f"""
     CREATE TABLE IF NOT EXISTS {table} (
-        date              DATE          NOT NULL,
-        symbol            VARCHAR(20)   NOT NULL,
-        tenor_bucket      VARCHAR(10)   NOT NULL,    -- '7d','30d','60d','90d','180d'
-
-        atm_iv            NUMERIC(10,6),
-        atm_iv_call       NUMERIC(10,6),
-        atm_iv_put        NUMERIC(10,6),
-        skew_25d          NUMERIC(10,6),     -- 25d put IV − 25d call IV
-        term_slope_30_90  NUMERIC(10,6),     -- iv_90 − iv_30 (denormalized)
-
-        created_at        TIMESTAMP DEFAULT NOW(),
-
-        CONSTRAINT pk_{table}
-            PRIMARY KEY (date, symbol, tenor_bucket)
+        date              DATE         NOT NULL,
+        symbol            VARCHAR(20)  NOT NULL,
+        tenor_bucket      VARCHAR(4)   NOT NULL,
+        dte               INT          NOT NULL,
+        atm_iv            NUMERIC,
+        atm_iv_call       NUMERIC,
+        atm_iv_put        NUMERIC,
+        skew_25d          NUMERIC,
+        term_slope_m1_m2  NUMERIC,
+        CONSTRAINT ck_{table}_tenor CHECK (tenor_bucket IN ('M1','M2')),
+        CONSTRAINT pk_{table} PRIMARY KEY (date, symbol, tenor_bucket)
     );
 
-    CREATE INDEX IF NOT EXISTS ix_{table}_sym_tenor_date
-        ON {table} (symbol, tenor_bucket, date DESC);
+    CREATE INDEX IF NOT EXISTS ix_{table}_symbol_date
+        ON {table} (symbol, date DESC);
     """
 
 

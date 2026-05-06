@@ -23,8 +23,8 @@
 ingest_cash.py [-h] [--market {us,hk,in,all}] [--period PERIOD] [--days DAYS] [--source {yfinance,ibkr}] [--full] [--backfill]
 
 python ingest/ingest_cash.py --market all --period 20y 
-python ingest/ingest_cash.py --market all --period 2d --source ibkr
-python ingestdb/load_db.py --market all --type cash
+python ingest/ingest_cash.py --market all --period 3d --source ibkr
+python ingest/db/load_db.py --market all --type cash
 
 python ingest/ingest_options.py --market us      
 python ingest/ingest_options.py --market us    --consolidate                                                                                                                                                 
@@ -58,6 +58,43 @@ python -m scripts.run_market -m HK --days 180 --open
 
 # Over Exhausted Sell
 python run_bounce_scan.py --market US
+
+
+# Default: US market, auto dates, minimal output
+python cash/phase2/runner_v2.py
+
+# US market with explicit date range
+python cash/phase2/runner_v2.py --market US --start-date 2024-01-02 --end-date 2025-04-25
+
+# ── Reports & Logging ────────────────────────────────────────────
+
+# Print the plain-text report to terminal
+python cash/phase2/runner_v2.py --market US --print-report
+
+# Verbose logging + report (recommended first smoke test)
+python cash/phase2/runner_v2.py --market US --print-report -v
+
+# Full flags: date range + verbose + report
+python cash/phase2/runner_v2.py --market US --start-date 2024-06-01 --end-date 2025-04-25 --print-report -v
+
+# ── Custom Data Path ─────────────────────────────────────────────
+
+# Point to a specific parquet file
+python cash/phase2/runner_v2.py --market US --parquet-path data/us_cash.parquet
+
+# ── Other Markets ────────────────────────────────────────────────
+
+# Hong Kong
+python cash/phase2/runner_v2.py --market HK --print-report -v
+
+# India with date range
+python cash/phase2/runner_v2.py --market IN --parquet-path data/in_cash.parquet --print-report -v
+
+# ── Single Day Run ───────────────────────────────────────────────
+
+# Run for a single trading day
+python cash/phase2/runner_v2.py --market US --start 2025-04-25 --end 2025-04-25 --print-report -v
+
 
 #So which should you use?
 # If you want quick terminal output with flexibility over which analysis mode to run, use run_strategy.py. 

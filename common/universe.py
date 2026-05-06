@@ -82,7 +82,6 @@ ETF_UNIVERSE = (
     + SECTORS
     + THEMATIC_ETFS
     + INTERNATIONAL
-    + HK_ETFS
     + FIXED_INCOME
     + COMMODITIES
 )
@@ -198,7 +197,7 @@ SINGLE_NAMES = {
         "tickers": [
             "APP", "CRWD", "PANW", "CEG", "VST", "AXON", "DECK", "ANET", "NOW", "UBER",
             "ROKU", "TTD", "HOOD", "SOUN", "UPST", "SOFI", "TOST", "GLBE", "GENI", "VRT","TEAM", "PGY", "AEHR",
-            "APPN", "APPD", "FIVN"
+            "APPN", "FIVN"
         ],
     },
     "defense": {

@@ -8,3 +8,7 @@ python -m ingest.underlying.build_underlying_daily --market hk --lookback 2y
 # Daily cron / manual run going forward
 python -m ingest.underlying.build_underlying_daily --market us --lookback 10d
 python -m ingest.underlying.build_underlying_daily --market hk --lookback 10d
+
+
+python -m ingest.iv.build_iv_history --market us
+python -m ingest.iv.build_iv_history --market us --symbols AAPL,AMZN,SPY,QQQ,NVDA,MSTR,TSLA,JMIA --verbose --dry-run
